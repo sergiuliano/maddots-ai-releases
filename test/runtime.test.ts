@@ -87,7 +87,7 @@ test('the npm-style executable symlink dispatches the CLI', async t => {
     env: { PATH: process.env.PATH, HOME: options.home, MADDOTS_AI_HOME: join(options.home, 'data') },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), '0.1.0');
+  assert.equal(result.stdout.trim(), '0.1.1');
   await assert.rejects(lstat(join(options.home, 'data')), { code: 'ENOENT' });
 });
 

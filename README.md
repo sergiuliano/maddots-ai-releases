@@ -8,10 +8,10 @@ Requirements: macOS, npm, and Node.js `^22.22.2 || ^24.15.0`.
 
 Follow the [installation guide](docs/install.md) to confirm the release signing
 key, verify the signed tag and attested `helper.tgz`, and install version
-0.1.0. Begin with the pinned source checkout:
+0.1.1. Begin with the pinned source checkout:
 
 ```sh
-git clone --branch v0.1.0 --depth 1 https://github.com/sergiuliano/maddots-ai-releases.git
+git clone --branch v0.1.1 --depth 1 https://github.com/sergiuliano/maddots-ai-releases.git
 ```
 
 The guide includes the complete tag and artifact verification commands, pairing,
