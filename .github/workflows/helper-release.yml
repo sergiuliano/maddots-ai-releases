@@ -1,0 +1,133 @@
+name: Release MadDots AI helper
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bootstrap_release:
+        description: Also publish the package version from an existing trusted signed tag
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: helper-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'sergiuliano/maddots-ai-releases' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      MADDOTS_AI_AUTO_UPDATE: '0'
+    steps:
+      - name: Check out the exact release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.22.3'
+      - name: Verify the signed source tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node --input-type=module -e 'import { readFileSync } from "node:fs"; process.stdout.write(JSON.parse(readFileSync("package.json", "utf8")).version)')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch --no-tags origin "refs/tags/v$version:refs/tags/v$version"
+          test "$(git cat-file -t "v$version")" = tag
+          printf '%s\n' 'sergiuliano namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIRSFnznywnHjMXqQnEA4nbVU7RW4X30NAP1dDmDRxtr' > "$RUNNER_TEMP/helper-allowed-signers"
+          git -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/helper-allowed-signers" verify-tag "v$version"
+          test "$(git rev-parse "v$version^{commit}")" = "$GITHUB_SHA"
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Test the helper
+        run: npm test
+      - name: Check the package boundary
+        run: npm run pack:check
+      - name: Prepare and clean-install the exact runtime artifact
+        run: node scripts/prepare-release.mjs --output "$RUNNER_TEMP/helper-release"
+      - name: Attest the runtime artifact with GitHub SLSA provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/helper-release/helper.tgz
+          create-storage-record: false
+      - name: Publish the immutable commit update and optional bootstrap release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          BOOTSTRAP_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap_release }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
+          test "$GITHUB_REPOSITORY" = sergiuliano/maddots-ai-releases
+          test "$GITHUB_REF" = refs/heads/main
+          remote_head="$(git ls-remote --exit-code https://github.com/sergiuliano/maddots-ai-releases.git refs/heads/main)"
+          test "${remote_head%%$'\t'*}" = "$GITHUB_SHA"
+          version="$(node --input-type=module -e 'import { readFileSync } from "node:fs"; process.stdout.write(JSON.parse(readFileSync("package.json", "utf8")).version)')"
+          release_dir="$RUNNER_TEMP/helper-release"
+          cp "$ATTESTATION_BUNDLE" "$release_dir/helper.sigstore.json"
+          verify_bundle() {
+            gh attestation verify "$1/helper.tgz" \
+              --bundle "$1/helper.sigstore.json" \
+              --repo "$GITHUB_REPOSITORY" \
+              --cert-identity 'https://github.com/sergiuliano/maddots-ai-releases/.github/workflows/helper-release.yml@refs/heads/main' \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              --source-ref refs/heads/main --source-digest "$GITHUB_SHA" \
+              --signer-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          }
+          verify_bundle "$release_dir"
+          if gh release view "helper-$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Reruns may reuse an existing release, never replace its assets.
+            prior="$RUNNER_TEMP/existing-helper-release"
+            mkdir "$prior"
+            gh release download "helper-$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --dir "$prior" \
+              --pattern helper.tgz --pattern helper.sigstore.json --pattern helper.tgz.sha256
+            cmp "$release_dir/helper.tgz" "$prior/helper.tgz"
+            cmp "$release_dir/helper.tgz.sha256" "$prior/helper.tgz.sha256"
+            verify_bundle "$prior"
+            release_dir="$prior"
+          else
+            gh release create "helper-$GITHUB_SHA" \
+              "$release_dir/helper.tgz" \
+              "$release_dir/helper.sigstore.json" \
+              "$release_dir/helper.tgz.sha256" \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "MadDots AI helper $version ($GITHUB_SHA)" \
+              --notes 'Verified MadDots AI helper update. The Sigstore bundle binds this artifact to the public main workflow and source commit. npm publication is disabled.' \
+              --latest
+          fi
+          if test "$BOOTSTRAP_RELEASE" = true; then
+            # The signed tag was checked before building. Copy the same attested bytes.
+            test "$(git rev-parse "v$version^{commit}")" = "$GITHUB_SHA"
+            if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              bootstrap="$RUNNER_TEMP/existing-bootstrap-release"
+              mkdir "$bootstrap"
+              gh release download "v$version" --repo "$GITHUB_REPOSITORY" --dir "$bootstrap" \
+                --pattern helper.tgz --pattern helper.sigstore.json --pattern helper.tgz.sha256
+              for asset in helper.tgz helper.sigstore.json helper.tgz.sha256; do
+                cmp "$release_dir/$asset" "$bootstrap/$asset"
+              done
+            else
+              gh release create "v$version" \
+                "$release_dir/helper.tgz" \
+                "$release_dir/helper.sigstore.json" \
+                "$release_dir/helper.tgz.sha256" \
+                --repo "$GITHUB_REPOSITORY" --verify-tag --latest=false \
+                --title "MadDots AI helper bootstrap $version" \
+                --notes "Version-pinned bootstrap from the trusted signed source tag. Assets are identical to helper-$GITHUB_SHA. npm publication remains disabled."
+            fi
+          fi

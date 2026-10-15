@@ -1,0 +1,40 @@
+{
+  "name": "maddots-ai",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "MacOS helper for connecting AI tools to MadDots AI",
+  "type": "module",
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0"
+  },
+  "bin": {
+    "maddots-ai": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "docs/install.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node --input-type=module -e \"import {cpSync} from 'node:fs'; cpSync('src/shared/tool-matrix.json', 'dist/shared/tool-matrix.json');\"",
+    "test": "tsx --test test/*.test.ts",
+    "pack:check": "npm run build && node scripts/check-package.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sergiuliano/maddots-ai-releases.git"
+  },
+  "dependencies": {
+    "sigstore": "5.0.0",
+    "tar": "7.5.22",
+    "make-fetch-happen": "16.0.1"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "22.20.1",
+    "@types/make-fetch-happen": "10.0.4",
+    "tsx": "4.20.6"
+  }
+}

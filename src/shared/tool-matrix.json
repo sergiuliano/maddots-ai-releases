@@ -1,0 +1,1285 @@
+{
+  "format": 1,
+  "checkedAt": "2026-10-14",
+  "sources": [
+    {
+      "url": "https://learn.chatgpt.com/docs/build-skills",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://code.claude.com/docs/en/skills",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://support.claude.com",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://cursor.com/docs/skills",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://cursor.com/docs/cli/headless",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://code.visualstudio.com/docs/agent-customization/agent-skills",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://docs.github.com/en/copilot",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://docs.devin.ai",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://docs.cline.bot",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://docs.continue.dev/cli/headless-mode",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://geminicli.com/docs/cli/skills",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://antigravity.google/docs/skills",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://opencode.ai/docs/skills",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://github.com/can1357/oh-my-pi",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://docs.openclaw.ai/tools/skills",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://hermes-agent.nousresearch.com/docs",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://docs.x.ai/build",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://github.com/xai-org/grok-build",
+      "checkedAt": "2026-10-13"
+    },
+    {
+      "url": "https://github.com/deepseek-ai/deepseek-harness",
+      "checkedAt": "2026-10-14"
+    }
+  ],
+  "routes": {
+    "agents-folder": {
+      "kind": "folder",
+      "path": "~/.agents/skills",
+      "readPath": null,
+      "target": "folder",
+      "card": "TLS-15"
+    },
+    "claude-plugin": {
+      "kind": "claude-plugin",
+      "path": "~/.maddots-ai/claude-code",
+      "readPath": null,
+      "target": "claude-plugin",
+      "card": "TLS-16"
+    },
+    "desktop-zip": {
+      "kind": "zip",
+      "path": "<data>/exports/claude-desktop",
+      "readPath": null,
+      "target": "desktop-zip",
+      "card": "TLS-45"
+    },
+    "continue-folder": {
+      "kind": "folder",
+      "path": "~/.continue/skills",
+      "readPath": null,
+      "target": "folder",
+      "card": "TLS-34"
+    },
+    "cline-folder": {
+      "kind": "folder",
+      "path": "~/.cline/skills",
+      "readPath": null,
+      "target": "folder",
+      "card": "TLS-15"
+    },
+    "antigravity-cli": {
+      "kind": "folder",
+      "path": "~/.gemini/antigravity-cli/skills",
+      "readPath": null,
+      "target": "folder",
+      "card": "TLS-45"
+    },
+    "antigravity-ide": {
+      "kind": "folder",
+      "path": "~/.gemini/config/skills",
+      "readPath": null,
+      "target": "folder",
+      "card": "TLS-45"
+    },
+    "hermes-folder": {
+      "kind": "folder",
+      "path": "~/.hermes/skills",
+      "readPath": null,
+      "target": "folder",
+      "card": "TLS-45"
+    },
+    "hermes-external-dir": {
+      "kind": "hermes-external-dir",
+      "path": "~/.agents/skills",
+      "readPath": null,
+      "target": "folder",
+      "card": "TLS-45"
+    }
+  },
+  "tools": [
+    {
+      "key": "codex",
+      "name": "Codex",
+      "vendor": "OpenAI",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "codex"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:codex(?:-cli)?[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "desktop",
+          "label": "ChatGPT desktop (Codex mode)",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/ChatGPT.app",
+              "~/Applications/ChatGPT.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "ide",
+          "label": "IDE extension",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [],
+            "configPaths": [
+              "~/.vscode/extensions/openai.chatgpt-*/package.json",
+              "~/.vscode-insiders/extensions/openai.chatgpt-*/package.json",
+              "~/.cursor/extensions/openai.chatgpt-*/package.json",
+              "~/.windsurf/extensions/openai.chatgpt-*/package.json"
+            ]
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.codex/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.codex*",
+          "skills": "~/.codex*/skills"
+        }
+      ],
+      "duplicateRule": "replace-local",
+      "reload": {
+        "kind": "live",
+        "command": null
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "claude-code",
+      "name": "Claude Code",
+      "vendor": "Anthropic",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "claude"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:(?:Claude(?: Code)?|claude)[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "desktop-code",
+          "label": "Desktop Code tab",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Claude.app",
+              "~/Applications/Claude.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "ide",
+          "label": "IDE extension",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [],
+            "configPaths": [
+              "~/.vscode/extensions/anthropic.claude-code-*/package.json",
+              "~/.vscode-insiders/extensions/anthropic.claude-code-*/package.json",
+              "~/.cursor/extensions/anthropic.claude-code-*/package.json",
+              "~/.windsurf/extensions/anthropic.claude-code-*/package.json"
+            ]
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "claude-plugin",
+      "reads": [
+        "~/.maddots-ai/claude-code"
+      ],
+      "legacyReads": [
+        "~/.claude/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.claude",
+          "skills": "~/.claude/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "live",
+        "command": null
+      },
+      "deliveryCard": "TLS-16",
+      "run": null
+    },
+    {
+      "key": "claude-desktop",
+      "name": "Claude Desktop",
+      "vendor": "Anthropic",
+      "variants": [
+        {
+          "key": "chat",
+          "label": "Chat",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Claude.app",
+              "~/Applications/Claude.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "cowork",
+          "label": "Cowork",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Claude.app",
+              "~/Applications/Claude.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "desktop-zip",
+      "reads": [],
+      "legacyReads": [],
+      "homes": [],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "restart",
+        "command": null
+      },
+      "deliveryCard": "TLS-45",
+      "run": null
+    },
+    {
+      "key": "cursor",
+      "name": "Cursor",
+      "vendor": "Anysphere",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "~/.local/bin/agent",
+              "~/.cursor/bin/agent",
+              "agent"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:Cursor(?: Agent| CLI)?)[ \\t:v-]*(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "editor",
+          "label": "Editor",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Cursor.app",
+              "~/Applications/Cursor.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.cursor/skills",
+        "~/.claude/skills",
+        "~/.codex/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.cursor",
+          "skills": "~/.cursor/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "restart",
+        "command": null
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "vscode-copilot",
+      "name": "VS Code / GitHub Copilot",
+      "vendor": "Microsoft / GitHub",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "copilot"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:(?:GitHub[ \\t]+)?Copilot(?: CLI)?[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "ide",
+          "label": "VS Code with Copilot Chat",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [],
+            "configPaths": [
+              "~/.vscode/extensions/github.copilot-chat-*/package.json",
+              "~/.vscode-insiders/extensions/github.copilot-chat-*/package.json",
+              "~/.cursor/extensions/github.copilot-chat-*/package.json",
+              "~/.windsurf/extensions/github.copilot-chat-*/package.json"
+            ]
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "app",
+          "label": "Copilot app",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/GitHub Copilot.app",
+              "~/Applications/GitHub Copilot.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.copilot/skills",
+        "~/.claude/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.copilot",
+          "skills": "~/.copilot/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "command",
+        "command": "/skills reload"
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "devin",
+      "name": "Devin (formerly Windsurf)",
+      "vendor": "Cognition",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "devin"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:Devin(?: CLI)?[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "desktop",
+          "label": "Devin Desktop",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Devin.app",
+              "~/Applications/Devin.app",
+              "/Applications/Windsurf.app",
+              "~/Applications/Windsurf.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.config/devin/skills",
+        "~/.codeium/windsurf/skills",
+        "~/.claude/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.config/devin",
+          "skills": "~/.config/devin/skills"
+        },
+        {
+          "glob": "~/.codeium/windsurf",
+          "skills": "~/.codeium/windsurf/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "restart",
+        "command": null
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "cline",
+      "name": "Cline",
+      "vendor": "Cline",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "cline"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:Cline(?: CLI)?[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "ide",
+          "label": "VS Code extension",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [],
+            "configPaths": [
+              "~/.vscode/extensions/saoudrizwan.claude-dev-*/package.json",
+              "~/.vscode-insiders/extensions/saoudrizwan.claude-dev-*/package.json",
+              "~/.cursor/extensions/saoudrizwan.claude-dev-*/package.json",
+              "~/.windsurf/extensions/saoudrizwan.claude-dev-*/package.json"
+            ]
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "desktop",
+          "label": "Desktop",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Cline.app",
+              "~/Applications/Cline.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.cline/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.cline",
+          "skills": "~/.cline/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "restart",
+        "command": null
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "continue",
+      "name": "Continue",
+      "vendor": "Continue",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "cn"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:(?:Continue|cn)(?: CLI)?[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "ide",
+          "label": "IDE extensions",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [],
+            "configPaths": [
+              "~/.vscode/extensions/continue.continue-*/package.json",
+              "~/.vscode-insiders/extensions/continue.continue-*/package.json",
+              "~/.cursor/extensions/continue.continue-*/package.json",
+              "~/.windsurf/extensions/continue.continue-*/package.json"
+            ]
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "continue-folder",
+      "reads": [
+        "~/.continue/skills"
+      ],
+      "legacyReads": [],
+      "homes": [
+        {
+          "glob": "~/.continue",
+          "skills": "~/.continue/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "restart",
+        "command": null
+      },
+      "deliveryCard": "TLS-34",
+      "run": null
+    },
+    {
+      "key": "gemini-cli",
+      "name": "Gemini CLI",
+      "vendor": "Google",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "gemini"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:Gemini(?: CLI)?[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.gemini/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.gemini",
+          "skills": "~/.gemini/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "command",
+        "command": "/skills reload"
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "antigravity",
+      "name": "Antigravity",
+      "vendor": "Google",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "agy"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:(?:Antigravity|agy)(?: CLI)?[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "ide",
+          "label": "IDE",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Antigravity.app",
+              "~/Applications/Antigravity.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "desktop",
+          "label": "Desktop",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Antigravity Desktop.app",
+              "~/Applications/Antigravity Desktop.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "antigravity-cli",
+      "reads": [
+        "~/.gemini/antigravity-cli/skills",
+        "~/.gemini/config/skills"
+      ],
+      "legacyReads": [],
+      "homes": [
+        {
+          "glob": "~/.gemini/antigravity-cli",
+          "skills": "~/.gemini/antigravity-cli/skills"
+        },
+        {
+          "glob": "~/.gemini/config",
+          "skills": "~/.gemini/config/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "restart",
+        "command": null
+      },
+      "deliveryCard": "TLS-45",
+      "run": null
+    },
+    {
+      "key": "opencode",
+      "name": "OpenCode",
+      "vendor": "OpenCode",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "opencode"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:opencode[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "desktop",
+          "label": "Desktop",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/OpenCode.app",
+              "~/Applications/OpenCode.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "ide",
+          "label": "IDE extension",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [],
+            "configPaths": [
+              "~/.vscode/extensions/sst-dev.opencode-*/package.json",
+              "~/.vscode-insiders/extensions/sst-dev.opencode-*/package.json",
+              "~/.cursor/extensions/sst-dev.opencode-*/package.json",
+              "~/.windsurf/extensions/sst-dev.opencode-*/package.json"
+            ]
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.config/opencode/skills",
+        "~/.claude/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.config/opencode",
+          "skills": "~/.config/opencode/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "restart",
+        "command": null
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "oh-my-pi",
+      "name": "Oh My Pi",
+      "vendor": "Oh My Pi",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "omp"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:(?:Oh My Pi|omp)[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.omp/skills",
+        "~/.claude/skills",
+        "~/.codex/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.omp",
+          "skills": "~/.omp/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "restart",
+        "command": null
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "openclaw",
+      "name": "OpenClaw",
+      "vendor": "OpenClaw",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "openclaw"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:OpenClaw[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "app",
+          "label": "Menu-bar app",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/OpenClaw.app",
+              "~/Applications/OpenClaw.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.openclaw/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.openclaw",
+          "skills": "~/.openclaw/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "live",
+        "command": null
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "hermes",
+      "name": "Hermes Agent",
+      "vendor": "Nous Research",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "hermes"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:Hermes(?: Agent)?[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        },
+        {
+          "key": "desktop",
+          "label": "Desktop (preview)",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Hermes.app",
+              "~/Applications/Hermes.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "hermes-folder",
+      "reads": [
+        "~/.hermes/skills"
+      ],
+      "legacyReads": [],
+      "homes": [
+        {
+          "glob": "~/.hermes",
+          "skills": "~/.hermes/skills"
+        }
+      ],
+      "duplicateRule": "none",
+      "reload": {
+        "kind": "live",
+        "command": null
+      },
+      "deliveryCard": "TLS-45",
+      "run": null
+    },
+    {
+      "key": "grok",
+      "name": "Grok CLI (Grok Build)",
+      "vendor": "xAI / SpaceXAI",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "~/.grok/bin/grok"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(?:Grok(?: CLI| Build)?[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": [
+              "models"
+            ],
+            "pattern": "^\\s*([a-zA-Z0-9][a-zA-Z0-9._:/+-]*)\\s*$"
+          }
+        },
+        {
+          "key": "desktop",
+          "label": "Desktop (if shipped)",
+          "syncOnly": true,
+          "detect": {
+            "binaries": [],
+            "versionArgs": [],
+            "versionPattern": "(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)",
+            "apps": [
+              "/Applications/Grok.app",
+              "~/Applications/Grok.app"
+            ],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills",
+        "~/.claude/plugins/cache/*/*/*/skills"
+      ],
+      "legacyReads": [
+        "~/.grok/skills",
+        "~/.claude/skills",
+        "~/.cursor/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.grok",
+          "skills": "~/.grok/skills"
+        }
+      ],
+      "duplicateRule": "grok-ignore",
+      "reload": {
+        "kind": "live",
+        "command": null
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    },
+    {
+      "key": "deepseek-harness",
+      "name": "DeepSeek Harness",
+      "vendor": "DeepSeek",
+      "variants": [
+        {
+          "key": "cli",
+          "label": "CLI (developer preview)",
+          "syncOnly": false,
+          "detect": {
+            "binaries": [
+              "~/.local/bin/dsh",
+              "dsh"
+            ],
+            "versionArgs": [
+              "--version"
+            ],
+            "versionPattern": "^(\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$",
+            "apps": [],
+            "configPaths": []
+          },
+          "models": {
+            "args": null,
+            "pattern": null
+          }
+        }
+      ],
+      "route": "agents-folder",
+      "reads": [
+        "~/.agents/skills"
+      ],
+      "legacyReads": [
+        "~/.dsh/skills"
+      ],
+      "homes": [
+        {
+          "glob": "~/.dsh",
+          "skills": "~/.dsh/skills"
+        }
+      ],
+      "duplicateRule": "replace-local",
+      "reload": {
+        "kind": "live",
+        "command": null
+      },
+      "deliveryCard": "TLS-15",
+      "run": null
+    }
+  ]
+}
