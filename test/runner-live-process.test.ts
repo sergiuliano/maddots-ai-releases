@@ -124,7 +124,7 @@ if (['term', 'hold', 'detached'].includes(mode)) setInterval(() => {}, 1000);
   };
 }
 
-test('TLS21-R5: startTool rootVerified sweeps a late same-group orphan after a full live scan outage with real ps', { timeout: 20_000 }, async context => {
+test('TLS21-R5: startTool rootVerified sweeps a late same-group orphan after a full live scan outage with real ps', { timeout: 20_000, skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)' }, async context => {
   if (!await realPs(context)) return;
   // No detach or environment change: this sleep inherits the root's group.
   // Waiting 5600 ms expires liveGroups authority before the root exits.
@@ -170,7 +170,7 @@ for (const [label, mode, before, after] of [
   ['TERM-ignoring shell sleep after 1 s of prior scans', 'shell', 1000, 0],
   ['non-detached shell loop', 'loop', 0, 0],
 ] as const) {
-  test(`TLS21-R5: ${label} is gone when finished resolves with real ps`, { timeout: 20_000 }, async context => {
+  test(`TLS21-R5: ${label} is gone when finished resolves with real ps`, { timeout: 20_000, skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)' }, async context => {
     if (!await realPs(context)) return;
     const f = await fixture(mode, before, after);
     try {
@@ -185,7 +185,7 @@ for (const [label, mode, before, after] of [
 }
 
 for (const action of ['stop', 'deadline'] as const) {
-  test(`TLS21-R5: ${action} sweeps the same-group orphan created by a TERM handler with real ps`, { timeout: 20_000 }, async context => {
+  test(`TLS21-R5: ${action} sweeps the same-group orphan created by a TERM handler with real ps`, { timeout: 20_000, skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)' }, async context => {
     if (!await realPs(context)) return;
     const f = await fixture('term');
     try {
@@ -199,7 +199,7 @@ for (const action of ['stop', 'deadline'] as const) {
   });
 }
 
-test('TLS21-R5: recovery of an identity-matched live root sweeps its TERM-handler orphan with real ps', { timeout: 20_000 }, async context => {
+test('TLS21-R5: recovery of an identity-matched live root sweeps its TERM-handler orphan with real ps', { timeout: 20_000, skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)' }, async context => {
   if (!await realPs(context)) return;
   const f = await fixture('term');
   try {
@@ -214,8 +214,7 @@ test('TLS21-R5: recovery of an identity-matched live root sweeps its TERM-handle
   } finally { await f.cleanup(); }
 });
 
-test('TLS21-R5: Darwin onGroups never persists sid or root sessionLeader for a detached child with real ps', { timeout: 20_000 }, async context => {
-  if (process.platform !== 'darwin') { context.skip('Darwin sess=0 regression'); return; }
+test('TLS21-R5: Darwin onGroups never persists sid or root sessionLeader for a detached child with real ps', { timeout: 20_000, skip: process.platform !== 'darwin' && 'macOS process semantics: Darwin sess=0 regression (TLS-35 adds Linux)' }, async context => {
   if (!await realPs(context)) return;
   const f = await fixture('detached');
   try {
@@ -232,8 +231,7 @@ test('TLS21-R5: Darwin onGroups never persists sid or root sessionLeader for a d
   } finally { await f.cleanup(); }
 });
 
-test('TLS21-R5: Darwin stale sid=0 and live root do not authorize an unrelated leaderless group with real ps', { timeout: 20_000 }, async context => {
-  if (process.platform !== 'darwin') { context.skip('Darwin sess=0 regression'); return; }
+test('TLS21-R5: Darwin stale sid=0 and live root do not authorize an unrelated leaderless group with real ps', { timeout: 20_000, skip: process.platform !== 'darwin' && 'macOS process semantics: Darwin sess=0 regression (TLS-35 adds Linux)' }, async context => {
   if (!await realPs(context)) return;
   const rootFixture = await fixture('hold');
   const unrelatedFixture = await fixture('node-empty');
@@ -261,7 +259,7 @@ test('TLS21-R5: Darwin stale sid=0 and live root do not authorize an unrelated l
 });
 
 for (const evidence of ['member', 'fence'] as const) {
-  test(`TLS21-P1: real leaderless group remains recoverable through its exact ${evidence}`, { timeout: 20_000 }, async context => {
+  test(`TLS21-P1: real leaderless group remains recoverable through its exact ${evidence}`, { timeout: 20_000, skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)' }, async context => {
     if (!await realPs(context)) return;
     const f = await fixture(evidence === 'member' ? 'node-empty' : 'fenced');
     try {

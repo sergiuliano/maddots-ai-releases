@@ -72,6 +72,9 @@ function runnerErrorCode(error: unknown): string {
   const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : '';
   return /^[A-Za-z0-9_]{1,60}$/.test(code) ? code : 'runner_failed';
 }
+function requireRunsPlatform(): void {
+  if (process.platform !== 'darwin') throw new HelperError('RUNS_PLATFORM_UNSUPPORTED', 'Agent runs require macOS. Linux and Windows support is planned in TLS-35.');
+}
 export async function computerName(runner: Runner = runCommand, env: NodeJS.ProcessEnv = process.env): Promise<string> {
   let name = hostname();
   try { name = (await runner('/usr/sbin/scutil', ['--get', 'LocalHostName'], { env: cleanEnvironment(env) })).stdout.trim() || name; } catch { /* Hostname is the documented fallback. */ }
@@ -86,6 +89,7 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
   if (['help', '--help', '-h'].includes(args.command)) {
     output('maddots-ai connect | status | allow [--all] | runs [test <tool> [--model <model>]] | agent setup [handle|agent-id] | agent access <handle|agent-id> folder-only|full | backups [restore <id>] | import | uninstall | update [--rollback] | service | --version'); return;
   }
+  if (args.command === 'runs' || args.command === 'agent') requireRunsPlatform();
   const isTTY = options.isTTY ?? !!(process.stdin.isTTY && process.stdout.isTTY);
   if (args.command === 'allow' && !isTTY) throw new HelperError('ALLOW_TTY_REQUIRED', 'Allow requires an interactive terminal on this computer.');
   if (args.command === 'update' && !RELEASE_IDENTITY && !options.updates) {
@@ -150,9 +154,13 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
     // Supply dialog text as an argument to a fixed script, never AppleScript source.
     await runner('/usr/bin/osascript', ['-e', 'on run argv\ndisplay dialog (item 1 of argv) buttons {"OK"} default button "OK"\nend run', message], { env: cleanEnvironment(config.env) });
   });
-  const runsFor = (helperId: string) => new RunsRuntime({paths, helperId, api, secrets, state: stateStore,
-    endpoint: config.endpoint, env: config.env, request: options.request, timing, verifier: options.verifier,
-    notify: {runner, entrypoint: runtime.bootstrapEntrypoint}});
+  const runsFor = (helperId: string) => {
+    // The service shares this production entry point with the interactive commands.
+    requireRunsPlatform();
+    return new RunsRuntime({paths, helperId, api, secrets, state: stateStore,
+      endpoint: config.endpoint, env: config.env, request: options.request, timing, verifier: options.verifier,
+      notify: {runner, entrypoint: runtime.bootstrapEntrypoint}});
+  };
   if (args.command === 'runs' || args.command === 'agent') {
     if (!saved.helperId || saved.status !== 'connected') throw new HelperError('TOKEN_REQUIRED', 'Connect this computer before setting up runs.');
     if (saved.tokenStorage !== 'keychain') throw new HelperError('FILE_RUNS_REFUSED', 'Agent runs require Keychain storage.');

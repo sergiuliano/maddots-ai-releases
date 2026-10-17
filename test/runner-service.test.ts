@@ -20,6 +20,10 @@ async function until(predicate: () => boolean): Promise<void> {
   assert(predicate(), 'Timed out waiting for the activation request.');
 }
 async function fixture(t: TestContext, active = false) {
+  // These service tests inject Apple commands and exercise the macOS pilot wiring.
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', {...descriptor, value: 'darwin'});
+  t.after(() => Object.defineProperty(process, 'platform', descriptor));
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-service-runs-'));
   t.after(() => rm(root, {recursive: true, force: true}));
   const home = join(root, 'home'), binDir = join(root, 'bin');
@@ -192,4 +196,17 @@ for (const failure of ['init', 'syncGrants'] as const) test(`service still ticks
   assert.equal(f.heartbeats.length, 1, 'Activation failure must not skip tickRunners or its signed heartbeat.');
   assert.equal(f.output.some(line => line.includes(secretMessage)), false);
   assert(f.output.includes(failure === 'init' ? 'Test recovery unavailable this cycle (RUNNER_TEST_RECOVERY_UNAVAILABLE).' : 'Run activation unavailable this cycle (runner_failed).'));
+});
+
+for (const platform of ['linux', 'win32']) test(`service refuses runner activation and recovery on ${platform}`, async t => {
+  const f = await fixture(t, true);
+  Object.defineProperty(process, 'platform', {value: platform});
+  t.mock.method(RunsRuntime.prototype, 'init', async () => {assert.fail('Unsupported runs must not inspect or recover processes.');});
+  t.mock.method(RunsOnController.prototype, 'syncGrants', async () => {assert.fail('Unsupported runs must not activate tools.');});
+  const writes = f.keychainWrites.length;
+  await f.run();
+  assert(f.output.includes('Runs paused this cycle (RUNS_PLATFORM_UNSUPPORTED).'));
+  assert.deepEqual(f.registrations, []); assert.deepEqual(f.results, []); assert.deepEqual(f.heartbeats, []);
+  assert.deepEqual(f.dialogs, []); assert.equal(f.keychainWrites.length, writes);
+  assert.equal(f.statusTimes.length, 1, 'Helper status polling continues without running agents.');
 });

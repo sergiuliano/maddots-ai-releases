@@ -76,7 +76,7 @@ test('CLI pairing stores only stdin secrets, installs the service, and uninstall
 });
 test('CLI parses future commands and refuses a relative file flag before asking for confirmation', async () => {
   const output: string[] = [];
-  await runCli(['--version'], { output: line => output.push(line) }); assert.deepEqual(output, ['0.1.2']);
+  await runCli(['--version'], { output: line => output.push(line) }); assert.deepEqual(output, ['0.1.3']);
   await assert.rejects(runCli(['allow'], {isTTY: false}), {code: 'ALLOW_TTY_REQUIRED'});
   await assert.rejects(runCli(['allow', '--all'], {isTTY: false}), {code: 'ALLOW_TTY_REQUIRED'});
   await assert.rejects(runCli(['allow', '--yes'], {isTTY: true}), {code: 'USAGE'});
@@ -119,4 +119,19 @@ test('computer name uses scutil and falls back to a bounded safe hostname', asyn
   assert.equal(await computerName(async () => ({ stdout: 'Office-Mac\n', stderr: '' })), 'Office-Mac');
   const fallback = await computerName(async () => { throw new CommandError(1); });
   assert.match(fallback, /^[A-Za-z0-9 ._-]{1,64}$/);
+});
+
+for (const platform of ['linux', 'win32']) test(`runs and agent refuse ${platform} before configuration, credentials or process work`, async t => {
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  Object.defineProperty(process, 'platform', {...descriptor, value: platform});
+  t.after(() => Object.defineProperty(process, 'platform', descriptor));
+  for (const argv of [['runs'], ['runs', 'test', 'codex'], ['runs', 'test', 'codex', '--model', 'fixture'],
+    ['agent', 'setup'], ['agent', 'setup', 'fixture'], ['agent', 'access', 'fixture', 'full']]) {
+    await assert.rejects(runCli(argv, {
+      home: 'invalid relative home', env: {MADDOTS_AI_URL: 'invalid'},
+      runner: async () => {assert.fail('Unsupported runs must not invoke commands.');},
+      request: async () => {assert.fail('Unsupported runs must not make requests.');},
+      confirm: async () => {assert.fail('Unsupported runs must not prompt.');},
+    }), {code: 'RUNS_PLATFORM_UNSUPPORTED', message: /macOS.*TLS-35/});
+  }
 });

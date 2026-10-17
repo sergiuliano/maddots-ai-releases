@@ -132,7 +132,7 @@ test('verified adapter rejects prohibited subcommands after global options and w
     ['copilot', 'gh', 'copilot', '--hostname'],
     ['devin', 'devin', '.', '--model'],
   ]) {
-    for (const version of ['', '-0.1.2']) {
+    for (const version of ['', '-0.1.3']) {
       const f = await fixture();
       try {
         f.adapter.info.tool = tool;
@@ -279,7 +279,7 @@ test('recovery refuses stale PID identities without signalling', async () => {
   for (const pid of [-1, 0, 1, 1.5]) assert.equal(await recoverProcess(pid, `fixture-${pid}`, testInspector), false);
 });
 
-test('deadline removes an escaped grandchild with real ps', async (context) => {
+test('deadline removes an escaped grandchild with real ps', {skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)'}, async (context) => {
   if (!await processStartIdentity(process.pid)) { context.skip('/bin/ps denied by sandbox; Claude must rerun process-group recovery check'); return; }
   const f = await fixture('grandchild');
   let grandchild = 0;
@@ -296,7 +296,7 @@ test('deadline removes an escaped grandchild with real ps', async (context) => {
 });
 
 for (const mode of ['orphan-group-exit', 'orphan-group-stop']) {
-  test(`reparented same-group child is gone after ${mode} with real ps`, async context => {
+  test(`reparented same-group child is gone after ${mode} with real ps`, {skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)'}, async context => {
     if (!await processStartIdentity(process.pid)) { context.skip('/bin/ps denied by sandbox; Claude must rerun process-group recovery check'); return; }
     const f = await fixture(mode);
     let grandchild = 0;
@@ -381,7 +381,7 @@ for (const operation of ['normal exit', 'stop', 'recovery']) {
   });
 }
 
-test('process identity and recovery survive parent time-zone and locale changes', async context => {
+test('process identity and recovery survive parent time-zone and locale changes', {skip: process.platform !== 'darwin' && 'macOS process identity and /bin/ps semantics (TLS-35 adds Linux)'}, async context => {
   if (!await processStartIdentity(process.pid)) { context.skip('/bin/ps denied by sandbox; Claude must rerun identity recovery check'); return; }
   const previous = { TZ: process.env.TZ, LC_ALL: process.env.LC_ALL };
   const child = spawn('/bin/sleep', ['30'], { detached: true, stdio: 'ignore' });
@@ -451,7 +451,7 @@ async function realFenceInspection(context: { skip(message: string): void }): Pr
 }
 
 for (const mode of ['detached-exit', 'recovery-detached-on-term', 'shell-detached-exit']) {
-  test(`TLS21-R1-B: ${mode} leaves no descendant with real ps`, async context => {
+  test(`TLS21-R1-B: ${mode} leaves no descendant with real ps`, {skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)'}, async context => {
     if (!await realFenceInspection(context)) return;
     const f = await fixture(mode);
     const pidFile = join(f.root, 'grandchild.pid');
@@ -492,7 +492,7 @@ for (const mode of ['detached-exit', 'recovery-detached-on-term', 'shell-detache
   });
 }
 
-test('TLS21-R1-B: recovery with no leader kills only its exact fence with real ps', async context => {
+test('TLS21-R1-B: recovery with no leader kills only its exact fence with real ps', {skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)'}, async context => {
   if (!await realFenceInspection(context)) return;
   const fence = randomBytes(16).toString('hex');
   const children = [
@@ -911,7 +911,7 @@ test('R2-NEW-TLS21-FIX-C2: transient null identity keeps a listed descendant tra
 });
 
 for (const [total, batch, seconds] of [[500, 100, 1.5], [20, 20, 0.6]]) {
-  test(`R2-NEW-TLS21-FIX-C2: ${total} sleep children in batches of ${batch} finish normally with real ps`, async context => {
+  test(`R2-NEW-TLS21-FIX-C2: ${total} sleep children in batches of ${batch} finish normally with real ps`, {skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)'}, async context => {
     if (!await realFenceInspection(context)) return;
     const f = await fixture('sleep-batches');
     try {
@@ -948,8 +948,7 @@ for (const deadline of [false, true]) {
 }
 
 for (const mode of ['platform-detached-exit', 'platform-detached-on-term']) {
-  test(`TLS21-R1-C: Apple sleep setsid accepted escape limit on ${mode} with real ps`, async context => {
-    if (process.platform !== 'darwin') { context.skip('Apple platform-binary visibility limit applies on macOS'); return; }
+  test(`TLS21-R1-C: Apple sleep setsid accepted escape limit on ${mode} with real ps`, {skip: process.platform !== 'darwin' && 'macOS Apple binary visibility semantics (TLS-35 adds Linux)'}, async context => {
     if (!await realFenceInspection(context)) return;
     const f = await fixture(mode), pidFile = join(f.root, 'escaped.pid'), fence = randomBytes(16).toString('hex');
     let root = 0, escaped = 0;
@@ -980,7 +979,7 @@ for (const mode of ['platform-detached-exit', 'platform-detached-on-term']) {
   });
 }
 
-test('R2-NEW-SEC-TLS21-FENCE-PLATFORM-BINARIES: detached Apple shell inherited pipes settle with real ps', async context => {
+test('R2-NEW-SEC-TLS21-FENCE-PLATFORM-BINARIES: detached Apple shell inherited pipes settle with real ps', {skip: process.platform !== 'darwin' && 'macOS Apple binary visibility and process semantics (TLS-35 adds Linux)'}, async context => {
   if (!await realFenceInspection(context)) return;
   const f = await fixture('platform-detached-exit'), pidFile = join(f.root, 'escaped.pid');
   let escaped = 0;
@@ -1022,7 +1021,7 @@ test('R2-NEW-TLS21-FIX-C2: dead tracked entries are pruned before normal exit gr
   }
 });
 
-test('Codex N1: recovery sweeps the original group after the leader exited with real ps', async context => {
+test('Codex N1: recovery sweeps the original group after the leader exited with real ps', {skip: process.platform !== 'darwin' && 'macOS process semantics (TLS-35 adds Linux)'}, async context => {
   if (!await realFenceInspection(context)) return;
   const f = await fixture('orphan-group-exit'), pidFile = join(f.root, 'orphan.pid');
   let root = 0, orphan = 0;

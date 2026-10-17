@@ -4,7 +4,7 @@ The helper connects tools on one Mac to your MadDots AI account. It is a
 separate program from `maddots-mcp`. macOS, npm and Node.js
 `^22.22.2 || ^24.15.0` are required.
 
-## Verify and install release 0.1.2
+## Verify and install release 0.1.3
 
 Release trust is set by the release owner during export. Confirm the following
 allowed-signers line through a trusted independent channel, then save it outside
@@ -18,27 +18,27 @@ Node.js, npm, Git and the GitHub CLI (`gh`) are required for this verification.
 Clone the exact version and verify its signed tag before using its artifact:
 
 ```sh
-git clone --branch v0.1.2 --depth 1 https://github.com/sergiuliano/maddots-ai-releases.git &&
+git clone --branch v0.1.3 --depth 1 https://github.com/sergiuliano/maddots-ai-releases.git &&
 cd maddots-ai-releases &&
 git config gpg.ssh.allowedSignersFile /ABSOLUTE/PATH/allowed_signers &&
-git verify-tag v0.1.2 &&
-git checkout --detach v0.1.2 &&
+git verify-tag v0.1.3 &&
+git checkout --detach v0.1.3 &&
 mkdir bootstrap-download &&
-gh release download v0.1.2 --repo sergiuliano/maddots-ai-releases --dir bootstrap-download \
+gh release download v0.1.3 --repo sergiuliano/maddots-ai-releases --dir bootstrap-download \
   --pattern helper.tgz --pattern helper.sigstore.json --pattern helper.tgz.sha256 &&
 gh attestation verify bootstrap-download/helper.tgz \
   --bundle bootstrap-download/helper.sigstore.json \
   --repo sergiuliano/maddots-ai-releases \
   --cert-identity 'https://github.com/sergiuliano/maddots-ai-releases/.github/workflows/helper-release.yml@refs/heads/main' \
   --cert-oidc-issuer https://token.actions.githubusercontent.com \
-  --source-ref refs/heads/main --source-digest "$(git rev-parse 'v0.1.2^{commit}')" \
-  --signer-digest "$(git rev-parse 'v0.1.2^{commit}')" --deny-self-hosted-runners &&
+  --source-ref refs/heads/main --source-digest "$(git rev-parse 'v0.1.3^{commit}')" \
+  --signer-digest "$(git rev-parse 'v0.1.3^{commit}')" --deny-self-hosted-runners &&
 (cd bootstrap-download && shasum -a 256 -c helper.tgz.sha256) &&
 npm install --global --ignore-scripts ./bootstrap-download/helper.tgz &&
 maddots-ai connect
 ```
 
-The version-pinned bootstrap is `https://github.com/sergiuliano/maddots-ai-releases/releases/download/v0.1.2/helper.tgz`.
+The version-pinned bootstrap is `https://github.com/sergiuliano/maddots-ai-releases/releases/download/v0.1.3/helper.tgz`.
 Install only the local archive after the verification above succeeds. The
 checksum catches transfer damage; signed provenance binds the archive to this
 repository, workflow, main branch and signed source commit. An unsigned tag,

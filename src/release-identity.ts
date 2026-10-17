@@ -1,7 +1,7 @@
 // TLS-12's verified export sets RELEASE to true in the public release artifact.
 // Source-only overrides must never be enabled in a release artifact.
 export const RELEASE = true;
-export const VERSION = '0.1.2';
+export const VERSION = '0.1.3';
 export const MADDOTS_ORIGIN = 'https://maddots.app';
 
 export interface ReleaseIdentity {
