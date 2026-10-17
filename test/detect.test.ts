@@ -66,11 +66,32 @@ test('matrix covers sixteen tools, conservative routes, duplicate risks, and GUI
   const antigravity = TOOL_MATRIX.tools.find((tool) => tool.key === 'antigravity')!;
   assert.deepEqual(antigravity.reads, ['~/.gemini/antigravity-cli/skills', '~/.gemini/config/skills']);
   for (const tool of TOOL_MATRIX.tools) {
-    assert.equal(tool.run, null);
+    assert(tool.run === null || tool.run.offered === false);
     for (const variant of tool.variants) {
       if (!variant.detect.binaries.length) assert.equal(variant.syncOnly, true);
     }
   }
+});
+
+test('detection records matched CLI paths locally and reports no executable locations', async () => {
+  const f = await fixture();
+  try {
+    const tool = f.matrix.tools.find(tool => tool.key === 'codex')!;
+    f.matrix.tools = [tool];
+    tool.variants = [tool.variants.find(variant => variant.key === 'cli')!];
+    const bin = join(f.home, 'bin', 'codex');
+    await executable(bin);
+    tool.variants[0].detect.binaries = [bin];
+    const found = await detectTools({home: f.home, env: {}, matrix: f.matrix,
+      runner: async () => ({stdout: 'codex-cli 1.2.3\n', stderr: ''})});
+    assert.equal(found.length, 1);
+    assert.equal(found[0].path, bin);
+    assert.equal(found[0].realpath, await realpath(bin));
+    const {reportedTools} = await import('../src/pairing.js');
+    const report = reportedTools(found)[0];
+    assert.equal(Object.hasOwn(report, 'path'), false);
+    assert.equal(Object.hasOwn(report, 'realpath'), false);
+  } finally { await f.cleanup(); }
 });
 
 test('loader validates paths, dates, regexes, identities, model pairs and route references', () => {
@@ -106,6 +127,45 @@ test('matrix accepts forty variants and refuses the forty-first', () => {
   assert.doesNotThrow(() => validateToolMatrix(matrix));
   tool.variants.push({ ...structuredClone(tool.variants[0]), key: 'fixture-overflow' });
   assert.throws(() => validateToolMatrix(matrix), /TOOL_MATRIX_INVALID: tools\.variants/u);
+});
+
+test('run metadata remains disabled until an adapter is offered and only applies to CLI tools', () => {
+  assert(TOOL_MATRIX.tools.every((tool) => tool.run?.offered !== true));
+  const matrix = structuredClone(TOOL_MATRIX);
+  const codex = matrix.tools.find((tool) => tool.key === 'codex')!;
+  codex.run = {adapter: 'codex', card: 'TLS-26', offered: false, folderOnly: 'os-sandbox',
+    mcpLevel: 'servers-off', reason: 'Awaiting real-run acceptance', checkedAt: '2026-10-14'};
+  assert.equal(validateToolMatrix(matrix).tools.find((tool) => tool.key === 'codex')!.run?.offered, false);
+  for (const folderOnly of ['os-sandbox', 'no-shell', 'none'] as const) {
+    for (const mcpLevel of ['servers-off', 'tools-denied'] as const) {
+      codex.run = {...codex.run, folderOnly, mcpLevel, reason: null};
+      assert.doesNotThrow(() => validateToolMatrix(matrix));
+    }
+  }
+  matrix.tools.find((tool) => tool.key === 'claude-desktop')!.run = {...codex.run};
+  assert.throws(() => validateToolMatrix(matrix), /TOOL_MATRIX_INVALID: tools\[\d+\]\.run/u);
+});
+
+test('run metadata rejects missing and unknown fields, invalid flags, capabilities, identifiers and dates', () => {
+  const run = {adapter: 'codex', card: 'TLS-26', offered: false, folderOnly: 'os-sandbox',
+    mcpLevel: 'servers-off', reason: null, checkedAt: '2026-10-14'};
+  const invalidRuns: unknown[] = [false, [], {}, {...run, unexpected: true},
+    {...run, adapter: ''}, {...run, adapter: '../codex'}, {...run, adapter: 'a'.repeat(41)},
+    {...run, card: ''}, {...run, card: 'TLS-26\n'},
+    {...run, offered: 'true'}, {...run, offered: 1}, {...run, offered: null},
+    {...run, folderOnly: 'sandbox'}, {...run, mcpLevel: 'enabled'},
+    {...run, reason: ''}, {...run, reason: false}, {...run, reason: 'bad\nreason'},
+    {...run, checkedAt: '2026-02-30'}, {...run, checkedAt: '2026-10-14T00:00:00Z'}];
+  for (const key of Object.keys(run)) {
+    const incomplete: Record<string, unknown> = {...run};
+    delete incomplete[key];
+    invalidRuns.push(incomplete);
+  }
+  for (const invalidRun of invalidRuns) {
+    const matrix = structuredClone(TOOL_MATRIX);
+    Object.assign(matrix.tools.find((tool) => tool.key === 'codex')!, {run: invalidRun});
+    assert.throws(() => validateToolMatrix(matrix), /TOOL_MATRIX_INVALID: tools\[\d+\]\.run/u);
+  }
 });
 
 test('colocated matrix loader works in the repository and a copied exported src/shared tree', async () => {
@@ -177,7 +237,8 @@ test('DeepSeek Harness accepts only one bare stdout version line and never probe
   try {
     const binary = join(home, '.local/bin/dsh');
     await executable(binary);
-    const detected = (value: string) => [{ tool: 'deepseek-harness', variant: 'cli', version: value, models: [], syncOnly: false }];
+    const detected = (value: string) => [{ tool: 'deepseek-harness', variant: 'cli', version: value, models: [], syncOnly: false,
+      path: binary, realpath: binary }];
     for (const stdout of ['0.2.0-rc.2', '0.2.0-rc.2\n', '0.2.0-rc.2\r\n', '0.2.0+fixture\n']) {
       const calls: string[] = [];
       const runner: Runner = async (file, args, options) => {

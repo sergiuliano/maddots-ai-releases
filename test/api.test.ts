@@ -70,3 +70,47 @@ test('a 304 plan response has no JSON body, and caller cancellation is preserved
   const cancelled = new ApiClient(endpoint, (async () => { throw new Error('private'); }) as typeof fetch);
   await assert.rejects(cancelled.request('/api/helper/status', { signal: controller.signal }), { code: 'API_CANCELLED' });
 });
+
+test('HTTP diagnostics retain static routes and schema paths without request values or error text', async () => {
+  const headers = {'x-mdai-validation-paths': JSON.stringify(['/managed/0/state', '/managed/0/state', '/managed/private-secret', '', token]),
+    'x-mdai-route': '/api/helper/builds/private-secret'};
+  const api = new ApiClient(endpoint, async () => Response.json({error: {code: 'VALIDATION', message: token}}, {status: 400, headers}));
+  await assert.rejects(api.request(`/api/helper/builds/${'a'.repeat(64)}?itemId=private-secret`), (error: unknown) => {
+    assert(error instanceof ApiError);
+    assert.deepEqual(error.http, {method: 'GET', route: '/api/helper/builds/:digest', status: 400, code: 'VALIDATION',
+      instancePaths: ['/managed/0/state', '']});
+    assert(!JSON.stringify(error.http).includes('private-secret'));
+    assert(!JSON.stringify(error.http).includes(token));
+    return true;
+  });
+});
+
+test('HTTP diagnostics survive missing or malformed metadata and omit non-validation paths', async () => {
+  for (const paths of [undefined, 'not JSON', '{}', JSON.stringify(['x'.repeat(9000)])]) {
+    const api = new ApiClient(endpoint, async () => Response.json({error: {code: 'VALIDATION', message: 'private'}},
+      {status: 400, headers: paths ? {'x-mdai-validation-paths': paths} : {}}));
+    await assert.rejects(api.request('/api/helper/inventory', {body: {}}), (error: unknown) => {
+      assert(error instanceof ApiError);
+      assert.deepEqual(error.http, {method: 'POST', route: '/api/helper/inventory', status: 400, code: 'VALIDATION', instancePaths: []});
+      return true;
+    });
+  }
+  const api = new ApiClient(endpoint, async () => Response.json({error: {code: 'TOKEN_REVOKED', message: 'private'}},
+    {status: 401, headers: {'x-mdai-validation-paths': '["/managed"]'}}));
+  await assert.rejects(api.request('/api/helper/status'), (error: unknown) => {
+    assert(error instanceof ApiError);
+    assert.deepEqual(error.http, {method: 'GET', route: '/api/helper/status', status: 401, code: 'TOKEN_REVOKED'});
+    return true;
+  });
+});
+
+test('non-JSON HTTP failures retain status and static route without raw output', async () => {
+  const api = new ApiClient(endpoint, async () => new Response('private-proxy-body', {status: 502}));
+  await assert.rejects(api.request('/api/helper/imports/private-session/uploads', {body: {}}), (error: unknown) => {
+    assert(error instanceof ApiError);
+    assert.equal(error.code, 'API_RESPONSE_INVALID');
+    assert.deepEqual(error.http, {method: 'POST', route: '/api/helper/imports/:sessionId/uploads', status: 502, code: 'API_RESPONSE_INVALID'});
+    assert(!JSON.stringify(error).includes('private'));
+    return true;
+  });
+});

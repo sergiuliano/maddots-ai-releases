@@ -17,8 +17,8 @@ export interface ScanResult {
   findings: ScanFinding[];
 }
 
-/** Scan import, proposal or run-output bytes before a caller sends any content. */
-export function scanFiles(files: readonly ScanFile[]): ScanResult {
+/** Scan before sending. Run output supplies its own cap; skills retain the 1 MiB default. */
+export function scanFiles(files: readonly ScanFile[], options: {maxFileBytes?: number} = {}): ScanResult {
   const findings: ScanFinding[] = [];
   const seen = new Set<string>();
   const paths = files.map(file => scanSecrets(file.path, file.path));
@@ -35,7 +35,7 @@ export function scanFiles(files: readonly ScanFile[]): ScanResult {
   files.forEach((file, index) => add(file, paths[index].length ? '[redacted]' : file.path, paths[index]));
   files.forEach((file, index) => {
     const path = paths[index].length ? '[redacted]' : file.path;
-    if (file.content.byteLength > SKILL_LIMITS.fileBytes) {
+    if (file.content.byteLength > (options.maxFileBytes ?? SKILL_LIMITS.fileBytes)) {
       add(file, path, [{rule: 'file-size-limit', line: 1}]);
       return;
     }

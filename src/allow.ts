@@ -45,7 +45,7 @@ function diff(previous: VerifiedBuild, next: VerifiedBuild): string {
 export function toolsFor(entry: HoldingEntry, detectedTools?: readonly {tool: string; variant: string}[]): string[] {
   return TOOL_MATRIX.tools.filter(tool => tool.route === entry.item.route && tool.variants.some(variant =>
     !detectedTools || detectedTools.some(detected => detected.tool === tool.key && detected.variant === variant.key)))
-    .map(tool => tool.name);
+    .map(tool => tool.key);
 }
 async function previousAllowed(engine: SyncEngine, entry: HoldingEntry): Promise<VerifiedBuild | null> {
   const locks = await Promise.all([engine.locks.read(), engine.agentLocks.read()]);
@@ -64,7 +64,8 @@ async function review(engine: SyncEngine, skill: WaitingSkill, output: (line: st
   output(visibleText(`${skill.name} v${skill.version}`));
   const shown = new Set<string>();
   for (const entry of skill.entries) {
-    output(visibleText(`Route: ${entry.item.route}; tools: ${toolsFor(entry, detectedTools).join(', ') || 'agent build'}`));
+    const toolNames = toolsFor(entry, detectedTools).map(key => TOOL_MATRIX.tools.find(tool => tool.key === key)!.name);
+    output(visibleText(`Route: ${entry.item.route}; tools: ${toolNames.join(', ') || 'agent build'}`));
     const key = entry.build.signature;
     if (shown.has(key)) continue; shown.add(key);
     const reasons = codeReasons(entry.verified.files);

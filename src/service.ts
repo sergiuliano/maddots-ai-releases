@@ -122,6 +122,7 @@ function plist(paths: HelperPaths, executable: string, entrypoint: string, env: 
   <key>ProgramArguments</key>
   <array>
     <string>${xml(executable)}</string>
+    <string>--disable-sigusr1</string>
     <string>${xml(entrypoint)}</string>
     <string>service</string>
   </array>

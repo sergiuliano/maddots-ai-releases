@@ -7,6 +7,7 @@ import { pairingScopes } from '../src/pairing.js';
 import type { SecretName, SecretStore } from '../src/secret-store.js';
 import type { HelperState } from '../src/state.js';
 import { TokenManager } from '../src/token.js';
+import { RunnerCore, type RunnerOptions } from '../src/runner/runner.js';
 
 const day = 86_400_000;
 const epoch = Date.parse('2026-01-01T00:00:00Z');
@@ -36,7 +37,7 @@ function fixture(fetcher: typeof fetch, start = epoch, storage: 'keychain' | 'fi
   return { manager, state: () => state, secrets, operations, reminders, reads: () => reads, advance: (ms: number) => { now += ms; }, failWrites: (value: boolean) => { failWrite = value; } };
 }
 const statusData = (extra: object = {}) => ({ account: { id: 'user-1', name: 'Ana' }, scopes: pairingScopes,
-  renewBy: date(epoch + 90 * day), idleLapseAt: date(epoch + 30 * day), connections: [], pending: [], ...extra });
+  renewBy: date(epoch + 90 * day), idleLapseAt: date(epoch + 30 * day), connections: [], pending: [], runGrants: [], ...extra });
 
 test('rotation saves and verifies the successor before any request switches to it', async () => {
   const usedTokens: string[] = []; let requests = 0;
@@ -50,6 +51,19 @@ test('rotation saves and verifies the successor before any request switches to i
   assert(f.operations.indexOf('set:skills-token') < f.operations.lastIndexOf('get:skills-token'));
   await f.manager.request('/api/helper/plan');
   assert.deepEqual(usedTokens, [`Bearer ${oldToken}`, `Bearer ${oldToken}`, `Bearer ${newToken}`]);
+});
+
+test('local executable paths survive inventory refresh but never enter helper request bodies', async () => {
+  let body: unknown;
+  const f = fixture(async (_url, init) => {
+    body = JSON.parse(String(init?.body));
+    return Response.json({data: {pending: [{tool: added.tool, variant: added.variant}], connected: []}});
+  });
+  const local = {...added, path: '/private/local/bin/grok', realpath: '/private/local/lib/grok'};
+  await f.manager.proposeTools([tool, local]);
+  assert.equal(f.state().tools[1].path, local.path);
+  assert.equal(f.state().tools[1].realpath, local.realpath);
+  assert.deepEqual(body, {tools: [added]});
 });
 
 test('a failed rotation write retains the predecessor and retries on the next rotation header', async () => {
@@ -100,6 +114,19 @@ test('local idle lapse also stops before sending a token and clears only credent
   f.advance(30 * day);
   await assert.rejects(f.manager.request('/api/helper/plan'), { code: 'TOKEN_LAPSED' });
   assert.equal(requests, 0); assert.equal(f.state().status, 'pair_again'); assert.equal(f.secrets.size, 0);
+});
+
+test('a runner disconnect failure cannot prevent pair again or deletion of both credentials', async t => {
+  const core = new RunnerCore({data: '/private/tmp/tls21-disconnect-unused'} as RunnerOptions);
+  t.after(() => core.close());
+  let disconnects = 0;
+  t.mock.method(core, 'disconnect', async () => { disconnects++; throw new Error('unreadable runner state'); });
+  const f = fixture(async () => Response.json({data: {}}));
+  await f.manager.clearCredentials();
+  assert.equal(disconnects, 1);
+  assert.equal(f.state().status, 'pair_again');
+  assert.equal(f.secrets.has('skills-token'), false);
+  assert.equal(f.secrets.has('device-key'), false);
 });
 
 test('Renew reminder begins on day 76 and produces at most one dialog a day', async () => {

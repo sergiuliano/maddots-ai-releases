@@ -423,10 +423,12 @@ export class ClaudePluginDeliveryTarget implements DeliveryTarget {
     }
     const registered = await this.state().then(state => state.plugins.map(plugin => `maddots-${plugin.slug}`), () => []);
     const containers = new Set(['.claude-plugin', ...registered, ...entries.map(entry => this.pluginName(entry.workspaceId))]);
-    const unmanaged = inventory.unmanaged.filter(item => {
-      const folder = item as {home?: string; folderName?: string} | null;
-      return !folder || folder.home !== this.route || !containers.has(folder.folderName ?? '');
-    });
+    // SyncEngine associates replacement snapshots with this array's identity.
+    const unmanaged = inventory.unmanaged;
+    for (let index = unmanaged.length - 1; index >= 0; index--) {
+      const folder = unmanaged[index] as {home?: string; folderName?: string} | null;
+      if (folder?.home === this.route && containers.has(folder.folderName ?? '')) unmanaged.splice(index, 1);
+    }
     return {...inventory, managed, unmanaged, deliveryErrors: [...inventory.deliveryErrors, ...errors]};
   }
   async watchReadCopy(changed: () => void, watcher: (path: string, changed: () => void) => {close(): void}): Promise<{close(): void} | undefined> {

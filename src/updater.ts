@@ -10,6 +10,7 @@ import { HelperError, clock, runCommand, type Timing } from './config.js';
 import { assertNoSymlinks, atomicWrite, ensurePrivateDirectory, inside, readPrivateFile, withWriteLock, type HelperPaths } from './paths.js';
 import { packageInfrastructure, PACKAGE_TIMEOUT_MS, runPackageCommand, type PackageInfrastructure } from './npm.js';
 import { RELEASE_IDENTITY, type ReleaseIdentity } from './release-identity.js';
+import { runnerBusy } from './runner/runner.js';
 
 export const UPDATE_CHECK_INTERVAL_MS = 3_600_000;
 const SHA = /^[a-f0-9]{40}$/;
@@ -258,7 +259,7 @@ async function preserveStage(options: UpdateOptions, path: string): Promise<void
 async function savePointer(options: UpdateOptions, next: Pointer, selected: SelectedRelease): Promise<void> {
   const path = join(updateDirectory(options), 'current.json'), previous = await pointer(updateDirectory(options));
   await atomicJson(path, next);
-  try { await options.activate?.(selected); }
+  try { if (!runnerBusy()) await options.activate?.(selected); }
   catch (error) { await atomicJson(path, previous ?? {}); throw error; }
 }
 export async function checkForUpdate(options: UpdateOptions, fixture?: UpdateBackend): Promise<UpdateResult> {

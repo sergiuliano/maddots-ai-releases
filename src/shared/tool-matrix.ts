@@ -22,6 +22,15 @@ export type ToolVariant = {
   };
   models: { args: string[] | null; pattern: string | null };
 };
+export type ToolRun = {
+  adapter: string;
+  card: string;
+  offered: boolean;
+  folderOnly: 'os-sandbox' | 'no-shell' | 'none';
+  mcpLevel: 'servers-off' | 'tools-denied';
+  reason: string | null;
+  checkedAt: string;
+};
 export type ToolDefinition = {
   key: string;
   name: string;
@@ -34,7 +43,7 @@ export type ToolDefinition = {
   duplicateRule: 'none' | 'replace-local' | 'grok-ignore';
   reload: { kind: 'live' | 'command' | 'restart'; command: string | null };
   deliveryCard: string;
-  run: null;
+  run: ToolRun | null;
 };
 export type ToolMatrix = {
   format: 1;
@@ -139,7 +148,17 @@ export function validateToolMatrix(value: unknown): ToolMatrix {
     if (reload.kind === 'command') string(reload.command, `${path}.reload.command`);
     else if (reload.command !== null) invalid(`${path}.reload.command`);
     string(tool.deliveryCard, `${path}.deliveryCard`);
-    if (tool.run !== null) invalid(`${path}.run`);
+    if (tool.run !== null) {
+      const run = object(tool.run, `${path}.run`, ['adapter', 'card', 'offered', 'folderOnly', 'mcpLevel', 'reason', 'checkedAt']);
+      string(run.adapter, `${path}.run.adapter`);
+      if (!/^[a-z][a-z0-9-]{0,39}$/u.test(run.adapter)) invalid(`${path}.run.adapter`);
+      string(run.card, `${path}.run.card`);
+      if (typeof run.offered !== 'boolean') invalid(`${path}.run.offered`);
+      choice(run.folderOnly, `${path}.run.folderOnly`, ['os-sandbox', 'no-shell', 'none']);
+      choice(run.mcpLevel, `${path}.run.mcpLevel`, ['servers-off', 'tools-denied']);
+      if (run.reason !== null) string(run.reason, `${path}.run.reason`);
+      date(run.checkedAt, `${path}.run.checkedAt`);
+    }
     const variantKeys = new Set<string>();
     list(tool.variants, `${path}.variants`, (value, path) => {
       if (++variantCount > HELPER_MAX_TOOLS) invalid('tools.variants');
@@ -170,6 +189,7 @@ export function validateToolMatrix(value: unknown): ToolMatrix {
       } else if (models.pattern !== null) invalid(`${path}.models.pattern`);
     });
     if (!variantKeys.size) invalid(`${path}.variants`);
+    if (tool.run !== null && !(tool.variants as ToolVariant[]).some((variant) => variant.key === 'cli' && !variant.syncOnly)) invalid(`${path}.run`);
   });
   if (!toolKeys.size) invalid('tools');
   return value as ToolMatrix;

@@ -230,7 +230,15 @@
         "command": null
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "codex",
+        "card": "TLS-26",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "claude-code",
@@ -317,7 +325,15 @@
         "command": null
       },
       "deliveryCard": "TLS-16",
-      "run": null
+      "run": {
+        "adapter": "claude-code",
+        "card": "TLS-26",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "claude-desktop",
@@ -443,7 +459,15 @@
         "command": null
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "cursor",
+        "card": "TLS-27",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "vscode-copilot",
@@ -531,7 +555,15 @@
         "command": "/skills reload"
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "copilot",
+        "card": "TLS-27",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "devin",
@@ -605,7 +637,15 @@
         "command": null
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "devin",
+        "card": "TLS-43",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "cline",
@@ -692,7 +732,15 @@
         "command": null
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "cline",
+        "card": "TLS-42",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "continue",
@@ -758,7 +806,15 @@
         "command": null
       },
       "deliveryCard": "TLS-34",
-      "run": null
+      "run": {
+        "adapter": "continue",
+        "card": "TLS-34",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "gemini-cli",
@@ -805,7 +861,15 @@
         "command": "/skills reload"
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "gemini-cli",
+        "card": "TLS-43",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "antigravity",
@@ -893,7 +957,15 @@
         "command": null
       },
       "deliveryCard": "TLS-45",
-      "run": null
+      "run": {
+        "adapter": "antigravity",
+        "card": "TLS-43",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "opencode",
@@ -981,7 +1053,15 @@
         "command": null
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "opencode",
+        "card": "TLS-28",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "oh-my-pi",
@@ -1030,7 +1110,15 @@
         "command": null
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "oh-my-pi",
+        "card": "TLS-42",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "openclaw",
@@ -1096,7 +1184,15 @@
         "command": null
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "openclaw",
+        "card": "TLS-42",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "hermes",
@@ -1160,7 +1256,15 @@
         "command": null
       },
       "deliveryCard": "TLS-45",
-      "run": null
+      "run": {
+        "adapter": "hermes",
+        "card": "TLS-42",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "grok",
@@ -1231,7 +1335,15 @@
         "command": null
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "grok",
+        "card": "TLS-29",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "tools-denied",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     },
     {
       "key": "deepseek-harness",
@@ -1279,7 +1391,15 @@
         "command": null
       },
       "deliveryCard": "TLS-15",
-      "run": null
+      "run": {
+        "adapter": "deepseek-harness",
+        "card": "TLS-50",
+        "offered": false,
+        "folderOnly": "none",
+        "mcpLevel": "servers-off",
+        "reason": "Real-tool and no-MCP canary checks pending.",
+        "checkedAt": "2026-10-14"
+      }
     }
   ]
 }

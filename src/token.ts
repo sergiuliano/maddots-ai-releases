@@ -4,6 +4,7 @@ import type { DetectedTool } from './detect.js';
 import { parseConnections, parseScopes, reportedTools, safeText, type PairingCredential } from './pairing.js';
 import type { SecretStore } from './secret-store.js';
 import type { HelperState, StateStore } from './state.js';
+import { disconnectRunners } from './runner/runner.js';
 
 export type TokenRequestOptions = Omit<ApiRequestOptions, 'token'>;
 export type TokenStatus = { state: HelperState; renewReminder: boolean; syncAllowed: boolean; message: string };
@@ -46,7 +47,7 @@ export class TokenManager {
       ...previous, status: 'connected', helperId: credential.helperId, account: credential.account,
       scopes: [...credential.scopes], issuedAt: new Date(this.timing.now()).toISOString(),
       renewBy: credential.renewBy, idleLapseAt: credential.idleLapseAt,
-      tools: reportedTools(tools), pendingTools: [], tokenStorage: this.secrets.storage,
+      tools: tools.map(tool => ({...tool, models: [...tool.models]})), pendingTools: [], tokenStorage: this.secrets.storage,
       lastDetectionAt: new Date(this.timing.now()).toISOString(),
       connections: credential.connections.map(connection => ({ ...connection })), proposedTools: [],
     };
@@ -155,7 +156,7 @@ export class TokenManager {
     this.currentToken = data.token;
   }
 
-  async refreshStatus(): Promise<HelperState> {
+  async refreshStatus(onStatus?: (data: Record<string, unknown>) => void): Promise<HelperState> {
     const response = await this.request<unknown>('/api/helper/status');
     const data = response.data;
     if (!isObject(data) || !isObject(data.account) || !safeText(data.account.id, 128) || !safeText(data.account.name) ||
@@ -184,6 +185,7 @@ export class TokenManager {
     await this.stateStore.write(state);
     this.retryRenewAt = 0;
     await this.showReminder();
+    onStatus?.(data);
     return this.stateStore.read();
   }
 
@@ -194,7 +196,7 @@ export class TokenManager {
     const waiting = new Set(state.pendingTools.map(identity));
     const previousProposals = state.proposedTools ?? state.pendingTools.map(({ tool, variant }) => ({ tool, variant }));
     const proposed = new Set(previousProposals.map(identity));
-    const detected = reportedTools(tools);
+    const detected = tools.map(tool => ({...tool, models: [...tool.models]}));
     // Initial unticked tools remain untracked. Only later tools previously proposed may retry after expiry or decline.
     const fresh = detected.filter(tool => !connected.has(identity(tool)) && !waiting.has(identity(tool)) &&
       (!known.has(identity(tool)) || proposed.has(identity(tool))));
@@ -205,7 +207,7 @@ export class TokenManager {
       await this.stateStore.write(updated);
       return updated;
     }
-    const response = await this.request<unknown>('/api/helper/tools', { method: 'POST', body: { tools: fresh } });
+    const response = await this.request<unknown>('/api/helper/tools', { method: 'POST', body: { tools: reportedTools(fresh) } });
     const data = response.data;
     if (!isObject(data)) throw new HelperError('API_RESPONSE_INVALID', 'MadDots AI returned invalid tool approval information.');
     const pending = toolIdentities(data.pending);
@@ -247,6 +249,7 @@ export class TokenManager {
 
   async clearCredentials(): Promise<void> {
     this.currentToken = undefined;
+    await disconnectRunners().catch(() => {});
     const state = await this.stateStore.read();
     await this.stateStore.write({ ...state, status: 'pair_again', scopes: [], pendingTools: [], connections: [], proposedTools: [] });
     // Do not touch skills, lock.json, or backups. Attempt both removals even if one fails.

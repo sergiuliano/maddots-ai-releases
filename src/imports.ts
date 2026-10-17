@@ -20,7 +20,7 @@ export type ReplaceLocalInstruction = FolderRef & {
   type: 'replace_local'; sessionId: string; skillId: string; alsoLinkedFrom: FolderRef[];
 };
 type SavedFolder = FolderRef & {originalPath: string; links: (FolderRef & {target: string})[]; backupId?: string; complete?: boolean;
-  instruction?: ReplaceLocalInstruction; reported?: boolean; failed?: string; kept?: 'protected_home'};
+  instruction?: ReplaceLocalInstruction; authorized?: boolean; reported?: boolean; failed?: string; kept?: 'protected_home'};
 type SavedSession = {sessionId: string; folders: SavedFolder[]};
 type ImportJournal = {format: 1; sessions: SavedSession[]; closed?: string[]};
 const MAX_SESSIONS = 1000, MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
@@ -92,6 +92,7 @@ export class ImportEngine {
             folder.links.some(link => !validRef(link) || typeof link.target !== 'string' || link.target.includes('\0')) ||
             (folder.backupId !== undefined && !safeName(folder.backupId)) || (folder.complete !== undefined && typeof folder.complete !== 'boolean') ||
             (folder.reported !== undefined && typeof folder.reported !== 'boolean') ||
+            (folder.authorized !== undefined && typeof folder.authorized !== 'boolean') ||
             (folder.failed !== undefined && (typeof folder.failed !== 'string' || !/^[A-Z][A-Z0-9_]{0,79}$/.test(folder.failed))) ||
             (folder.kept !== undefined && folder.kept !== 'protected_home') ||
             (folder.instruction !== undefined && (!replaceInstruction(folder.instruction) || identity(folder.instruction) !== identity(folder) || folder.instruction.sessionId !== session.sessionId))))) {
@@ -277,24 +278,44 @@ export class ImportEngine {
       return tool.reads.includes(definition.readPath ?? definition.path);
     }));
   }
-  /** Authenticated plan instructions are the browser's recorded click. Call under the write lock. */
-  async executeInstructions(instructions: readonly unknown[]): Promise<void> {
+  /** Older journals need one fresh full plan before an unstarted replacement can resume. */
+  async needsFullPlan(): Promise<boolean> {
+    return (await this.journal()).sessions.some(session => session.folders.some(folder => folder.instruction &&
+      !folder.backupId && !folder.complete && !folder.reported && !folder.failed && folder.authorized === undefined));
+  }
+  /** Retain the latest full plan before delivery. An empty plan withdraws unstarted replacements. Call under the write lock. */
+  async rememberInstructions(instructions: readonly unknown[]): Promise<void> {
     const pending = await this.journal();
-    // Shared corruption must remain recoverable after repair, never become a terminal folder failure.
-    await this.locks.read();
-    await this.revoked();
+    const current: ReplaceLocalInstruction[] = [];
     let changed = false;
     for (const raw of instructions) {
       let instruction: ReplaceLocalInstruction | null;
       try { instruction = replaceInstruction(raw); } catch { continue; }
       if (!instruction || pending.closed?.includes(instruction.sessionId)) continue;
+      current.push(instruction);
       const selected = pending.sessions.find(session => session.sessionId === instruction.sessionId)?.folders.find(folder => identity(folder) === identity(instruction));
       if (!selected || selected.instruction) continue;
       selected.instruction = instruction; changed = true;
     }
+    for (const folder of pending.sessions.flatMap(session => session.folders)) {
+      if (!folder.instruction) continue;
+      const authorized = current.some(instruction => instruction.sessionId === folder.instruction!.sessionId &&
+        instruction.skillId === folder.instruction!.skillId && identity(instruction) === identity(folder));
+      if (folder.authorized !== authorized) {folder.authorized = authorized; changed = true;}
+    }
     if (changed) await this.save(pending);
+  }
+  /** Undefined means an unchanged 304, never a new empty full plan. Call under the write lock. */
+  async executeInstructions(instructions?: readonly unknown[]): Promise<void> {
+    if (instructions !== undefined) await this.rememberInstructions(instructions);
+    const pending = await this.journal();
+    // Shared corruption must remain recoverable after repair, never become a terminal folder failure.
+    await this.locks.read();
+    await this.revoked();
     let retry: unknown;
     for (const folder of pending.sessions.flatMap(session => session.folders).filter(folder => folder.instruction && !folder.reported && !folder.failed)) {
+      // Prepared backups and completed receipts are durable transactions that must still recover.
+      if (!folder.backupId && !folder.complete && folder.authorized !== true) continue;
       try { await this.replaceOne(pending, folder); }
       catch (error) {
         if (error instanceof HelperError && error.code.startsWith('TOKEN_')) throw error;
@@ -361,7 +382,7 @@ export class ImportEngine {
     folder.reported = true;
     await this.save(journal);
   }
-  async applyInstructions(instructions: readonly unknown[]): Promise<void> {
+  async applyInstructions(instructions?: readonly unknown[]): Promise<void> {
     return withWriteLock(this.options.paths, () => this.executeInstructions(instructions), this.timing);
   }
 }

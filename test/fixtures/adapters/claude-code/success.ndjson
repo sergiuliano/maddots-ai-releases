@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"fixture-session","mcp_servers":[],"plugins":[{"name":"maddots-run","path":"/project/.maddots/runs/fixture/plugin"}],"tools":["Read","Write","Bash","Skill"]}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Intermediate text is not the final answer."}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"Finished the fixture task.\nSecond paragraph.","session_id":"fixture-session","total_cost_usd":0,"permission_denials":[]}

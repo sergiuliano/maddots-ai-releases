@@ -10,6 +10,9 @@ export type DetectedTool = {
   version: string | null;
   models: string[];
   syncOnly: boolean;
+  /** CLI locations stay on this computer; reportedTools removes them from every request. */
+  path?: string;
+  realpath?: string;
 };
 export type DetectionOptions = { home: string; env?: NodeJS.ProcessEnv; runner?: Runner; matrix?: ToolMatrix };
 
@@ -130,7 +133,7 @@ export async function detectTools(options: DetectionOptions): Promise<DetectedTo
   const found: DetectedTool[] = [];
   for (const tool of matrix.tools) {
     for (const variant of tool.variants) {
-      let detected: { version: string | null; models: string[] } | null = null;
+      let detected: { version: string | null; models: string[]; path?: string; realpath?: string } | null = null;
       for (const binary of await binaryPaths(variant.detect.binaries, home, env)) {
         if (tool.key === 'cursor' && await cursorClash(binary, home)) continue;
         try {
@@ -145,7 +148,7 @@ export async function detectTools(options: DetectionOptions): Promise<DetectedTo
           if (bareVersion && match?.[0] !== text) continue;
           const confirmedVersion = version(match?.[1] ?? match?.[0]);
           if (!confirmedVersion) continue;
-          detected = { version: confirmedVersion, models: await modelsFor(binary, variant, runner, env) };
+          detected = { version: confirmedVersion, models: await modelsFor(binary, variant, runner, env), path: binary, realpath: await realpath(binary) };
           break;
         } catch { /* An absent, incompatible, or broken variant is not installed. */ }
       }
@@ -167,7 +170,7 @@ export async function detectTools(options: DetectionOptions): Promise<DetectedTo
           if (detected) break;
         }
       }
-      if (detected) found.push({ tool: tool.key, variant: variant.key, version: detected.version, models: detected.models, syncOnly: variant.syncOnly });
+      if (detected) found.push({ tool: tool.key, variant: variant.key, ...detected, syncOnly: variant.syncOnly });
     }
   }
   return found;

@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","mcp_servers":[{"name":"maddots-canary","status":"connected"}],"plugins":[],"tools":["Read","mcp__maddots-canary__maddots_canary_ping","mcp__claude-in-chrome__tabs_context_mcp"]}
+{"type":"result","subtype":"success","is_error":false,"result":"This result must not bypass the init check."}

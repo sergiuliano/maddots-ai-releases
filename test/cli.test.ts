@@ -76,7 +76,7 @@ test('CLI pairing stores only stdin secrets, installs the service, and uninstall
 });
 test('CLI parses future commands and refuses a relative file flag before asking for confirmation', async () => {
   const output: string[] = [];
-  await runCli(['--version'], { output: line => output.push(line) }); assert.deepEqual(output, ['0.1.1']);
+  await runCli(['--version'], { output: line => output.push(line) }); assert.deepEqual(output, ['0.1.2']);
   await assert.rejects(runCli(['allow'], {isTTY: false}), {code: 'ALLOW_TTY_REQUIRED'});
   await assert.rejects(runCli(['allow', '--all'], {isTTY: false}), {code: 'ALLOW_TTY_REQUIRED'});
   await assert.rejects(runCli(['allow', '--yes'], {isTTY: true}), {code: 'USAGE'});

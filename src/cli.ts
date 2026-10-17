@@ -12,7 +12,7 @@ import { describeUnmanaged, ImportEngine } from './imports.js';
 import { grokDuplicateWarning } from './duplicates.js';
 import { TOOL_MATRIX } from './shared/tool-matrix.js';
 import { LockStore } from './lock.js';
-import { ClaudePluginDeliveryTarget } from './delivery/claude-plugin.js';
+import { ClaudePluginDeliveryTarget, ClaudePluginSyncEngine } from './delivery/claude-plugin.js';
 import { AgentsFolderDeliveryTarget } from './delivery/agents-folder.js';
 import { PairingFlow, helperOs } from './pairing.js';
 import { createPaths, ensurePaths, withWriteLock } from './paths.js';
@@ -29,6 +29,9 @@ import { interruptWaitingDialog, reserveWaitingDialog, showWaitingDialog, type P
 import { SyncEngine, type SyncOptions } from './sync.js';
 import { BuildVerifier } from './verify.js';
 import type { HelperState } from './state.js';
+import { runnerBusy, stopRunners, tickRunners } from './runner/runner.js';
+import { cleanupRunHomes } from './runner/process.js';
+import { RunsRuntime } from './runner/cli-runs.js';
 
 export type CliOptions = {
   env?: NodeJS.ProcessEnv; home?: string; runner?: Runner; request?: typeof fetch; timing?: Timing;
@@ -49,6 +52,7 @@ async function prompt(_warning: string): Promise<string> {
 function argumentsFor(argv: string[]): { command: string; tokenFile?: string; restoreId?: string; rollback: boolean; all?: boolean } {
   const commands = ['connect', 'status', 'allow', 'backups', 'import', 'uninstall', 'update', 'service'];
   const command = argv[0] ?? 'help';
+  if (command === 'runs' || command === 'agent') return {command, rollback: false};
   if (['help', '--help', '-h', '--version', '--self-test'].includes(command)) {
     if (argv.length > 1) throw new HelperError('USAGE', 'Unexpected command arguments.');
     return { command, rollback: false };
@@ -64,6 +68,10 @@ function argumentsFor(argv: string[]): { command: string; tokenFile?: string; re
   }
   return { command, tokenFile, restoreId, rollback, all };
 }
+function runnerErrorCode(error: unknown): string {
+  const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : '';
+  return /^[A-Za-z0-9_]{1,60}$/.test(code) ? code : 'runner_failed';
+}
 export async function computerName(runner: Runner = runCommand, env: NodeJS.ProcessEnv = process.env): Promise<string> {
   let name = hostname();
   try { name = (await runner('/usr/sbin/scutil', ['--get', 'LocalHostName'], { env: cleanEnvironment(env) })).stdout.trim() || name; } catch { /* Hostname is the documented fallback. */ }
@@ -76,7 +84,7 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
   // Candidate validation must never read credentials or pair with the server.
   if (args.command === '--self-test') return;
   if (['help', '--help', '-h'].includes(args.command)) {
-    output('maddots-ai connect | status | allow [--all] | backups [restore <id>] | import | uninstall | update [--rollback] | service | --version'); return;
+    output('maddots-ai connect | status | allow [--all] | runs [test <tool> [--model <model>]] | agent setup [handle|agent-id] | agent access <handle|agent-id> folder-only|full | backups [restore <id>] | import | uninstall | update [--rollback] | service | --version'); return;
   }
   const isTTY = options.isTTY ?? !!(process.stdin.isTTY && process.stdout.isTTY);
   if (args.command === 'allow' && !isTTY) throw new HelperError('ALLOW_TTY_REQUIRED', 'Allow requires an interactive terminal on this computer.');
@@ -142,6 +150,19 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
     // Supply dialog text as an argument to a fixed script, never AppleScript source.
     await runner('/usr/bin/osascript', ['-e', 'on run argv\ndisplay dialog (item 1 of argv) buttons {"OK"} default button "OK"\nend run', message], { env: cleanEnvironment(config.env) });
   });
+  const runsFor = (helperId: string) => new RunsRuntime({paths, helperId, api, secrets, state: stateStore,
+    endpoint: config.endpoint, env: config.env, request: options.request, timing, verifier: options.verifier,
+    notify: {runner, entrypoint: runtime.bootstrapEntrypoint}});
+  if (args.command === 'runs' || args.command === 'agent') {
+    if (!saved.helperId || saved.status !== 'connected') throw new HelperError('TOKEN_REQUIRED', 'Connect this computer before setting up runs.');
+    if (saved.tokenStorage !== 'keychain') throw new HelperError('FILE_RUNS_REFUSED', 'Agent runs require Keychain storage.');
+    const runs = runsFor(saved.helperId);
+    try { await runs.command(argv, {isTTY, output, prompt: options.confirm ?? (async question => {
+      const input = createInterface({input: process.stdin, output: process.stdout});
+      try {return await input.question(question + ' ');} finally {input.close();}
+    })}); } finally {await runs.close();}
+    return;
+  }
   if (args.command === 'import') {
     if (!saved.helperId || saved.status !== 'connected' || !saved.scopes.includes('import_upload')) {
       throw new HelperError('TOKEN_REQUIRED', 'Connect this computer before importing the folders selected on ai.maddots.app.');
@@ -158,19 +179,19 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
   let syncComputerName = 'Computer';
   const syncFor = (state: HelperState): SyncEngine => {
     if (!state.helperId) throw new HelperError('TOKEN_REQUIRED', 'Run maddots-ai connect to connect this computer.');
-    // Pilot delivery only. Later route cards register their own adapters.
-    const pilotRoutes: ReadonlySet<string> = new Set(['agents-folder']);
+    const pilotRoutes: ReadonlySet<string> = new Set(['agents-folder', 'claude-plugin']);
     const routes = new Set((state.connections ?? []).flatMap(connection => TOOL_MATRIX.tools
       .filter(tool => tool.key === connection.tool).map(tool => tool.route)));
-    // Release 8 merge: the shared folder uses TLS-15's adapter. TLS-16's Claude Code plugin needs its
-    // ClaudePluginSyncEngine and is wired by the pilot service card (FOLLOWUPS 44).
     const targets = options.deliveryTargets ?? [...routes].filter(route => pilotRoutes.has(route)).flatMap(route => {
-      if (route === 'agents-folder') return [new AgentsFolderDeliveryTarget(paths)];
+      if (route === 'agents-folder') return [new AgentsFolderDeliveryTarget(paths)] as DeliveryTarget[];
+      if (route === 'claude-plugin') return [new ClaudePluginDeliveryTarget({paths, helperId: state.helperId!, runner, env: config.env})];
       const definition = TOOL_MATRIX.routes[route];
       return definition?.kind === 'folder' ? [new FolderDeliveryTarget(paths, route, join(paths.home, definition.path.slice(2)))] : [];
     });
-    return new SyncEngine({paths, helperId: state.helperId, client: tokens, targets, verifier: options.verifier,
-      timing, computerName: syncComputerName, tools: state.tools, tokenStorage: state.tokenStorage, watchRoute: options.watchRoute});
+    const syncOptions = {paths, helperId: state.helperId, client: tokens, targets, verifier: options.verifier,
+      timing, computerName: syncComputerName, tools: state.tools, tokenStorage: state.tokenStorage, watchRoute: options.watchRoute};
+    const plugin = targets.find((target): target is ClaudePluginDeliveryTarget => target instanceof ClaudePluginDeliveryTarget);
+    return plugin ? new ClaudePluginSyncEngine(syncOptions, plugin) : new SyncEngine(syncOptions);
   };
   if (args.command === 'allow') {
     syncComputerName = await computerName(runner, config.env);
@@ -245,17 +266,23 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
       }
     }, timing);
   } else if (args.command === 'uninstall') {
+    await stopRunners();
+    const homesCleaned = await cleanupRunHomes(paths.data).then(() => true, () => false);
     await withWriteLock(paths, async () => {
       await removeService(paths, { runner, env: config.env });
       try { await tokens.revoke(); }
       catch { output('The server could not confirm token revocation. Revoke this computer on ai.maddots.app.'); }
       // Local credentials are removed even when the service cannot be reached.
       await tokens.clearCredentials();
+      if (!homesCleaned) output(`Some run homes were kept for safety in ${join(paths.data, 'run-homes')}.`);
       await stateStore.write({ format: 1, endpoint: config.endpoint.href, status: 'unpaired', scopes: [], tools: [], pendingTools: [], tokenStorage: 'keychain' });
       output(`Skills remain in their tool folders. The lock file and backups remain in ${paths.data}.`);
       output('Run npm uninstall -g maddots-ai to remove the helper package.');
     }, timing);
   } else if (args.command === 'service') {
+    let runs: RunsRuntime | undefined, runsIdentity: string | undefined;
+    let grants: unknown;
+    let nextAgentNotify = 0;
     let initialDetection = true;
     let nextUpdateCheck = 0;
     let nextPointerCheck = 0;
@@ -276,7 +303,7 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
         if (initialDetection || !state.lastDetectionAt || timing.now() - Date.parse(state.lastDetectionAt) >= 3_600_000) tools = await detect();
         initialDetection = false;
         try {
-          const refreshed = await tokens.refreshStatus();
+          const refreshed = await tokens.refreshStatus(data => {grants = data.runGrants ?? [];});
           if (refreshed.status === 'connected' && tools) await tokens.proposeTools(tools);
           if (refreshed.status === 'connected' && refreshed.helperId && refreshed.scopes.includes('import_upload')) {
             await new ImportEngine({paths, helperId: refreshed.helperId, client: tokens, timing}).uploadPending();
@@ -292,6 +319,29 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
       }
       const state = await stateStore.read();
       syncActive = state.status === 'connected' && !!state.helperId;
+      try {
+      if (runs && (state.status === 'pair_again' || state.status === 'unpaired')) {
+        await runs.close(); runs = undefined; runsIdentity = undefined; grants = undefined;
+      }
+      if (state.status === 'connected' && state.helperId && state.tokenStorage === 'keychain') {
+        if (!runs || runsIdentity !== state.helperId) {
+          await runs?.close(); runs = runsFor(state.helperId); runsIdentity = state.helperId;
+        }
+        try { await runs.init(); }
+        catch (error) { output(`Test recovery unavailable this cycle (${runnerErrorCode(error)}).`); }
+        if (grants !== undefined) {
+          const pendingGrants = grants; grants = undefined;
+          try { await runs.activation.syncGrants(pendingGrants); }
+          catch (error) { output(`Run activation unavailable this cycle (${runnerErrorCode(error)}).`); }
+        }
+      }
+      } catch (error) { output(`Runs paused this cycle (${runnerErrorCode(error)}).`); }
+      try { await tickRunners(); }
+      catch (error) { output(`Runs paused this cycle (${runnerErrorCode(error)}).`); }
+      if (runs && state.status === 'connected' && timing.now() >= nextAgentNotify) {
+        nextAgentNotify = timing.now() + 60_000;
+        try {await runs.notifySetup();} catch {output('Agent setup notification is unavailable this cycle.');}
+      }
       if (state.status === 'connected' && state.helperId) {
         const identity = JSON.stringify([state.helperId, state.connections, state.tools, state.tokenStorage]);
         if (!sync || syncIdentity !== identity) {
@@ -325,19 +375,21 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
       if (timing.now() >= nextPointerCheck) {
         nextPointerCheck = timing.now() + 60_000;
         const selected = await (options.updates?.select ?? selectRelease)(updateOptions);
-        if (selected.root !== runtime.runningRoot) {
+        if (selected.root !== runtime.runningRoot && !runnerBusy() && !runs?.activation.busy) {
           throw new HelperError('UPDATE_RESTART', 'Restarting into the selected verified helper after sync completed.');
         }
       }
       if (config.env.MADDOTS_AI_AUTO_UPDATE !== '0' && timing.now() >= nextUpdateCheck) {
         nextUpdateCheck = timing.now() + UPDATE_CHECK_INTERVAL_MS;
         const result = await (options.updates?.check ?? checkForUpdate)(updateOptions);
-        if (result.status === 'prepared') {
+        if (result.status === 'prepared' && !runnerBusy() && !runs?.activation.busy) {
           throw new HelperError('UPDATE_RESTART', 'Restarting into the verified helper update after sync completed.');
         }
       }
     }, { signal: options.signal, sleep: timing.sleep, intervalMs: () => syncActive ? 1000 : 60_000 });
     } finally {
+      await runs?.close();
+      await stopRunners();
       options.signal?.removeEventListener('abort', cancelDialog);
       dialogStop.abort();
       try { sync?.close(); }

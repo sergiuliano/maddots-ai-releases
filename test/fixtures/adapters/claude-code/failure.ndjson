@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","mcp_servers":[],"plugins":[],"tools":["Read","Bash"]}
+{"type":"result","subtype":"error_during_execution","is_error":true,"result":"A fixture error must not become a successful comment.","errors":["Fixture failure"]}

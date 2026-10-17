@@ -1,4 +1,5 @@
 import { HelperError } from './config.js';
+import {HELPER_VALIDATION_PATHS_HEADER, helperRouteTemplate, safeHelperInstancePaths, type HelperHttpDiagnostic} from './shared/helper-http-diagnostics.js';
 
 export type Scope = 'sync' | 'import_upload' | 'proposal_upload' | 'run_claim';
 export type ApiRequestOptions = {
@@ -25,7 +26,7 @@ const messages: Record<string, string> = {
 };
 
 export class ApiError extends HelperError {
-  constructor(code: string, readonly status: number, readonly headers: Headers = new Headers()) {
+  constructor(code: string, readonly status: number, readonly headers: Headers = new Headers(), readonly http?: HelperHttpDiagnostic) {
     super(code, messages[code] ?? 'MadDots AI could not complete the request. Retry later.');
   }
 }
@@ -108,13 +109,27 @@ export class ApiClient {
       throw new HelperError('API_CONNECTION_FAILED', 'Could not reach MadDots AI. Check the connection and retry.');
     }
     if (response.status === 304) return { data: undefined as T, headers: response.headers, status: response.status };
+    const httpError = (code: string) => {
+      const route = helperRouteTemplate(url.pathname);
+      let instancePaths: string[] = [];
+      if (code === 'VALIDATION') {
+        const paths = response.headers.get(HELPER_VALIDATION_PATHS_HEADER);
+        try {if (paths && paths.length <= 8192) instancePaths = safeHelperInstancePaths(JSON.parse(paths));} catch { /* Diagnostics cannot replace the original HTTP failure. */ }
+      }
+      return new ApiError(code, response.status, response.headers, route ? {
+        method: options.method ?? (options.body === undefined ? 'GET' : 'POST'), route, status: response.status, code,
+        ...(code === 'VALIDATION' ? {instancePaths} : {}),
+      } : undefined);
+    };
     const limit = url.pathname.startsWith('/api/helper/builds/') ? 16 * 1024 * 1024
       : url.pathname === '/api/helper/plan' ? 4 * 1024 * 1024 : 1024 * 1024;
-    const envelope = await boundedJson(response, limit);
+    let envelope: Record<string, unknown>;
+    try {envelope = await boundedJson(response, limit);}
+    catch (error) {if (!response.ok && error instanceof HelperError) throw httpError(error.code); throw error;}
     if (!response.ok) {
       const error = isObject(envelope.error) ? envelope.error : undefined;
       const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.code) ? error.code : 'API_FAILED';
-      throw new ApiError(code, response.status, response.headers);
+      throw httpError(code);
     }
     if (!Object.hasOwn(envelope, 'data')) throw new HelperError('API_RESPONSE_INVALID', 'MadDots AI returned an invalid response envelope.');
     return { data: envelope.data as T, headers: response.headers, status: response.status };

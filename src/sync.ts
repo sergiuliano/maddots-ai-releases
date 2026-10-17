@@ -453,6 +453,11 @@ export class SyncEngine {
       this.readCopyRetries.clear();
       this.meta = {...this.meta, revoked: plan.revoked, pollAfterSeconds: plan.pollAfterSeconds, degraded: plan.degraded};
       await atomicWrite(join(this.options.paths.data, 'sync-meta.json'), JSON.stringify(this.meta) + '\n');
+      const imports = new ImportEngine({paths: this.options.paths, helperId: this.options.helperId, client: this.options.client,
+        targets: this.options.targets, verifier: this.verifier, timing: this.timing});
+      let retryInstructions = false;
+      try {await imports.rememberInstructions(plan.instructions);}
+      catch (error) {this.importRetry(error); retryInstructions = true;}
       try { await this.holding.reconcile(plan.items, plan.revoked, plan.degraded); }
       catch (error) { this.holdingFailure(error); }
       // New revocation evidence takes priority over an interrupted placement.
@@ -509,11 +514,9 @@ export class SyncEngine {
       for (const item of plan.items) {
         await apply(item);
       }
-      let retryInstructions = false;
-      if (!plan.degraded) {
+      if (!plan.degraded && !retryInstructions) {
         try {
-          await new ImportEngine({paths: this.options.paths, helperId: this.options.helperId, client: this.options.client,
-            targets: this.options.targets, verifier: this.verifier, timing: this.timing}).executeInstructions(plan.instructions);
+          await imports.executeInstructions();
         } catch (error) {
           this.importRetry(error);
           // A local retry may have prevented journaling the click. Fetch its full plan again.
@@ -889,14 +892,17 @@ export class SyncEngine {
           }
           if (saved.planRevision === null) this.meta.planRevision = null;
         } catch (error) { if (!absent(error)) throw error; }
+        const imports = new ImportEngine({paths: this.options.paths, helperId: this.options.helperId, client: this.options.client,
+          targets: this.options.targets, verifier: this.verifier, timing: this.timing});
+        try {if (await imports.needsFullPlan()) this.meta.planRevision = null;}
+        catch (error) {this.importRetry(error);}
         const response = await this.options.client.request<SyncPlan>('/api/helper/plan', {headers: this.meta.planRevision ? {'If-None-Match': this.meta.planRevision} : {}});
         if (response.status !== 304) {
           await this.applyPlan(response.data); this.nextPlan = now + response.data.pollAfterSeconds * 1000;
         } else {
           if (this.meta.degraded === false) {
             try {
-              await new ImportEngine({paths: this.options.paths, helperId: this.options.helperId, client: this.options.client,
-                targets: this.options.targets, verifier: this.verifier, timing: this.timing}).applyInstructions([]);
+              await imports.applyInstructions();
             } catch (error) {this.importRetry(error);}
           }
           this.nextPlan = now + this.meta.pollAfterSeconds * 1000;

@@ -121,6 +121,44 @@ test('TLS-15 delivers byte-for-byte TLS-06 JSON-line renderer output', async () 
   } finally {await f.close();}
 });
 
+test('TLS-49 delivers only to the shared folder, reports dsh copies and presents live reload', async () => {
+  const f = await fixture();
+  try {
+    const dsh = TOOL_MATRIX.tools.find(tool => tool.key === 'deepseek-harness')!;
+    assert.equal(dsh.route, 'agents-folder');
+    assert.deepEqual(dsh.reads, ['~/.agents/skills']);
+    assert.deepEqual(dsh.legacyReads, ['~/.dsh/skills']);
+    assert.deepEqual(dsh.homes, [{glob: '~/.dsh', skills: '~/.dsh/skills'}]);
+    assert.equal(dsh.duplicateRule, 'replace-local');
+    f.options.tools = tools.filter(tool => tool.tool === dsh.key);
+    const engine = f.engine(), first = f.build();
+    await engine.reconcile(); await engine.applyPlan(f.plan([f.item(first)]));
+    assert.deepEqual(await readdir(f.route), ['example']);
+    await missing(join(f.home, '.dsh'));
+    const local = await f.local('.dsh/skills/example');
+    await writeFile(join(local, 'SKILL.md'), skillText('example', 'Local dsh copy.'));
+    const before = await snapshot(local);
+    const duplicate = {tool: dsh.key, home: '.dsh', folderName: 'example', skillId: first.skillId};
+    assert.deepEqual((await engine.inventory()).duplicates, [duplicate]);
+    assert.deepEqual(await engine.localCopyQuestions(), [{...duplicate, action: 'replace_local', message: 'Replace local copies'}]);
+    const next = f.build(2, 'example', skillText('example', 'Updated shared copy.'));
+    const asking = f.item(next, {kind: 'update', state: 'asking', answer: null,
+      restartHints: [{tool: dsh.key, reload: 'restart', command: null}]});
+    await engine.applyPlan(f.plan([asking]));
+    const [question] = await engine.questions();
+    assert.deepEqual(question.restartHints, [{tool: dsh.key, reload: 'live', command: null}]);
+    assert.deepEqual(question.duplicates, [{...duplicate, action: 'replace_local', message: 'Replace local copies'}]);
+    assert.deepEqual(await snapshot(local), before);
+    assert.deepEqual(await listBackups(f.paths), []);
+    await engine.applyPlan(f.plan([{...asking, state: 'approved', answer: 'update'}]));
+    assert.equal(await readFile(join(f.route, 'example/SKILL.md'), 'utf8'), skillText('example', 'Updated shared copy.'));
+    assert.deepEqual(await snapshot(local), before, 'A sync approval does not authorize replacing the local dsh copy.');
+    assert.deepEqual(await readdir(f.route), ['example']);
+    assert.equal((await engine.locks.read()).entries.length, 1);
+    assert.deepEqual((await engine.inventory()).deliveryErrors, []);
+  } finally {await f.close();}
+});
+
 for (const text of [skillText('other'), 'No frontmatter.', '---\nname: Example\ndescription: Fixture\n---\n', '---\nname: example\nname: other\n---\n', '---\nmetadata:\n  name: example\n---\n',
   ...['{"name":"other","name":"example"}', '{"metadata":{"name":"example"}}', '{"name":"Example"}', '["example"]', '{"name":"example"'].map(line => `---\n${line}\n---\nFixture skill.\n`)]) {
   test(`TLS-15 rejects a folder/frontmatter mismatch: ${JSON.stringify(text.split('\n').slice(0, 3))}`, async () => {

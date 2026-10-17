@@ -74,6 +74,7 @@ export type PairingPollResponse = {status: 'pending'; expiresAt: string} | Pairi
 export type HelperStatus = {
   account: HelperAccount; computerName: string; scopes: HelperScope[]; renewBy: string;
   idleLapseAt: string; connections: ToolConnection[]; pending: ToolIdentity[];
+  runGrants: {aiToolId: string; expiresAt: string}[];
 };
 export type AddedToolsResponse = {pending: ToolIdentity[]; connected: ToolConnection[]};
 export type PendingTool = ReportedTool & {id: string; helperId: string; computerName: string; expiresAt: string};
@@ -138,7 +139,8 @@ export const HELPER_SCHEMAS = {
       connections: array(connection, HELPER_MAX_TOOLS)}),
   ]},
   helperStatus: helperSchemaObject({account, computerName, scopes, renewBy: date, idleLapseAt: date,
-    connections: array(connection, HELPER_MAX_TOOLS), pending: array(toolIdentity, HELPER_MAX_TOOLS)}),
+    connections: array(connection, HELPER_MAX_TOOLS), pending: array(toolIdentity, HELPER_MAX_TOOLS),
+    runGrants: array(helperSchemaObject({aiToolId: uuid, expiresAt: date}), HELPER_MAX_TOOLS)}),
   tokenResponse: helperSchemaObject(tokenFields),
   toolsResponse: helperSchemaObject({pending: array(toolIdentity, HELPER_MAX_TOOLS), connected: array(connection, HELPER_MAX_TOOLS)}),
   proposalUpload: helperSchemaObject({itemId: id, skillId: uuid, baseVersion: {type: 'integer', minimum: 1},

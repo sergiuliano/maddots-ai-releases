@@ -1,0 +1,12 @@
+{
+  "headlessCommand": {
+    "argv": ["{bin}", "exec", "--json", "-C", "{cwd}", "--ephemeral", "--skip-git-repo-check", "-o", "{runDir}/last-message.txt", "-"],
+    "env": {},
+    "envUnset": []
+  },
+  "modelFlag": { "args": ["-m", "{model}"] },
+  "folderOnlyFlags": { "args": ["-s", "workspace-write"] },
+  "fullAccessFlags": { "args": ["--dangerously-bypass-approvals-and-sandbox"] },
+  "noMcpMethod": { "args": ["--ignore-user-config", "--disable", "apps", "--disable", "plugins", "--disable", "skill_mcp_dependency_install"] },
+  "noBrowserMethod": { "args": ["--disable", "browser_use", "--disable", "browser_use_external", "--disable", "browser_use_full_cdp_access", "--disable", "in_app_browser", "--disable", "computer_use"] }
+}

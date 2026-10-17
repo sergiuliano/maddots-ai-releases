@@ -726,8 +726,8 @@ test('Allow queues exact TLS07 reports per digest and retries them durably once 
   const failed = f.calls.filter(call => call.path === '/api/helper/allow');
   assert.equal(failed.length, 1);
   const expected = { holdingCount: 0, reports: [
-    { skillId: first.skillId, version: 1, digest: first.digest, tools: ['Codex'], allowedAt: new Date(f.timing.now()).toISOString() },
-    { skillId: second.skillId, version: 1, digest: second.digest, tools: ['Continue'], allowedAt: new Date(f.timing.now()).toISOString() },
+    { skillId: first.skillId, version: 1, digest: first.digest, tools: ['codex'], allowedAt: new Date(f.timing.now()).toISOString() },
+    { skillId: second.skillId, version: 1, digest: second.digest, tools: ['continue'], allowedAt: new Date(f.timing.now()).toISOString() },
   ] };
   const normalized = (value: unknown) => {
     const body = value as typeof expected;
@@ -965,6 +965,147 @@ test('the service registers only pilot routes when Codex, Continue and Hermes ar
   assert.ok(inventory.deliveryErrors.some(error => error.skillId === later.skillId && error.code === 'ROUTE_UNKNOWN'));
   assert.ok(inventory.deliveryErrors.every(error => error.code === 'ROUTE_UNKNOWN'));
   assert.doesNotMatch(f.output.join('\n'), /PLAN_CONFLICT|ROUTE_INVALID/u);
+});
+
+test('the CLI composes Claude plugin sync so accepted builds are stamped and registered once', async t => {
+  const f = await fixture(t);
+  const claude = TOOL_MATRIX.tools.find(tool => tool.key === 'claude-code')!;
+  f.tools.push({tool: claude.key, variant: claude.variants[0].key});
+  const build = f.build([{path: 'SKILL.md', content: '---\nname: example\ndescription: CLI plugin integration\n---\nExplain the fixture.\n'}],
+    {target: 'claude-plugin'});
+  f.server(f.plan([f.item(build, {route: 'claude-plugin'})]));
+  const cli = await connectedCli(f), bin = join(f.root, 'claude-bin'), executable = join(bin, 'claude');
+  await mkdir(bin, {mode: 0o700});
+  await writeFile(executable, 'fixture executable', {mode: 0o700});
+  const calls: string[][] = [];
+  const options: CliOptions = {...cli.options, deliveryTargets: undefined,
+    env: {...cli.options.env, PATH: bin}, runner: async (file, args) => {
+      if (file === '/usr/sbin/scutil') return {stdout: 'Plugin-Test-Mac\n', stderr: ''};
+      assert.equal(file, executable);
+      calls.push([...args]);
+      if (args[0] === '--version') return {stdout: '2.1.289 (Claude Code)\n', stderr: ''};
+      if (args.join(' ') === 'plugin marketplace list --json') return {stdout: '[]', stderr: ''};
+      return {stdout: '', stderr: ''};
+    }};
+  await runCli(['allow', '--all'], options);
+  await runCli(['allow', '--all'], options);
+  const entry = (await f.engine.locks.read()).entries.find(entry => entry.skillId === build.skillId)!;
+  assert.equal(entry.route, 'claude-plugin');
+  assert.equal(entry.target, 'claude-plugin');
+  const folder = join(f.home, '.maddots-ai/claude-code/maddots-workspace-one/skills/example');
+  const stamp = await readStamp(folder, f.verifier, ['helper-allow']);
+  assert.equal(stamp.signature, build.signature);
+  assert.equal(stamp.digest, build.digest);
+  assert.equal(calls.filter(args => args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add').length, 1);
+  assert.equal(calls.filter(args => args[0] === 'plugin' && args[1] === 'install').length, 1);
+  await missing(join(f.home, '.claude/skills/example'));
+});
+
+test('the mixed Codex/Claude CLI service backs up a reported unmanaged conflict only after replace_unmanaged', async t => {
+  const f = await fixture(t);
+  f.tools.splice(0, f.tools.length, ...['codex', 'claude-code'].map(key => {
+    const tool = TOOL_MATRIX.tools.find(tool => tool.key === key)!;
+    return {tool: key, variant: tool.variants[0].key};
+  }));
+  const original = '---\nname: example\ndescription: My existing skill.\n---\nKeep my local copy.\n';
+  const delivered = '---\nname: example\ndescription: The approved skill.\n---\nDeliver this version.\n';
+  const folder = join(f.routes['agents-folder'], 'example');
+  await mkdir(join(folder, '.maddots/empty'), {recursive: true});
+  await writeFile(join(folder, 'SKILL.md'), original);
+  await writeFile(join(folder, '.maddots/notes'), 'personal metadata');
+  const build = f.build([{path: 'SKILL.md', content: delivered}]);
+  const pluginBuild = f.build([{path: 'SKILL.md', content: '---\nname: plugin-example\ndescription: A plugin skill.\n---\nPlugin content.\n'}],
+    {skillId: 'skill-plugin', name: 'plugin-example', target: 'claude-plugin'});
+  const asking = f.item(build, {state: 'asking', answer: null});
+  const pluginItem = f.item(pluginBuild, {route: 'claude-plugin'});
+  f.server(f.plan([asking, pluginItem]));
+  const cli = await connectedCli(f), bin = join(f.root, 'claude-bin'), executable = join(bin, 'claude');
+  await mkdir(bin, {mode: 0o700});
+  await writeFile(executable, 'fixture executable', {mode: 0o700});
+  const calls: string[][] = [], stop = new AbortController();
+  let sleeps = 0;
+  await runCli(['service'], {
+    ...cli.options, deliveryTargets: undefined, env: {...cli.options.env, PATH: bin}, isTTY: false, signal: stop.signal,
+    runner: async (file, args) => {
+      if (file === '/usr/sbin/scutil') return {stdout: 'Mixed-Tools-Mac\n', stderr: ''};
+      assert.equal(file, executable);
+      calls.push([...args]);
+      if (args[0] === '--version') return {stdout: '2.1.289 (Claude Code)\n', stderr: ''};
+      if (args.join(' ') === 'plugin marketplace list --json') return {stdout: '[]', stderr: ''};
+      return {stdout: '', stderr: ''};
+    },
+    timing: {now: f.timing.now, sleep: async ms => {
+      assert.equal(ms, 1000);
+      sleeps++;
+      if (sleeps <= 2) {
+        assert.equal(await readFile(join(folder, 'SKILL.md'), 'utf8'), original);
+        assert.deepEqual(await listBackups(f.paths), []);
+        assert.ok(!(await f.engine.locks.read()).entries.some(entry => entry.skillId === build.skillId));
+      }
+      if (sleeps === 2) {
+        const report = f.calls.filter(call => call.path === '/api/helper/inventory').at(-1)!.options!.body as SyncInventory;
+        assert.ok(report.unmanaged.some(value => {
+          const conflict = value as {home: string; folderName: string; canonicalConflict?: {skillId: string}};
+          return conflict.home === '.agents' && conflict.folderName === build.name && conflict.canonicalConflict?.skillId === build.skillId;
+        }));
+        f.server(f.plan([{...asking, state: 'approved', answer: 'replace_unmanaged'}, pluginItem]));
+      }
+      if (sleeps === 3) assert.equal(await readFile(join(folder, 'SKILL.md'), 'utf8'), delivered);
+      if (sleeps === 4) stop.abort();
+      f.advance(600_000);
+    }},
+  });
+  const backups = await listBackups(f.paths);
+  assert.equal(backups.length, 1);
+  assert.equal(backups[0].reason, 'unmanaged_replaced');
+  assert.equal(backups[0].originalPath, '.agents/skills/example');
+  const preserved = join(f.paths.backups, backups[0].id, 'agents-folder/example');
+  assert.equal(await readFile(join(preserved, 'SKILL.md'), 'utf8'), original);
+  assert.equal(await readFile(join(preserved, '.maddots/notes'), 'utf8'), 'personal metadata');
+  assert.ok((await lstat(join(preserved, '.maddots/empty'))).isDirectory());
+  const snapshot = JSON.parse(await readFile(join(f.paths.data, 'unmanaged-conflicts', asking.itemId + '.json'), 'utf8'));
+  assert.equal(snapshot.reported, true);
+  assert.equal(snapshot.completed, true);
+  assert.equal((await readStamp(folder, f.verifier, ['helper-allow'])).signature, build.signature);
+  const pluginFolder = join(f.home, '.maddots-ai/claude-code/maddots-workspace-one/skills/plugin-example');
+  assert.equal((await readStamp(pluginFolder, f.verifier, ['helper-allow'])).signature, pluginBuild.signature);
+  assert.equal((await f.engine.locks.read()).entries.length, 2);
+  assert.equal(calls.filter(args => args[0] === 'plugin' && args[1] === 'install').length, 1);
+  const report = f.calls.filter(call => call.path === '/api/helper/inventory').at(-1)!.options!.body as SyncInventory;
+  assert.deepEqual(report.deliveryErrors, []);
+});
+
+test('TLS-49 the default service delivers a DeepSeek-only connection to the shared folder without creating its legacy home', async t => {
+  const f = await fixture(t);
+  const tool = TOOL_MATRIX.tools.find(tool => tool.key === 'deepseek-harness')!;
+  f.tools.splice(0, f.tools.length, { tool: tool.key, variant: tool.variants[0].key });
+  const text = '---\nname: example\ndescription: A plain DeepSeek skill.\n---\nA plain DeepSeek skill.\n';
+  const build = f.build([{ path: 'SKILL.md', content: text }]);
+  f.server(f.plan([f.item(build)]));
+  const cli = await connectedCli(f), stop = new AbortController();
+  let sleeps = 0;
+  await runCli(['service'], {
+    ...cli.options, deliveryTargets: undefined, isTTY: false, signal: stop.signal,
+    timing: { now: f.timing.now, sleep: async ms => {
+      assert.equal(ms, 1000); f.advance(ms);
+      if (++sleeps === 2) stop.abort();
+    } },
+    runner: async file => {
+      assert.equal(file, '/usr/sbin/scutil');
+      return { stdout: 'DeepSeek-Test-Mac\n', stderr: '' };
+    },
+  });
+  assert.deepEqual(await readdir(f.routes['agents-folder']), [build.name]);
+  assert.equal(await readFile(join(f.routes['agents-folder'], build.name, 'SKILL.md'), 'utf8'), text);
+  assert.deepEqual(await readdir(f.routes['continue-folder']), []);
+  await missing(join(f.home, '.dsh'));
+  const entries = (await f.engine.locks.read()).entries;
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].route, 'agents-folder');
+  assert.equal(entries[0].digest, build.digest);
+  const inventory = f.calls.filter(call => call.path === '/api/helper/inventory').at(-1)!.options!.body as SyncInventory;
+  assert.deepEqual(inventory.deliveryErrors, []);
+  assert.deepEqual(await listBackups(f.paths), []);
 });
 
 test('a pending service dialog leaves the lock free and cannot overlap a later eligible waiting set', { timeout: 30_000 }, async t => {

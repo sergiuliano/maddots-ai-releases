@@ -163,7 +163,7 @@ test('code held for Allow keeps local copies; replacement runs after that exact 
     const held = f.sync(); await held.reconcile(); await held.applyPlan(plan);
     assert.equal((await listBackups(f.paths)).length, 0); await assert.rejects(lstat(join(f.home, '.agents/skills/example')), {code: 'ENOENT'});
     assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
-    const allowed = f.sync(true); await allowed.reconcile(); await allowed.applyPlan(f.plan([f.item(build)]));
+    const allowed = f.sync(true); await allowed.reconcile(); await allowed.applyPlan(f.plan([f.item(build)], [f.instruction(session)]));
     assert.equal((await listBackups(f.paths)).length, 1); await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
     assert.equal(await readFile(join(f.home, '.agents/skills/example/SKILL.md'), 'utf8'), '! echo managed\n');
   } finally {await f.close();}
@@ -179,7 +179,7 @@ test('replacement needs the instruction and verified delivered copy, preserves o
     await sync.applyPlan(f.plan([], [f.instruction(session)]));
     assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
     assert.equal((await listBackups(f.paths)).length, 0);
-    const build = f.build(); await sync.applyPlan(f.plan([f.item(build)]));
+    const build = f.build(); await sync.applyPlan(f.plan([f.item(build)], [f.instruction(session)]));
     for (const home of ['.codex', '.codex-work', '.codex-client']) await assert.rejects(lstat(f.original('example', home)), {code: 'ENOENT'});
     const backups = await listBackups(f.paths); assert.equal(backups.length, 1); assert.equal(backups[0].unmanaged!.links.length, 2);
     assert.equal(await readFile(join(f.paths.backups, backups[0].id, 'local-import/example/SKILL.md'), 'utf8'), 'Original local content\n');
@@ -188,6 +188,42 @@ test('replacement needs the instruction and verified delivered copy, preserves o
     assert.ok(f.calls.some(call => call.body?.status === 'replaced' && call.body.backupId === backups[0].id));
     await restoreBackup(f.paths, backups[0].id); await sync.applyPlan(f.plan([], [f.instruction(session)]));
     assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n', 'replayed instructions cannot move a restored copy again');
+  } finally {await f.close();}
+});
+
+test('TLS-49 replaces a dsh copy only after Replace local copies and preserves it in a restorable backup', async () => {
+  const f = await fixture();
+  try {
+    const original = f.original('example', '.dsh'), text = 'Original dsh content\n';
+    await f.skill('example', text, '.dsh');
+    await mkdir(join(original, 'references')); await writeFile(join(original, 'references/context.md'), 'Local context\n');
+    await f.skill('personal', 'Unrelated dsh skill\n', '.dsh');
+    const session = f.session(['example'], {tool: 'deepseek-harness', folders: [{home: '.dsh', folderName: 'example'}]});
+    f.setSessions([session]); await f.engine().poll();
+    f.setSessions([]);
+    const sync = f.sync(); await sync.reconcile();
+    const build = f.build(); await sync.applyPlan(f.plan([f.item(build)]));
+    assert.equal(await readFile(join(original, 'SKILL.md'), 'utf8'), text);
+    assert.deepEqual(await listBackups(f.paths), [], 'Import and ordinary sync leave the local copy in place.');
+    const instruction = {...f.instruction(session), home: '.dsh'};
+    await sync.applyPlan(f.plan([], [instruction]));
+    await assert.rejects(lstat(original), {code: 'ENOENT'});
+    const [backup] = await listBackups(f.paths);
+    assert.ok(backup); assert.equal((await listBackups(f.paths)).length, 1);
+    assert.equal(backup.originalPath, '.dsh/skills/example');
+    assert.equal(backup.reason, 'local-import');
+    assert.deepEqual(backup.unmanaged!.original, {home: '.dsh', folderName: 'example'});
+    const saved = join(f.paths.backups, backup.id, 'local-import/example');
+    assert.equal(await readFile(join(saved, 'SKILL.md'), 'utf8'), text);
+    assert.equal(await readFile(join(saved, 'references/context.md'), 'utf8'), 'Local context\n');
+    assert.equal(await readFile(join(f.home, '.agents/skills/example/SKILL.md'), 'utf8'), 'Managed delivery\n');
+    assert.equal(await readFile(join(f.original('personal', '.dsh'), 'SKILL.md'), 'utf8'), 'Unrelated dsh skill\n');
+    assert.ok(f.calls.some(call => call.body?.home === '.dsh' && call.body.status === 'replaced' && call.body.backupId === backup.id));
+    await restoreBackup(f.paths, backup.id);
+    assert.equal(await readFile(join(original, 'SKILL.md'), 'utf8'), text);
+    assert.equal(await readFile(join(original, 'references/context.md'), 'utf8'), 'Local context\n');
+    await sync.applyPlan(f.plan([], [instruction]));
+    assert.equal(await readFile(join(original, 'SKILL.md'), 'utf8'), text, 'Replaying the recorded click leaves a restored copy alone.');
   } finally {await f.close();}
 });
 
@@ -202,7 +238,7 @@ test('delivery without a click and forged or edited managed stamps preserve the 
     await writeFile(join(f.home, '.agents/skills/example/SKILL.md'), 'Managed delivery\n');
     const stampFile = join(f.home, '.agents/skills/example/.maddots/skill.json'), genuine = await readFile(stampFile, 'utf8');
     await writeFile(stampFile, JSON.stringify({...JSON.parse(genuine), signature: Buffer.alloc(64).toString('base64')}), {mode: 0o600});
-    await f.engine().applyInstructions([]); assert.equal((await listBackups(f.paths)).length, 0, 'forged stamp');
+    await f.engine().applyInstructions(); assert.equal((await listBackups(f.paths)).length, 0, 'forged stamp');
     await writeFile(stampFile, genuine, {mode: 0o600});
     const forged = {...f.instruction(session), sessionId: randomUUID()};
     // The previously recorded genuine click is still pending; defer it while checking forged input.
@@ -245,12 +281,95 @@ test('deferred replacement survives restart and 304, and retries a lost receipt 
     f.conditional(); f.advance(60_000); await f.sync().tick();
     assert.equal((await listBackups(f.paths)).length, 0, '304 must retain degraded restriction');
     f.resultsFail(true);
-    await assert.rejects(sync.applyPlan(f.plan([f.item(build)], [], false)), {code: 'API_CONNECTION_FAILED'});
+    await assert.rejects(sync.applyPlan(f.plan([f.item(build)], [f.instruction(session)], false)), {code: 'API_CONNECTION_FAILED'});
     assert.equal((await listBackups(f.paths)).length, 1);
+    const withdrawn = f.plan(); f.setPlan(withdrawn);
+    await assert.rejects(sync.applyPlan(withdrawn), {code: 'API_CONNECTION_FAILED'});
     f.resultsFail(false); await f.sync().tick();
     assert.equal((await listBackups(f.paths)).length, 1);
-    const results = f.calls.filter(call => call.body?.status === 'replaced'); assert.equal(results.length, 2);
-    assert.equal(results[0].body.backupId, results[1].body.backupId);
+    const results = f.calls.filter(call => call.body?.status === 'replaced'); assert.equal(results.length, 3);
+    assert(results.every(result => result.body.backupId === results[0].body.backupId));
+  } finally {await f.close();}
+});
+
+test('an authorized deferred replacement survives restart and recovers on 304 without a new full plan', async () => {
+  const f = await fixture();
+  try {
+    await f.skill('example'); const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+    const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())]));
+    const managed = join(f.home, '.agents/skills/example/SKILL.md');
+    await writeFile(managed, 'Edited\n');
+    const authorized = f.plan([], [f.instruction(session)]); await sync.applyPlan(authorized); f.setPlan(authorized);
+    sync.close();
+    const restarted = f.sync(); await restarted.tick();
+    assert.equal(f.calls.filter(call => call.path === '/api/helper/plan').at(-1)!.revision, authorized.planRevision);
+    assert.equal((await listBackups(f.paths)).length, 0);
+    await writeFile(managed, 'Managed delivery\n');
+    f.advance(60_000); await restarted.tick(); restarted.close();
+    await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+    assert.equal((await listBackups(f.paths)).length, 1);
+    assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 1);
+  } finally {await f.close();}
+});
+
+for (const mismatch of ['omitted', 'sessionId', 'skillId', 'home', 'folderName'] as const)
+  test(`a full plan with ${mismatch} replacement authorization suspends the original across restart and 304 until reauthorized`, async () => {
+    const f = await fixture();
+    try {
+      await f.skill('example'); const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+      const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())]));
+      const managed = join(f.home, '.agents/skills/example/SKILL.md');
+      await writeFile(managed, 'Edited\n');
+      const instruction = f.instruction(session);
+      await sync.applyPlan(f.plan([], [instruction]));
+      await writeFile(managed, 'Managed delivery\n');
+      const withdrawn = f.plan([], mismatch === 'omitted' ? [] : [{...instruction, [mismatch]: 'different'}]);
+      await sync.applyPlan(withdrawn); f.setPlan(withdrawn); sync.close();
+      const restarted = f.sync(); await restarted.tick(); restarted.close();
+      assert.equal(f.calls.filter(call => call.path === '/api/helper/plan').at(-1)!.revision, withdrawn.planRevision);
+      assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
+      assert.equal((await listBackups(f.paths)).length, 0);
+      assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 0);
+      const folder = JSON.parse(await readFile(join(f.paths.data, 'imports.json'), 'utf8')).sessions[0].folders[0];
+      assert.equal(folder.authorized, false); assert.equal(folder.failed, undefined);
+      await sync.applyPlan(f.plan([], [instruction]));
+      await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+      assert.equal((await listBackups(f.paths)).length, 1);
+    } finally {await f.close();}
+  });
+
+test('an older journal without retained full-plan authorization cannot start a replacement on 304', async () => {
+  const f = await fixture();
+  try {
+    await f.skill('example'); const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+    const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())]));
+    const file = join(f.paths.data, 'imports.json'), journal = JSON.parse(await readFile(file, 'utf8'));
+    journal.sessions[0].folders[0].instruction = f.instruction(session);
+    await atomicWrite(file, JSON.stringify(journal));
+    f.conditional(); await f.sync().tick();
+    assert.equal(f.calls.filter(call => call.path === '/api/helper/plan').at(-1)!.revision, null,
+      'an older journal must request a fresh full plan instead of remaining suspended behind its old ETag');
+    assert.equal((await listBackups(f.paths)).length, 0);
+    assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
+    await sync.applyPlan(f.plan([], [f.instruction(session)]));
+    await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+  } finally {await f.close();}
+});
+
+test('an older queued replacement requests a full plan on restart and resumes when authorization is still present', async () => {
+  const f = await fixture();
+  try {
+    await f.skill('example'); const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+    const sync = f.sync(); await sync.reconcile();
+    const plan = f.plan([f.item(f.build())], [f.instruction(session)]);
+    await sync.applyPlan({...plan, instructions: []});
+    const file = join(f.paths.data, 'imports.json'), journal = JSON.parse(await readFile(file, 'utf8'));
+    journal.sessions[0].folders[0].instruction = f.instruction(session);
+    await atomicWrite(file, JSON.stringify(journal)); f.setPlan(plan);
+    sync.close(); const restarted = f.sync(); await restarted.tick(); restarted.close();
+    assert.equal(f.calls.filter(call => call.path === '/api/helper/plan').at(-1)!.revision, null);
+    await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+    assert.equal((await listBackups(f.paths)).length, 1);
   } finally {await f.close();}
 });
 
@@ -315,7 +434,7 @@ for (const action of ['deleted', 'renamed'] as const) test(`a ${action} original
     if (action === 'deleted') await rm(f.original('example'), {recursive: true});
     else await rename(f.original('example'), f.original('example-old'));
     await writeFile(join(f.home, '.agents/skills/example/SKILL.md'), 'Managed delivery\n');
-    const next = f.plan([], [f.instruction(session, 'other')]); await sync.applyPlan(next);
+    const next = f.plan([], [f.instruction(session), f.instruction(session, 'other')]); await sync.applyPlan(next);
     const journal = JSON.parse(await readFile(join(f.paths.data, 'imports.json'), 'utf8'));
     assert.equal(journal.sessions[0].folders.find((folder: any) => folder.folderName === 'example').failed, 'ORIGINAL_MISSING');
     assert.equal((await listBackups(f.paths)).length, 1, 'only the second folder is backed up');
@@ -460,7 +579,7 @@ test('a managed copy on an unrelated route cannot replace the importing tool ori
     assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
     assert.equal((await listBackups(f.paths)).length, 0); assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 0);
     // Distinct names keep the lock entries independent while testing route coverage for the same skill.
-    await sync.applyPlan(f.plan([f.item(f.build('managed-codex'))]));
+    await sync.applyPlan(f.plan([f.item(f.build('managed-codex'))], [f.instruction(session)]));
     assert.equal((await listBackups(f.paths)).length, 1); await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
   } finally {await f.close();}
 });
@@ -689,11 +808,11 @@ test('shared lock and sync metadata corruption never mark a pending replacement 
     await writeFile(join(f.home, '.agents/skills/example/SKILL.md'), 'Managed delivery\n');
     for (const [name, code] of [['lock.json', 'LOCK_INVALID'], ['sync-meta.json', 'SYNC_META_INVALID']]) {
       const file = join(f.paths.data, name), genuine = await readFile(file, 'utf8');
-      await atomicWrite(file, '{}'); await assert.rejects(f.engine().applyInstructions([]), {code}); await atomicWrite(file, genuine);
+      await atomicWrite(file, '{}'); await assert.rejects(f.engine().applyInstructions(), {code}); await atomicWrite(file, genuine);
       const journal = JSON.parse(await readFile(join(f.paths.data, 'imports.json'), 'utf8'));
       assert.equal(journal.sessions[0].folders[0].failed, undefined);
     }
-    await f.engine().applyInstructions([]); assert.equal((await listBackups(f.paths)).length, 1);
+    await f.engine().applyInstructions(); assert.equal((await listBackups(f.paths)).length, 1);
   } finally {await f.close();}
 });
 
@@ -754,7 +873,7 @@ for (const code of ['IMPORT_JOURNAL_INVALID', 'IMPORT_JOURNAL_FULL', 'FILE_UNSAF
   } finally {await f.close();}
 });
 
-for (const code of ['IMPORT_JOURNAL_INVALID', 'IMPORT_JOURNAL_FULL', 'FILE_UNSAFE']) test(`${code} is logged locally without stalling plan sync or 304 retries`, async t => {
+for (const code of ['IMPORT_JOURNAL_INVALID', 'IMPORT_JOURNAL_FULL', 'FILE_UNSAFE']) test(`${code} is logged locally without stalling delivery or full-plan retries`, async t => {
   const f = await fixture();
   try {
     await f.skill('example', 'Claude original\n', '.claude');
@@ -762,6 +881,7 @@ for (const code of ['IMPORT_JOURNAL_INVALID', 'IMPORT_JOURNAL_FULL', 'FILE_UNSAF
     const sync = f.sync(); await sync.reconcile();
     const file = join(f.paths.data, 'imports.json'), journal = JSON.parse(await readFile(file, 'utf8'));
     journal.sessions[0].folders[0].instruction = {...f.instruction(session), home: '.claude'};
+    journal.sessions[0].folders[0].authorized = true;
     const repaired = JSON.stringify(journal);
     if (code === 'IMPORT_JOURNAL_FULL') {
       // A pending protected-home result needs a journal write that exceeds the byte cap.
@@ -771,16 +891,16 @@ for (const code of ['IMPORT_JOURNAL_INVALID', 'IMPORT_JOURNAL_FULL', 'FILE_UNSAF
     }
     await atomicWrite(file, code === 'IMPORT_JOURNAL_INVALID' ? '{}' : JSON.stringify(journal));
     if (code === 'FILE_UNSAFE') await chmod(file, 0o644);
-    await assert.rejects(f.engine().applyInstructions([]), {code}, 'the fixture must trigger the actual journal failure');
+    await assert.rejects(f.engine().applyInstructions(), {code}, 'the fixture must trigger the actual journal failure');
     const damaged = await readFile(file, 'utf8'), log = t.mock.method(console, 'error', () => {});
-    const plan = f.plan(); await sync.applyPlan(plan);
-    assert.equal(JSON.parse(await readFile(join(f.paths.data, 'sync-meta.json'), 'utf8')).planRevision, plan.planRevision);
+    const plan = f.plan([], [journal.sessions[0].folders[0].instruction]); f.setPlan(plan); await sync.applyPlan(plan);
+    assert.equal(JSON.parse(await readFile(join(f.paths.data, 'sync-meta.json'), 'utf8')).planRevision, null);
     assert.ok(log.mock.calls.some(call => String(call.arguments[0]).includes(code)));
     assert.deepEqual((await sync.inventory()).deliveryErrors, []);
     const logged = log.mock.callCount();
     f.conditional(); f.advance(60_000); await sync.tick();
     assert.equal((sync as any).failures, 0); assert.equal(sync.retryAt, f.timing.now() + plan.pollAfterSeconds * 1000);
-    assert.ok(log.mock.callCount() > logged, '304 retries record the journal error too');
+    assert.ok(log.mock.callCount() > logged, 'full-plan retries record the journal error too');
     assert.ok(f.calls.filter(call => call.path === '/api/helper/inventory').every(call => call.body.deliveryErrors.length === 0));
     assert.equal(await readFile(file, 'utf8'), damaged, 'a damaged journal is retained for repair');
     assert.equal(await readFile(join(f.original('example', '.claude'), 'SKILL.md'), 'utf8'), 'Claude original\n');

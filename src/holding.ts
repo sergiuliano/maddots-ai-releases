@@ -208,6 +208,7 @@ export class HoldingStore {
     return !!(await this.receipt(build))?.replacementContexts?.includes(hash(consentContext(item)));
   }
   async approve(entry: HoldingEntry, tools: string[]): Promise<void> {
+    if (!tools.length) throw new HelperError('ALLOW_TOOLS_REQUIRED', 'Allow needs a connected tool for this build route.');
     const directory = join(this.paths.data, 'allows'); await ensurePrivateDirectory(directory);
     const existing = await this.receipt(entry.build);
     const replacement = entry.item.kind === 'local_newer' && entry.item.answer === 'replace' ? hash(consentContext(entry.item)) : undefined;
@@ -243,7 +244,11 @@ export class HoldingStore {
     // A bounded batch remains below TLS-07's 256 KiB route limit.
     for (let start = 0; start < pending.length; start += 50) {
       const batch = pending.slice(start, start + 50);
-      await client.request('/api/helper/allow', {method: 'POST', body: {holdingCount: await this.count(), reports: batch.map(value => value.receipt.report)}});
+      // Older helpers queued display names. Preserve their consent and retry using
+      // the matrix keys required by the wire protocol and the server's audit match.
+      const reports = batch.map(({receipt}) => ({...receipt.report, tools: [...new Set(receipt.report.tools.map(value =>
+        TOOL_MATRIX.tools.find(tool => tool.name === value)?.key ?? value))].sort()}));
+      await client.request('/api/helper/allow', {method: 'POST', body: {holdingCount: await this.count(), reports}});
       for (const value of batch) await atomicWriteBuild(value.file, JSON.stringify({...value.receipt, reported: true}) + '\n');
     }
   }

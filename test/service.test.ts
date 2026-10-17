@@ -44,6 +44,8 @@ test('installation uses the user launchd domain, failure-only KeepAlive and esca
   const content = await readFile(paths.servicePlist, 'utf8');
   assert.match(content, /<key>RunAtLoad<\/key><true\/>/u);
   assert.match(content, /<key>KeepAlive<\/key><dict><key>SuccessfulExit<\/key><false\/><\/dict>/u);
+  assert.match(content, /<string>--disable-sigusr1<\/string>/u);
+  assert.doesNotMatch(content, /--inspect[^<\s]*/u);
   assert.ok(content.includes(executable.replaceAll('&', '&amp;')));
   assert.ok(content.includes(entrypoint.replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')));
   assert.ok(content.includes(`<string>${paths.logs}/service.log</string>`));

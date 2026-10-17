@@ -1,6 +1,6 @@
 {
   "name": "maddots-ai",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "license": "MIT",
   "description": "MacOS helper for connecting AI tools to MadDots AI",
@@ -18,7 +18,7 @@
     "docs/install.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node --input-type=module -e \"import {cpSync} from 'node:fs'; cpSync('src/shared/tool-matrix.json', 'dist/shared/tool-matrix.json');\"",
+    "build": "tsc -p tsconfig.json && node --input-type=module -e \"import {cpSync} from 'node:fs'; for (const name of ['tool-matrix.json', 'runner-contract.json']) cpSync('src/shared/' + name, 'dist/shared/' + name);\"",
     "test": "tsx --test test/*.test.ts",
     "pack:check": "npm run build && node scripts/check-package.mjs"
   },
