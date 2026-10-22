@@ -399,17 +399,15 @@
         {
           "key": "cli",
           "label": "CLI",
-          "syncOnly": false,
+          "syncOnly": true,
           "detect": {
             "binaries": [
-              "~/.local/bin/agent",
-              "~/.cursor/bin/agent",
-              "agent"
+              "~/.local/bin/cursor-agent"
             ],
             "versionArgs": [
               "--version"
             ],
-            "versionPattern": "^(?:Cursor(?: Agent| CLI)?)[ \\t:v-]*(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "versionPattern": "^(\\d{4}\\.\\d{2}\\.\\d{2}-[0-9a-f]{7,40})$",
             "apps": [],
             "configPaths": []
           },
@@ -464,9 +462,9 @@
         "card": "TLS-27",
         "offered": false,
         "folderOnly": "none",
-        "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "mcpLevel": "tools-denied",
+        "reason": "Sync only: with the person's normal HOME, cursor-agent starts MCP servers from the Claude Code configuration (observed: the person's MadDots MCP) despite the project Mcp(*:*) deny. No verified switch stops it while keeping the sign-in.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -560,9 +558,9 @@
         "card": "TLS-27",
         "offered": false,
         "folderOnly": "none",
-        "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "mcpLevel": "tools-denied",
+        "reason": "Acceptance passed on The Machine 2026-10-21 with --model auto (servers off by the CLI's own report; skill and completion verified). Offer pending the founder; Folder only is no-shell and needs R-02.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -642,9 +640,9 @@
         "card": "TLS-43",
         "offered": false,
         "folderOnly": "none",
-        "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "mcpLevel": "tools-denied",
+        "reason": "Sync only: Devin 3000.11.3 still loads native project .devin/mcp_config.json with an isolated config and all read_config_from sources disabled; no verified headless switch prevents MCP server startup.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -655,7 +653,7 @@
         {
           "key": "cli",
           "label": "CLI",
-          "syncOnly": false,
+          "syncOnly": true,
           "detect": {
             "binaries": [
               "cline"
@@ -738,8 +736,8 @@
         "offered": false,
         "folderOnly": "none",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "reason": "Skills sync only: in 3.0.71, CLINE_MCP_SETTINGS_PATH redirects ordinary MCP settings but does not stop project or Documents/Cline/Plugins agent plugins from adding MCP servers, tools or hooks. No complete plugin-startup disable was verified.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -867,8 +865,8 @@
         "offered": false,
         "folderOnly": "none",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "reason": "Sync only: Gemini requires a paid key or verified enterprise sign-in. Personal/free Google authentication is not accepted, and its tier cannot be established from the permitted auth-type setting alone.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -963,8 +961,8 @@
         "offered": false,
         "folderOnly": "none",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "reason": "Real Antigravity cached-login, staged-skill, custom-agent no-MCP/browser and access checks remain pending with the person's normal HOME and cached login.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -1059,8 +1057,8 @@
         "offered": false,
         "folderOnly": "none",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "reason": "Pinned OpenCode v1 local-provider candidate keeps HOME and isolates XDG only. Real Ollama run, skill-tool proof, model metadata and process-watch acceptance are pending. An existing ~/.opencode or managed configuration prevents isolation and is refused. Folder only awaits R-02; hosted/custom providers need a supported credential path.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -1071,7 +1069,7 @@
         {
           "key": "cli",
           "label": "CLI",
-          "syncOnly": false,
+          "syncOnly": true,
           "detect": {
             "binaries": [
               "omp"
@@ -1079,7 +1077,7 @@
             "versionArgs": [
               "--version"
             ],
-            "versionPattern": "^(?:(?:Oh My Pi|omp)[ \\t:v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
+            "versionPattern": "^(?:(?:Oh My Pi|omp)[ \\t:/v-]*)?(\\d+\\.\\d+(?:\\.\\d+)?(?:[-+][0-9A-Za-z.-]+)?)(?:[ \\t].*)?$",
             "apps": [],
             "configPaths": []
           },
@@ -1116,8 +1114,8 @@
         "offered": false,
         "folderOnly": "none",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "reason": "Skills sync only: in 18.10.4, --tools does not disable MCP discovery or project custom-tool module loading, and --no-extensions does not disable those startup paths. The proposed profile/overlay has no verified servers-off composition. Write approval is not a workspace sandbox.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -1128,7 +1126,7 @@
         {
           "key": "cli",
           "label": "CLI",
-          "syncOnly": false,
+          "syncOnly": true,
           "detect": {
             "binaries": [
               "openclaw"
@@ -1190,8 +1188,8 @@
         "offered": false,
         "folderOnly": "none",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "reason": "Skills sync only: temporary exec state preserves installed plugin roots with --config. Tool denies can hide MCP tools after servers load. Disabling all plugins also removes the bundled Ollama provider; a safe provider/plugin allowlist has not been verified.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -1202,7 +1200,7 @@
         {
           "key": "cli",
           "label": "CLI",
-          "syncOnly": false,
+          "syncOnly": true,
           "detect": {
             "binaries": [
               "hermes"
@@ -1262,8 +1260,8 @@
         "offered": false,
         "folderOnly": "none",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "reason": "Skills sync only: safe mode disables MCP/plugins, but both Hermes headless paths reload saved provider/fallback configuration. No supported per-run config or fallback-disable switch was verified that preserves normal HOME and pins the agent-selected Ollama route. The history/trust issue from round 1 is resolved by round 2; real-run acceptance remains pending.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -1274,7 +1272,7 @@
         {
           "key": "cli",
           "label": "CLI",
-          "syncOnly": false,
+          "syncOnly": true,
           "detect": {
             "binaries": [
               "~/.grok/bin/grok"
@@ -1341,8 +1339,8 @@
         "offered": false,
         "folderOnly": "none",
         "mcpLevel": "tools-denied",
-        "reason": "Real-tool and no-MCP canary checks pending.",
-        "checkedAt": "2026-10-14"
+        "reason": "Sync only: with the person's normal HOME, Grok 1.0.52 still starts MCP servers from the Claude Code configuration (observed: the person's MadDots MCP), even with all GROK_*_MCPS/HOOKS/AGENTS/RULES/SESSIONS/SKILLS imports and managed MCPs off. MCP calls stay denied (tools-denied), but servers start.",
+        "checkedAt": "2026-10-21"
       }
     },
     {
@@ -1397,7 +1395,7 @@
         "offered": false,
         "folderOnly": "none",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
+        "reason": "TLS-50 adapter implemented; real DeepSeek API, privacy, workspace and no-MCP canary checks pending (R-22 to R-27).",
         "checkedAt": "2026-10-14"
       }
     }

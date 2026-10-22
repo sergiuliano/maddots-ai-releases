@@ -20,7 +20,8 @@ import { assertRouteRoot, atomicWriteBuild, durableRename, readSkillTree, stageB
 import { makeStamp, readStamp, stampMatches } from './stamp.js';
 import { BuildVerifier, type PlanItem, type SignedBuild, type VerifiedBuild } from './verify.js';
 import { HoldingStore } from './holding.js';
-import { listUnmanaged, unmanagedInventory, type UnmanagedInventory } from './unmanaged.js';
+import { listUnmanaged, unmanagedInventory, type FolderRef, type UnmanagedInventory } from './unmanaged.js';
+import { discoverManagedLinks, linkedHomeRefs, linkedHomesWarning } from './linked-homes.js';
 import { managedReadFolder, readLocalEdit } from './local-edits.js';
 import { parseSendProposalInstruction, sendProposal } from './proposals.js';
 import { completeUnmanagedSnapshot, readUnmanagedSnapshot, rememberUnmanagedSnapshot, reportUnmanagedSnapshot, unmanagedDigest, unmanagedSnapshot, type UnmanagedSnapshot } from './unmanaged-replacement.js';
@@ -31,10 +32,11 @@ export type SyncPlan = {planRevision: string; degraded: boolean; pollAfterSecond
   revoked: {skillId: string; digest: string}[]; instructions: unknown[]};
 export type DeliveryError = {skillId: string; target: string; name: string; code: string};
 export type ManagedInventory = {skillId: string; target: string; name: string; version: number; settingsRevision: number;
-  digest: string; localDigest: string | null; state: 'ok' | 'edited' | 'missing' | 'held'};
+  digest: string; localDigest: string | null; state: 'ok' | 'edited' | 'missing' | 'held'; linkedHomes?: FolderRef[]};
 export type SyncInventory = {
   helperVersion: string; computerName: string; os: 'macos' | 'linux' | 'windows'; tokenStorage: 'keychain' | 'file'; tools: ReportedTool[];
   managed: ManagedInventory[]; duplicates: unknown[]; unmanaged: unknown[]; holdingCount: number; deliveryErrors: DeliveryError[];
+  capabilities?: {allow: boolean; 'linked-replacement'?: boolean}; waitingForAllow?: {skillId: string; version: number; itemIds: string[]}[];
 };
 export type SyncOptions = {
   paths: HelperPaths; helperId: string; client: Pick<ApiClient, 'request'>; targets: readonly DeliveryTarget[];
@@ -46,6 +48,7 @@ export type SyncOptions = {
   hold?: (build: VerifiedBuild, item: PlanItem) => Promise<void>;
   holdingCount?: () => Promise<number>;
   inventoryExtras?: () => Promise<{unmanaged: unknown[]; duplicates: unknown[]}>;
+  output?: (line: string) => void;
   crash?: (step: 'staged' | 'backed_up' | 'placed' | 'locked' | 'proposal_sent' | 'holding') => void | Promise<void>;
   watchRoute?: (root: string, changed: () => void) => {close(): void};
 };
@@ -310,6 +313,8 @@ export class SyncEngine {
   }
   async inventory(): Promise<SyncInventory> {
     const lock = await this.locks.read(); const managed: ManagedInventory[] = [];
+    const live = lock.entries.filter(entry => !entry.removed);
+    const links = await discoverManagedLinks({paths: this.options.paths, managed: live, verifier: this.verifier, helperIds: this.locks.knownIds(lock)});
     const heldKeys = new Set<string>();
     try {
       for (const held of await this.holding.entries()) {
@@ -333,16 +338,23 @@ export class SyncEngine {
         }
       } catch (error) { if (!absent(error)) { state = 'edited'; this.error(entry, error); } }
       if (state === 'missing' && heldKeys.has(entryKey(entry))) state = 'held';
+      const linkedHomes = linkedHomeRefs(links, entry);
       managed.push({skillId: entry.skillId, target: entry.target, name: entry.name, version: entry.version,
-        settingsRevision: entry.settingsRevision, digest: entry.digest, localDigest, state});
+        settingsRevision: entry.settingsRevision, digest: entry.digest, localDigest, state, ...(linkedHomes.length ? {linkedHomes} : {})});
     }
-    const live = lock.entries.filter(entry => !entry.removed);
     const extras = await this.options.inventoryExtras?.() ?? {duplicates: await scanDuplicates({paths: this.options.paths,
       tools: this.options.tools ?? [], managed: live, managedFolders: this.managedFolders(live), verifier: this.verifier,
       helperIds: this.locks.knownIds(lock)}), unmanaged: await this.unmanaged(lock)};
     let holdingCount = this.lastHoldingCount;
+    let waitingForAllow: SyncInventory['waitingForAllow'];
     try {
-      holdingCount = await this.options.holdingCount?.() ?? await this.holding.count();
+      if (this.options.holdingCount) holdingCount = await this.options.holdingCount();
+      else {
+        const waiting = await this.holding.waiting();
+        holdingCount = waiting.length;
+        waitingForAllow = waiting.map(group => ({skillId: group.skillId, version: group.version,
+          itemIds: [...new Set(group.entries.map(entry => entry.item.itemId))].sort()}));
+      }
       this.lastHoldingCount = holdingCount;
     } catch (error) { this.holdingFailure(error); }
     const unmanaged = extras.unmanaged.slice(0, 2000);
@@ -353,7 +365,8 @@ export class SyncEngine {
     this.conflictSnapshots.set(unmanaged, (this.conflictSnapshots.get(extras.unmanaged) ?? []).filter(snapshot => reportedConflicts.has(entryKey(snapshot))));
     return {helperVersion: VERSION, computerName: this.options.computerName ?? 'Computer', os: 'macos', tokenStorage: this.options.tokenStorage ?? 'keychain',
       tools: (this.options.tools ?? []).map(tool => ({tool: tool.tool, variant: tool.variant, version: tool.version, models: tool.models.slice(0, 50), syncOnly: tool.syncOnly})), managed,
-      unmanaged, duplicates: extras.duplicates.slice(0, 2000), holdingCount,
+      unmanaged, duplicates: extras.duplicates.slice(0, 2000), holdingCount, capabilities: {allow: true, 'linked-replacement': true},
+      ...(waitingForAllow ? {waitingForAllow} : {}),
       deliveryErrors: [...this.errors.values()]};
   }
   /** Only an accepted report establishes the durable local replacement baseline. */
@@ -372,7 +385,10 @@ export class SyncEngine {
   async questions(): Promise<SyncQuestion[]> {
     const items = this.questionItems.filter(item => item.state === 'asking' && !item.forAgentIds.length);
     const duplicates = await this.localCopyQuestions();
-    return items.map(item => ({...item, restartHints: item.route === 'agents-folder' ? agentsFolderReloadHints(this.options.tools ?? []) : item.restartHints,
+    const lock = await this.locks.read();
+    const links = await discoverManagedLinks({paths: this.options.paths, managed: lock.entries.filter(entry => !entry.removed),
+      verifier: this.verifier, helperIds: this.locks.knownIds(lock)});
+    return items.map(item => ({...item, linkedHomes: linkedHomeRefs(links, item), restartHints: item.route === 'agents-folder' ? agentsFolderReloadHints(this.options.tools ?? []) : item.restartHints,
       duplicates: duplicates.filter(duplicate => duplicate.skillId === item.skillId)}));
   }
   /** Duplicates still need attention when there is no install/update question. */
@@ -454,7 +470,7 @@ export class SyncEngine {
       this.meta = {...this.meta, revoked: plan.revoked, pollAfterSeconds: plan.pollAfterSeconds, degraded: plan.degraded};
       await atomicWrite(join(this.options.paths.data, 'sync-meta.json'), JSON.stringify(this.meta) + '\n');
       const imports = new ImportEngine({paths: this.options.paths, helperId: this.options.helperId, client: this.options.client,
-        targets: this.options.targets, verifier: this.verifier, timing: this.timing});
+        targets: this.options.targets, verifier: this.verifier, timing: this.timing, output: this.options.output});
       let retryInstructions = false;
       try {await imports.rememberInstructions(plan.instructions);}
       catch (error) {this.importRetry(error); retryInstructions = true;}
@@ -611,6 +627,12 @@ export class SyncEngine {
     const agentPrior = agentLock.entries.filter(entry => entryKey(entry) === entryKey(item) && item.forAgentIds.includes(entry.agentId!))
       .sort((a, b) => b.version - a.version || b.settingsRevision - a.settingsRevision)[0] ?? null;
     const prior = item.forAgentIds.length ? agentPrior : routePrior;
+    const warnLinkedHomes = async () => {
+      if (!prior || item.forAgentIds.length || !this.options.output) return;
+      const links = await discoverManagedLinks({paths: this.options.paths, managed: [prior], verifier: this.verifier, helperIds: this.locks.knownIds(lock)});
+      const warning = linkedHomesWarning(item.name, linkedHomeRefs(links, prior));
+      if (warning) this.options.output(warning);
+    };
     if (item.state === 'forced' ? !['forced_remove', 'forced_restore'].includes(item.kind) : !['install', 'update', 'local_newer', 'forced_restore'].includes(item.kind)) {
       throw new HelperError('FORCED_EFFECT_INVALID', 'A forced change can only remove or restore a previous build.');
     }
@@ -762,6 +784,7 @@ export class SyncEngine {
       if (replacing) {
         const destination = await this.destination(target!, prior!);
         // Move the edited source before holding, so it cannot remain live as code.
+        await warnLinkedHomes();
         if (await exists(destination)) await backupFolder(this.options.paths, destination, target!.route, 'local_newer', await this.localDigest(destination), this.timing.now(), async manifest => {
           // Persist the backup identity before moving the copy so interrupted holding can resume.
           let saved = {};
@@ -824,6 +847,7 @@ export class SyncEngine {
     const key = entryKey(entry);
     await this.locks.setPending(key, pending); await this.options.crash?.('staged');
     if (unmanagedSourceDigest && !await exists(destination)) throw new HelperError('UNMANAGED_CHANGED', 'The unmanaged folder disappeared before backup. No build was placed.');
+    await warnLinkedHomes();
     const backup = await exists(destination) ? await backupFolder(this.options.paths, destination, target!.route,
       replacingUnmanaged ? 'unmanaged_replaced' : item.kind, unmanagedSourceDigest ?? await this.localDigest(destination), this.timing.now(), async manifest => {
       if (unmanagedSourceDigest && await unmanagedDigest(this.options.paths, destination) !== unmanagedSourceDigest) {
@@ -893,7 +917,7 @@ export class SyncEngine {
           if (saved.planRevision === null) this.meta.planRevision = null;
         } catch (error) { if (!absent(error)) throw error; }
         const imports = new ImportEngine({paths: this.options.paths, helperId: this.options.helperId, client: this.options.client,
-          targets: this.options.targets, verifier: this.verifier, timing: this.timing});
+          targets: this.options.targets, verifier: this.verifier, timing: this.timing, output: this.options.output});
         try {if (await imports.needsFullPlan()) this.meta.planRevision = null;}
         catch (error) {this.importRetry(error);}
         const response = await this.options.client.request<SyncPlan>('/api/helper/plan', {headers: this.meta.planRevision ? {'If-None-Match': this.meta.planRevision} : {}});

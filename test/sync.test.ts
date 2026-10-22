@@ -189,6 +189,7 @@ test('TLS-19 code Replace backs up before holding and requires Allow for that re
     const item = f.item(build, {kind: 'local_newer', answer: 'replace', localDigest, fromVersion: 1}), plan = f.plan([item]);
     await engine.applyPlan(plan); await missing(join(f.route, 'example'));
     assert.equal((await engine.inventory()).managed[0].state, 'held'); assert.equal((await engine.inventory()).holdingCount, 1);
+    assert.deepEqual((await engine.inventory()).waitingForAllow, [{skillId: build.skillId, version: build.version, itemIds: [item.itemId]}]);
     const waiting = await engine.holding.waiting(); assert.equal(waiting.length, 1);
     assert.deepEqual(waiting[0].digests, [build.digest]); assert.equal(waiting[0].entries[0].item.itemId, item.itemId);
     assert.equal((await engine.holding.entries()).length, 1);

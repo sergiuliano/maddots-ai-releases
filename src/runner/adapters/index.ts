@@ -1,4 +1,5 @@
 import type { Adapter } from '../adapter.js';
+import { TOOL_MATRIX } from '../../shared/tool-matrix.js';
 import { codexAdapter } from './codex.js';
 import { claudeCodeAdapter } from './claude-code.js';
 
@@ -16,7 +17,9 @@ export class AdapterRegistry {
   }
 
   get(toolOrHarness: string): Adapter | undefined {
-    return this.#adapters.get(toolOrHarness) ?? this.list().find((adapter) => adapter.info.harness === toolOrHarness);
+    const adapter = this.#adapters.get(toolOrHarness) ?? this.list().find((adapter) => adapter.info.harness === toolOrHarness);
+    const matrixAdapter = TOOL_MATRIX.tools.find(tool => tool.key === toolOrHarness)?.run?.adapter;
+    return adapter ?? (matrixAdapter ? this.#adapters.get(matrixAdapter) : undefined);
   }
 
   list(): Adapter[] { return [...this.#adapters.values()]; }

@@ -1,11 +1,13 @@
 import { constants } from 'node:fs';
-import { lstat, open, readdir } from 'node:fs/promises';
+import { lstat, open, readdir, readlink } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { TOOL_MATRIX, type ToolMatrix } from './shared/tool-matrix.js';
+import { isBackupSkillPath } from './shared/skill-folder-names.js';
 import { HelperError } from './config.js';
 import { skillFrontmatterName } from './delivery/agents-folder.js';
 import type { DetectedTool } from './detect.js';
 import { safeName, type LockEntry } from './lock.js';
+import { discoverManagedLinks } from './linked-homes.js';
 import { assertNoSymlinks, inside, type HelperPaths } from './paths.js';
 import { readStamp } from './stamp.js';
 import type { BuildVerifier, PlanItem } from './verify.js';
@@ -109,6 +111,8 @@ export async function scanDuplicates(options: {paths: HelperPaths; tools: readon
     for (const root of await rootsFor(template, paths)) owned.add(root);
   }
   const isOwned = (folder: string) => [...owned].some(root => inside(root, folder));
+  const managedLinks = new Set(options.verifier && options.helperIds?.length ?
+    (await discoverManagedLinks({paths, managed, verifier: options.verifier, helperIds: options.helperIds})).map(link => link.path) : []);
   const duplicates = new Map<string, Duplicate>();
   for (const tool of TOOL_MATRIX.tools.filter(tool => options.tools.some(found => found.tool === tool.key && tool.variants.some(variant => variant.key === found.variant)))) {
     // Grok's plugin reads belong to the TLS-45 ignore entry and status warning.
@@ -141,7 +145,12 @@ export async function scanDuplicates(options: {paths: HelperPaths; tools: readon
               if (++visited > MAX_ENTRIES || duplicates.size >= 2000) break;
               if (!safeName(entry.name) || (!entry.isDirectory() && !entry.isSymbolicLink())) continue;
               const folder = join(directory, entry.name);
-              if (!allowed(paths, folder) || canonical.has(resolve(folder)) || isOwned(folder)) continue;
+              if (!allowed(paths, folder) || isBackupSkillPath(relative(paths.home, folder).split(sep).join('/')) ||
+                  canonical.has(resolve(folder)) || isOwned(folder) || managedLinks.has(folder)) continue;
+              if (entry.isSymbolicLink()) {
+                const target = resolve(directory, await readlink(folder));
+                if (inside(paths.data, target) || isBackupSkillPath(relative(paths.home, target).split(sep).join('/'))) continue;
+              }
               const text = entry.isDirectory() ? await readMetadata(join(folder, 'SKILL.md'), paths) : null;
               const name = text === null ? null : skillFrontmatterName(text);
               let skillId: string | null = null;

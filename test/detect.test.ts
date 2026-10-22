@@ -73,6 +73,34 @@ test('matrix covers sixteen tools, conservative routes, duplicate risks, and GUI
   }
 });
 
+for (const acceptance of [
+  {
+    tool: 'grok', adapter: 'grok', card: 'TLS-29', syncOnly: true, binaries: ['~/.grok/bin/grok'],
+    reason: "Sync only: with the person's normal HOME, Grok 1.0.52 still starts MCP servers from the Claude Code configuration (observed: the person's MadDots MCP), even with all GROK_*_MCPS/HOOKS/AGENTS/RULES/SESSIONS/SKILLS imports and managed MCPs off. MCP calls stay denied (tools-denied), but servers start.",
+  },
+  {
+    tool: 'cursor', adapter: 'cursor', card: 'TLS-27', syncOnly: true, binaries: ['~/.local/bin/cursor-agent'],
+    reason: "Sync only: with the person's normal HOME, cursor-agent starts MCP servers from the Claude Code configuration (observed: the person's MadDots MCP) despite the project Mcp(*:*) deny. No verified switch stops it while keeping the sign-in.",
+  },
+  {
+    tool: 'vscode-copilot', adapter: 'copilot', card: 'TLS-27', syncOnly: false, binaries: ['copilot'],
+    reason: "Acceptance passed on The Machine 2026-10-21 with --model auto (servers off by the CLI's own report; skill and completion verified). Offer pending the founder; Folder only is no-shell and needs R-02.",
+  },
+]) {
+  test(`${acceptance.tool} matrix preserves round 4 acceptance and keeps runs unoffered`, () => {
+    const tool = loadToolMatrix().tools.find(tool => tool.key === acceptance.tool);
+    assert(tool);
+    const cli = tool.variants.find(variant => variant.key === 'cli');
+    assert(cli);
+    assert.equal(cli.syncOnly, acceptance.syncOnly);
+    assert.deepEqual(cli.detect.binaries, acceptance.binaries);
+    assert.deepEqual(tool.run, {
+      adapter: acceptance.adapter, card: acceptance.card, offered: false, folderOnly: 'none',
+      mcpLevel: 'tools-denied', reason: acceptance.reason, checkedAt: '2026-10-21',
+    });
+  });
+}
+
 test('detection records matched CLI paths locally and reports no executable locations', async () => {
   const f = await fixture();
   try {
@@ -146,6 +174,46 @@ test('run metadata remains disabled until an adapter is offered and only applies
   assert.throws(() => validateToolMatrix(matrix), /TOOL_MATRIX_INVALID: tools\[\d+\]\.run/u);
 });
 
+test('sync-only CLI metadata permits a documented unoffered run with no folder-only capability', () => {
+  const matrix = structuredClone(TOOL_MATRIX);
+  const grok = matrix.tools.find(tool => tool.key === 'grok')!;
+  assert.equal(grok.variants.find(variant => variant.key === 'cli')!.syncOnly, true);
+  for (const mcpLevel of ['servers-off', 'tools-denied'] as const) {
+    grok.run = { adapter: 'grok', card: 'TLS-29', offered: false, folderOnly: 'none',
+      mcpLevel, reason: 'Sync only: MCP startup remains enabled.', checkedAt: '2026-10-21' };
+    assert.deepEqual(validateToolMatrix(matrix).tools.find(tool => tool.key === 'grok')!.run, grok.run);
+  }
+});
+
+test('sync-only CLI metadata rejects offered runs, folder-only capabilities and missing reasons', () => {
+  for (const change of [
+    { offered: true }, { folderOnly: 'os-sandbox' }, { folderOnly: 'no-shell' },
+    { reason: null }, { reason: '' }, { reason: '   ' },
+  ]) {
+    const matrix = structuredClone(TOOL_MATRIX);
+    const grok = matrix.tools.find(tool => tool.key === 'grok')!;
+    Object.assign(grok.run!, change);
+    assert.throws(() => validateToolMatrix(matrix), /TOOL_MATRIX_INVALID: tools\[\d+\]\.run(?:\.reason)?$/u);
+  }
+});
+
+test('sync-only run metadata still requires a CLI variant with an executable candidate', () => {
+  for (const executableCli of [false, true]) {
+    const matrix = structuredClone(TOOL_MATRIX);
+    const grok = matrix.tools.find(tool => tool.key === 'grok')!;
+    const cli = grok.variants.find(variant => variant.key === 'cli')!;
+    grok.variants = [cli];
+    if (executableCli) cli.key = 'editor';
+    else {
+      cli.detect.binaries = [];
+      cli.detect.versionArgs = [];
+      cli.detect.apps = ['~/Applications/Grok.app'];
+      cli.models = { args: null, pattern: null };
+    }
+    assert.throws(() => validateToolMatrix(matrix), /TOOL_MATRIX_INVALID: tools\[\d+\]\.run$/u);
+  }
+});
+
 test('run metadata rejects missing and unknown fields, invalid flags, capabilities, identifiers and dates', () => {
   const run = {adapter: 'codex', card: 'TLS-26', offered: false, folderOnly: 'os-sandbox',
     mcpLevel: 'servers-off', reason: null, checkedAt: '2026-10-14'};
@@ -195,7 +263,7 @@ test('fixture homes detect every tool, versions, PATH binaries, absolute Grok an
     for (const tool of matrix.tools) {
       const variant = tool.variants.find((variant) => variant.detect.binaries.length);
       if (!variant) continue;
-      const path = tool.key === 'grok' ? join(home, '.grok/bin/grok') : tool.key === 'cursor' ? join(home, '.cursor/bin/agent') :
+      const path = tool.key === 'grok' ? join(home, '.grok/bin/grok') : tool.key === 'cursor' ? join(home, '.local/bin/cursor-agent') :
         tool.key === 'deepseek-harness' ? join(home, '.local/bin/dsh') : join(home, 'bin', variant.detect.binaries[0]);
       await executable(path);
       binaries.set(path, tool.key);
@@ -215,14 +283,14 @@ test('fixture homes detect every tool, versions, PATH binaries, absolute Grok an
       assert(tool, `unexpected binary ${file}`);
       if (args[0] === 'fixture-models') return { stdout: `provider/${tool}-model\nlocal/${tool}-model\n`, stderr: '' };
       assert.deepEqual(args, ['--version']);
-      return { stdout: tool === 'cursor' ? 'Cursor Agent 1.2.3' : '1.2.3', stderr: '' };
+      return { stdout: tool === 'cursor' ? '2026.10.14-0f9edde' : '1.2.3', stderr: '' };
     };
     const found = await detectTools({ home, env: { PATH: join(home, 'bin'), SOME_TOKEN: 'never-forward', API_KEY: 'never-forward', SECRET: 'never-forward' }, matrix, runner });
     assert.equal(found.length, 16);
     assert.deepEqual(new Set(found.map((tool) => tool.tool)), new Set(matrix.tools.map((tool) => tool.key)));
     for (const tool of found) {
-      assert.equal(tool.version, tool.tool === 'claude-desktop' ? '4.5.6' : '1.2.3');
-      assert.equal(tool.syncOnly, tool.tool === 'claude-desktop');
+      assert.equal(tool.version, tool.tool === 'claude-desktop' ? '4.5.6' : tool.tool === 'cursor' ? '2026.10.14-0f9edde' : '1.2.3');
+      assert.equal(tool.syncOnly, ['claude-desktop', 'oh-my-pi', 'openclaw', 'hermes', 'cline', 'grok', 'cursor'].includes(tool.tool));
       assert.deepEqual(tool.models, tool.tool === 'claude-desktop' ? [] : [`provider/${tool.tool}-model`, `local/${tool.tool}-model`]);
     }
     assert(calls.every((call) => call.file.startsWith('/')));
@@ -328,16 +396,16 @@ test('Cursor never runs Grok agent directly or through realpath aliases and reje
     await mkdir(join(home, 'bin'), { recursive: true });
     await symlink(grokAgent, join(home, 'bin/agent'));
     const calls: string[] = [];
-    const runner: Runner = async (file) => { calls.push(file); return { stdout: 'Cursor Agent 1.2.3', stderr: '' }; };
+    const runner: Runner = async (file) => { calls.push(file); return { stdout: '2026.10.14-0f9edde', stderr: '' }; };
     assert.deepEqual(await detectTools({ home, matrix, runner, env: { PATH: `${join(home, '.grok/bin')}:${join(home, 'bin')}` } }), []);
     assert.deepEqual(calls, []);
-    await executable(join(home, '.cursor/bin/agent'));
+    await executable(join(home, '.local/bin/cursor-agent'));
     const wrongIdentity: Runner = async () => ({ stdout: 'Grok Agent 0.2.20', stderr: '' });
     assert.deepEqual(await detectTools({ home, matrix, runner: wrongIdentity, env: { PATH: '' } }), []);
     const found = await detectTools({ home, matrix, runner, env: { PATH: '' } });
     assert.equal(found.length, 1);
     assert.equal(found[0].tool, 'cursor');
-    assert.deepEqual(calls, [join(home, '.cursor/bin/agent')]);
+    assert.deepEqual(calls, [join(home, '.local/bin/cursor-agent')]);
   } finally { await cleanup(); }
 });
 

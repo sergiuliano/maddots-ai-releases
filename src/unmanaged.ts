@@ -1,8 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import { lstat, readdir, readlink, realpath } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { TOOL_MATRIX } from './shared/tool-matrix.js';
 import { detectCode } from './shared/skill-checks/risk-signs.js';
 import { scanSecrets } from './shared/skill-checks/secret-rules.js';
+import { isBackupSkillName, isBackupSkillPath } from './shared/skill-folder-names.js';
 import { HelperError } from './config.js';
 import { safeName } from './lock.js';
 import { assertNoSymlinks, inside, type HelperPaths } from './paths.js';
@@ -16,7 +18,7 @@ export type FolderLink = {target: string; targetName: string; targetHome: string
 export type UnmanagedFolder = FolderRef & {
   path: string; realPath: string; link: FolderLink | null; alsoLinkedFrom: FolderRef[]; hasScripts: boolean;
 };
-export type UnmanagedInventory = FolderRef & {link: {targetName: string; targetHome: string | null} | null; hasScripts: boolean};
+export type UnmanagedInventory = FolderRef & {physicalSourceId: string; link: {targetName: string; targetHome: string | null} | null; hasScripts: boolean};
 const overlap = (a: string, b: string) => inside(a, b) || inside(b, a);
 const absent = (error: unknown) => ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '');
 const denied = (error: unknown) => ['EACCES', 'EPERM', 'ELOOP'].includes((error as NodeJS.ErrnoException).code ?? '');
@@ -108,7 +110,7 @@ export async function toolHomes(paths: HelperPaths): Promise<ToolHome[]> {
 }
 
 async function resolveFolder(paths: HelperPaths, ref: FolderRef, homes: ToolHome[]) {
-  if (!safeName(ref.home) || !safeName(ref.folderName)) throw unsafe();
+  if (!safeName(ref.home) || !safeName(ref.folderName) || isBackupSkillName(ref.folderName, ref.home)) throw unsafe();
   const home = homes.find(home => home.home === ref.home);
   if (!home) throw unsafe();
   const path = join(home.root, ref.folderName);
@@ -123,6 +125,7 @@ async function resolveFolder(paths: HelperPaths, ref: FolderRef, homes: ToolHome
     link = {target: realPath, targetName: basename(realPath), targetHome: homes.find(home => home.root === dirname(realPath))?.home ?? null};
   } else if (!info.isDirectory()) throw unsafe();
   if (!allowed(paths, realPath)) throw unsafe();
+  if (isBackupSkillPath(relative(paths.home, realPath).split(sep).join('/'))) throw unsafe();
   await assertNoSymlinks(realPath, paths.home);
   if (await realpath(realPath) !== realPath) throw unsafe();
   return {path, realPath, link};
@@ -142,7 +145,7 @@ export async function listUnmanaged(paths: HelperPaths, options: {verifier?: Bui
     try { names = (await readdir(home.root)).sort(); }
     catch (error) { if (absent(error) || denied(error)) continue; throw error; }
     for (const folderName of names) {
-      if (!safeName(folderName)) continue;
+      if (!safeName(folderName) || isBackupSkillName(folderName, home.home)) continue;
       const ref = {home: home.home, folderName};
       try {
         const resolved = await resolveFolder(paths, ref, homes);
@@ -182,13 +185,16 @@ export async function listUnmanaged(paths: HelperPaths, options: {verifier?: Bui
 /** Inventory deliberately omits paths and file contents, including for aliases. */
 export function unmanagedInventory(folders: readonly UnmanagedFolder[]): UnmanagedInventory[] {
   return folders.flatMap(folder => {
+    // One opaque, scan-local identifier per verified physical source, including
+    // external targets. Neither a basename nor a hash of a private path is identity.
+    const physicalSourceId = randomUUID();
     const name = folder.link?.targetName ?? folder.folderName;
     const home = folder.link?.targetHome ?? (folder.link ? null : folder.home);
     const targetName = scanSecrets('', name).length ? '[redacted]' : name;
     const targetHome = home && scanSecrets('', home).length ? null : home;
-    return [{home: folder.home, folderName: folder.folderName, hasScripts: folder.hasScripts,
+    return [{home: folder.home, folderName: folder.folderName, physicalSourceId, hasScripts: folder.hasScripts,
       link: folder.link ? {targetName, targetHome} : null}, ...folder.alsoLinkedFrom.map(ref => ({...ref,
-      hasScripts: folder.hasScripts, link: {targetName, targetHome}}))]
+      physicalSourceId, hasScripts: folder.hasScripts, link: {targetName, targetHome}}))]
       .filter(ref => !scanSecrets('', ref.home).length && !scanSecrets('', ref.folderName).length);
   });
 }

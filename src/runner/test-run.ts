@@ -9,7 +9,7 @@ import {HelperError} from '../config.js';
 import {assertNoSymlinks, atomicWrite, ensurePrivateDirectory, inside, readPrivateFile, withWriteLock, type HelperPaths} from '../paths.js';
 import type {Adapter} from './adapter.js';
 import {AdapterRegistry} from './adapters/index.js';
-import {ProcessCleanupError, recoverProcess, startTool, timeoutSeconds, type ProcessGroup, type ProcessInspector, type RunningTool} from './process.js';
+import {cleanupRunHome, ProcessCleanupError, recoverProcess, startTool, timeoutSeconds, type ProcessGroup, type ProcessInspector, type RunningTool} from './process.js';
 
 export const RUN_TEST_PROMPT = 'Reply with exactly MADDOTS-RUNNER-OK and nothing else.';
 export const RUN_TEST_DEADLINE_MS = 300_000;
@@ -21,6 +21,7 @@ export type RunTestResult = RunnerTestResultBody;
 export type RunToolTestOptions = {
   data?: string; connection: RunTestConnection; registry: AdapterRegistry; matrix?: ToolMatrix; model?: string;
   processes?: ProcessInspector; now?: () => number; signal?: AbortSignal;
+  readProviderKey?: () => Promise<string | null | undefined>;
 };
 export function runTestCode(error: unknown): string {
   const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
@@ -77,6 +78,7 @@ async function recoverTestsUnlocked(data: string, processes?: ProcessInspector):
       await recoverProcess(row.pid, row.startedAt, processes, row.fence, row.groups, async groups => {
         row.groups = groups; await atomicWrite(file, JSON.stringify(row) + '\n');
       });
+      await cleanupRunHome(data, `test-${row.fence}`);
       await checkedTemp(row.cwd); await rm(row.cwd, {recursive: true, force: true}); await unlink(file);
     } catch {throw recoveryError();}
   }
@@ -116,7 +118,7 @@ async function executeToolTest(options: RunToolTestOptions): Promise<RunTestResu
   const {connection, signal} = options;
   const result = (code: string | null): RunTestResult => ({ok: code === null, code, toolVersion: connection.toolVersion});
   const sourceAdapter = options.registry.get(connection.tool);
-  const model = options.model ?? connection.model;
+  const model = options.model ?? connection.model ?? (sourceAdapter?.info.tool === 'deepseek-harness' ? 'deepseek-flash' : undefined);
   let adapter = sourceAdapter;
   if (sourceAdapter && model === undefined) {
     const flag = sourceAdapter.info.tool === 'codex' ? '-m' : sourceAdapter.info.tool === 'claude-code' ? '--model' : null;
@@ -170,8 +172,9 @@ async function executeToolTest(options: RunToolTestOptions): Promise<RunTestResu
     }
     signal?.addEventListener('abort', abort, {once: true});
     tool = await startTool({adapter, spec: {bin: connection.bin, cwd, runDir, promptFile, ...selected,
-      skillsDir, maxTurns: 50, timeoutSeconds: timeoutSeconds(deadline, claimedAt), runHome: null},
+      skillsDir, skillNames: [], maxTurns: 50, timeoutSeconds: timeoutSeconds(deadline, claimedAt), runHome: null},
       recordedRealpath: connection.realpath, matrix: options.matrix, processes: options.processes, now: options.now,
+      dataDir: options.data, runId: `test-${fence}`, readProviderKey: options.readProviderKey,
       claimedAt, expiresAt: deadline + 300_000, maxRunMinutes: 5, fence,
       onSpawn: async (pid, startedAt) => {if (row && ledger) {row.pid = pid; row.startedAt = startedAt; await saveProcess();}},
       onGroups: async groups => {if (row && ledger) {row.groups = groups; await saveProcess();}},

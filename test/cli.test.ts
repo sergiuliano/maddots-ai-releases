@@ -7,6 +7,7 @@ import { runCli, computerName } from '../src/cli.js';
 import { CommandError, readConfig, type Runner, type Timing } from '../src/config.js';
 import { atomicWrite, createPaths, ensurePaths } from '../src/paths.js';
 import { StateStore } from '../src/state.js';
+import { RunnerState } from '../src/runner/state.js';
 
 test('CLI pairing stores only stdin secrets, installs the service, and uninstall preserves skills and backups', async () => {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-cli-'));
@@ -59,14 +60,19 @@ test('CLI pairing stores only stdin secrets, installs the service, and uninstall
     assert.ok(output.every(line => !line.includes(deviceCode) && !line.includes(credential)));
     for (const call of calls) assert.ok(!JSON.stringify(call.args).includes(credential));
     const state = await readFile(join(data, 'state.json'), 'utf8'); assert.ok(!state.includes(credential) && !state.includes(deviceCode) && !state.includes(code));
-    secrets.clear();
+    const providerKey = 'sk-' + 'SyntheticDeepSeekCanary1234'.repeat(2);
+    await runCli(['keys', 'set', 'deepseek'], {...options, isTTY: true, readKey: async () => providerKey});
+    for (const account of [...secrets.keys()]) if (account !== 'deepseek') secrets.delete(account);
     await runCli(['connect'], options);
     assert.equal(http.filter(path => path === '/api/helper/pairings').length, 2, 'Explicit connect recovers a missing local token.');
+    assert.equal(secrets.get('deepseek'), providerKey, 'Pairing again retains the provider key.');
     await writeFile(join(data, 'lock.json'), 'kept'); await writeFile(join(data, 'backups/kept'), 'backup');
     await mkdir(join(home, '.agents/skills/kept'), { recursive: true }); await writeFile(join(home, '.agents/skills/kept/SKILL.md'), 'skill');
     const mcp = join(home, '.config/ibl-projects-mcp'); await mkdir(mcp, { recursive: true }); await writeFile(join(mcp, 'untouched.json'), 'untouched');
     await runCli(['uninstall'], options);
     assert.ok(!loaded); assert.equal(secrets.size, 0); assert.ok(http.includes('/api/helper/token/revoke'));
+    assert.ok(output.every(line => !line.includes(providerKey)));
+    assert.ok(calls.every(call => !JSON.stringify(call.args).includes(providerKey)));
     for (const [path, text] of [['lock.json', 'kept'], ['backups/kept', 'backup']]) assert.equal(await readFile(join(data, path), 'utf8'), text);
     assert.equal(await readFile(join(home, '.agents/skills/kept/SKILL.md'), 'utf8'), 'skill');
     assert.equal(await readFile(join(mcp, 'untouched.json'), 'utf8'), 'untouched');
@@ -76,7 +82,7 @@ test('CLI pairing stores only stdin secrets, installs the service, and uninstall
 });
 test('CLI parses future commands and refuses a relative file flag before asking for confirmation', async () => {
   const output: string[] = [];
-  await runCli(['--version'], { output: line => output.push(line) }); assert.deepEqual(output, ['0.1.3']);
+  await runCli(['--version'], { output: line => output.push(line) }); assert.deepEqual(output, ['0.1.4']);
   await assert.rejects(runCli(['allow'], {isTTY: false}), {code: 'ALLOW_TTY_REQUIRED'});
   await assert.rejects(runCli(['allow', '--all'], {isTTY: false}), {code: 'ALLOW_TTY_REQUIRED'});
   await assert.rejects(runCli(['allow', '--yes'], {isTTY: true}), {code: 'USAGE'});
@@ -120,6 +126,54 @@ test('computer name uses scutil and falls back to a bounded safe hostname', asyn
   const fallback = await computerName(async () => { throw new CommandError(1); });
   assert.match(fallback, /^[A-Za-z0-9 ._-]{1,64}$/);
 });
+
+for (const evidence of ['none', 'active-run', 'live-test', 'invalid-ledger', 'orphan-test'] as const) {
+  test(`uninstall stops the service before home cleanup and preserves unverified evidence: ${evidence}`, async () => {
+    const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-uninstall-homes-'));
+    const home = join(root, 'home'); await mkdir(home, {mode: 0o700});
+    const env = {PATH: join(root, 'empty-bin')}, paths = await createPaths(readConfig(env, home));
+    await ensurePaths(paths);
+    const runId = '11111111-1111-1111-1111-111111111111', fence = 'a'.repeat(32);
+    const savedHome = join(paths.data, 'run-homes', evidence === 'live-test' || evidence === 'orphan-test' ? `test-${fence}` : runId);
+    await mkdir(savedHome, {recursive: true, mode: 0o700});
+    await writeFile(join(savedHome, 'diagnostic'), 'private synthetic evidence', {mode: 0o600});
+    const state = new RunnerState(paths.data); await state.init();
+    if (evidence === 'active-run') await state.writeActive([{runId, agentId: '22222222-2222-2222-2222-222222222222',
+      aiToolId: '33333333-3333-3333-3333-333333333333', pid: 0, startedAt: 'fixture', fence,
+      runDir: join(root, 'workspace', '.maddots', 'runs', runId), phase: 'running'}]);
+    if (evidence === 'live-test') await atomicWrite(join(paths.data, 'runner', '.test-process.lock'), String(process.pid));
+    if (evidence === 'invalid-ledger') await atomicWrite(join(paths.data, 'runner', 'active.json'), 'invalid JSON');
+    let loaded = true, stopped = false;
+    const output: string[] = [];
+    const runner: Runner = async (file, args) => {
+      if (file === '/bin/launchctl') {
+        if (args[0] === 'print' && !loaded) throw new CommandError(113);
+        if (args[0] === 'bootout') {
+          assert.equal(await readFile(join(savedHome, 'diagnostic'), 'utf8'), 'private synthetic evidence', 'Home must survive until service stop.');
+          loaded = false; stopped = true;
+        }
+        return {stdout: '', stderr: ''};
+      }
+      assert.equal(file, '/usr/bin/security');
+      assert.equal(stopped, true, 'Credentials are removed after the service stops.');
+      if (args[0] === 'find-generic-password') throw new CommandError(44);
+      assert.equal(args[0], 'delete-generic-password');
+      return {stdout: '', stderr: ''};
+    };
+    try {
+      await runCli(['uninstall'], {home, env, runner, output: line => output.push(line),
+        request: async () => {assert.fail('An unpaired uninstall must not contact a server.');}});
+      assert.equal(stopped, true);
+      if (evidence === 'none') {
+        await assert.rejects(lstat(savedHome), {code: 'ENOENT'});
+        assert.equal(output.some(line => line.includes('run homes were kept')), false);
+      } else {
+        assert.equal(await readFile(join(savedHome, 'diagnostic'), 'utf8'), 'private synthetic evidence');
+        assert.ok(output.some(line => line.includes('run homes were kept') && line.includes('cleanup could not be verified')));
+      }
+    } finally {await rm(root, {recursive: true, force: true});}
+  });
+}
 
 for (const platform of ['linux', 'win32']) test(`runs and agent refuse ${platform} before configuration, credentials or process work`, async t => {
   const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;

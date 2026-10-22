@@ -4,10 +4,17 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { backupFolder } from '../src/backups.js';
 import { readConfig } from '../src/config.js';
 import { createPaths } from '../src/paths.js';
 import { assertUnmanagedTarget, listUnmanaged, resolveToolFolder, toolHomeRoot, toolHomes, unmanagedInventory } from '../src/unmanaged.js';
 import { BuildVerifier, signedBuildString } from '../src/verify.js';
+
+const withoutSourceIds = (inventory: ReturnType<typeof unmanagedInventory>) => inventory.map(entry => {
+  const {physicalSourceId, ...display} = entry;
+  assert.match(physicalSourceId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+  return display;
+});
 
 async function fixture() {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'mdai-unmanaged-'));
@@ -106,7 +113,7 @@ test('oversized files and trees remain listed conservatively for upload checks',
     for (let index = 0; index < 11; index++) {
       await writeFile(join(heavy, `reference-${index}.bin`), Buffer.alloc(1024 * 1024));
     }
-    assert.deepEqual(unmanagedInventory(await listUnmanaged(f.paths)), [
+    assert.deepEqual(withoutSourceIds(unmanagedInventory(await listUnmanaged(f.paths))), [
       {home: '.codex', folderName: 'large-file', hasScripts: true, link: null},
       {home: '.codex', folderName: 'large-tree', hasScripts: true, link: null},
       {home: '.codex', folderName: 'plain', hasScripts: false, link: null}
@@ -179,9 +186,92 @@ test('inventory omits credential-bearing refs and redacts credential-bearing lin
     await symlink(target, join(f.home, '.agents/skills/safe-alias'));
     await symlink(target, join(f.home, '.agents/skills', secret));
     const inventory = unmanagedInventory(await listUnmanaged(f.paths));
-    assert.deepEqual(inventory, [{home: '.agents', folderName: 'safe-alias', hasScripts: false,
+    assert.deepEqual(withoutSourceIds(inventory), [{home: '.agents', folderName: 'safe-alias', hasScripts: false,
       link: {targetName: '[redacted]', targetHome: null}}]);
     assert.equal(JSON.stringify(inventory).includes(secret), false);
     assert.equal(JSON.stringify(inventory).includes(f.home), false);
   } finally { await f.close(); }
+});
+
+test('three Codex homes sharing one physical skill retain all home references', async () => {
+  const f = await fixture();
+  try {
+    const source = await f.folder('.codex-work/skills', 'shared');
+    for (const home of ['.codex', '.codex-client']) {
+      await mkdir(join(f.home, home, 'skills'), {recursive: true});
+      await symlink(source, join(f.home, home, 'skills/shared'));
+    }
+    const folders = await listUnmanaged(f.paths);
+    assert.equal(folders.length, 1);
+    assert.equal(folders[0].home, '.codex-work');
+    assert.deepEqual(folders[0].alsoLinkedFrom, [{home: '.codex', folderName: 'shared'}, {home: '.codex-client', folderName: 'shared'}]);
+    const inventory = unmanagedInventory(folders);
+    assert.equal(new Set(inventory.map(entry => entry.physicalSourceId)).size, 1);
+    assert.deepEqual(withoutSourceIds(inventory), [
+      {home: '.codex-work', folderName: 'shared', hasScripts: false, link: null},
+      ...['.codex', '.codex-client'].map(home => ({home, folderName: 'shared', hasScripts: false,
+        link: {targetName: 'shared', targetHome: '.codex-work'}})),
+    ]);
+  } finally {await f.close();}
+});
+
+test('only exact Grok date backups and helper-owned backup storage are excluded', async () => {
+  const f = await fixture();
+  try {
+    for (const name of ['database-backup', 'database-backup-tool', 'backups', 'manual.bak', 'guide~', 'guide-backup-20261021']) {
+      await f.folder('.codex/skills', name);
+    }
+    await f.folder('.codex-backup-20261021/skills', 'retired');
+    await f.folder('.codex-work/skills', 'guide.backup');
+    const backup = await f.folder('.grok/skills', 'guide-backup-20261021');
+    for (const name of ['database-backup', 'backups', 'guide-backup-manual', 'guide-backup-20260231', 'guide-backup-20261021-extra']) {
+      await f.folder('.grok/skills', name);
+    }
+    const original = await f.folder('.agents/skills', 'original');
+    const manifest = await backupFolder(f.paths, original, 'agents-folder', 'test', null);
+    assert.equal(manifest.folderName, 'original');
+    await symlink(backup, join(f.home, '.agents/skills/linked-backup'));
+    await symlink(join(f.paths.backups, manifest.id, manifest.route, manifest.folderName), join(f.home, '.agents/skills/helper-backup'));
+    assert.deepEqual((await listUnmanaged(f.paths)).map(({home, folderName}) => ({home, folderName})), [
+      {home: '.codex', folderName: 'backups'},
+      {home: '.codex', folderName: 'database-backup'},
+      {home: '.codex', folderName: 'database-backup-tool'},
+      {home: '.codex', folderName: 'guide-backup-20261021'},
+      {home: '.codex', folderName: 'guide~'},
+      {home: '.codex', folderName: 'manual.bak'},
+      {home: '.codex-backup-20261021', folderName: 'retired'},
+      {home: '.codex-work', folderName: 'guide.backup'},
+      {home: '.grok', folderName: 'backups'},
+      {home: '.grok', folderName: 'database-backup'},
+      {home: '.grok', folderName: 'guide-backup-20260231'},
+      {home: '.grok', folderName: 'guide-backup-20261021-extra'},
+      {home: '.grok', folderName: 'guide-backup-manual'},
+    ]);
+    assert.ok((await toolHomes(f.paths)).some(home => home.home === '.codex-backup-20261021'));
+    await assert.doesNotReject(toolHomeRoot(f.paths, '.codex-backup-20261021'));
+    await assert.rejects(resolveToolFolder(f.paths, {home: '.agents', folderName: 'linked-backup'}), {code: 'PATH_UNSAFE'});
+    await assert.rejects(resolveToolFolder(f.paths, {home: '.agents', folderName: 'helper-backup'}), {code: 'PATH_UNSAFE'});
+  } finally {await f.close();}
+});
+
+test('physical-source IDs join external aliases and distinguish unrelated same-basename targets without leaking paths', async () => {
+  const f = await fixture();
+  try {
+    const shared = await f.folder('local-skills/first', 'guide');
+    const independent = await f.folder('local-skills/second', 'guide');
+    for (const home of ['.codex', '.codex-client', '.codex-work']) {
+      await mkdir(join(f.home, home, 'skills'), {recursive: true});
+      await symlink(shared, join(f.home, home, 'skills/shared'));
+    }
+    await symlink(independent, join(f.home, '.codex/skills/independent'));
+    const inventory = unmanagedInventory(await listUnmanaged(f.paths));
+    const linked = inventory.filter(entry => entry.folderName === 'shared');
+    assert.equal(linked.length, 3);
+    assert.equal(new Set(linked.map(entry => entry.physicalSourceId)).size, 1);
+    const distinct = inventory.find(entry => entry.folderName === 'independent')!;
+    assert.notEqual(distinct.physicalSourceId, linked[0].physicalSourceId);
+    withoutSourceIds(inventory);
+    assert.equal(JSON.stringify(inventory).includes('local-skills'), false);
+    assert.equal(JSON.stringify(inventory).includes(f.home), false);
+  } finally {await f.close();}
 });

@@ -1,11 +1,11 @@
 import { constants, type Stats } from 'node:fs';
-import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readdir, realpath, rename, unlink } from 'node:fs/promises';
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { link, lstat, mkdir, open, readdir, readlink, realpath, rename, symlink, unlink } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { treeDigest, type BuildFileMode } from './shared/build-format.js';
 import { SKILL_LIMITS } from './shared/skill-limits.js';
 import { HelperError } from './config.js';
-import { assertNoSymlinks, ensurePrivateDirectory, inside, type HelperPaths } from './paths.js';
+import { assertNoSymlinks, atomicWrite, ensurePrivateDirectory, inside, readPrivateFile, type HelperPaths } from './paths.js';
 
 export type SafeBuildFile = { path: string; mode: BuildFileMode; content: Buffer };
 const FILE_BYTES = SKILL_LIMITS.fileBytes;
@@ -104,6 +104,128 @@ export async function syncDirectory(path: string): Promise<void> {
   } finally { await directory.close(); }
 }
 
+/** Preserve exact link text without following it or creating an availability gap. */
+export async function preserveSymlink(source: string, destination: string, target: string): Promise<void> {
+  const parent = await realDirectory(dirname(source));
+  await realDirectory(dirname(destination));
+  const before = await lstat(source);
+  if (!before.isSymbolicLink() || before.uid !== process.getuid?.() || await readlink(source) !== target) {
+    throw new HelperError('PATH_CHANGED', 'The skill link changed before it could be backed up.');
+  }
+  // macOS does not support hard-linking a symlink. Snapshot its exact text in
+  // an exclusive backup slot before an atomic repoint replaces the live link.
+  await symlink(target, destination);
+  const saved = await lstat(destination);
+  if (!saved.isSymbolicLink() || await readlink(destination) !== target ||
+      !sameFile(parent, await realDirectory(dirname(source))) || !sameFile(before, await lstat(source))) {
+    throw new HelperError('PATH_CHANGED', 'The skill link changed while it was being backed up.');
+  }
+  await syncDirectory(dirname(destination));
+}
+
+export type SymlinkHooks = {
+  beforeStage?: () => Promise<void>;
+  beforePreserve?: () => Promise<void>;
+  afterPreserve?: () => Promise<void>;
+  beforePlace?: () => Promise<void>;
+};
+type LinkIdentity = {dev: number; ino: number; type: number};
+const linkIdentity = (info: Stats): LinkIdentity => ({dev: info.dev, ino: info.ino, type: info.mode & constants.S_IFMT});
+const sameIdentity = (expected: LinkIdentity, info: Stats) => expected.dev === info.dev && expected.ino === info.ino && expected.type === (info.mode & constants.S_IFMT);
+type LinkJournal = {format: 1; path: string; target: string; preserved: string; identity: LinkIdentity};
+const maybeStat = async (path: string) => lstat(path).catch(error => {
+  if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+  throw error;
+});
+
+/** Preserve the actual displaced inode, then place exclusively. The journal recovers the two-step gap. */
+async function placeSymlink(path: string, target: string, expected: string | null | {directory: true}, preserved: string | undefined, hooks: SymlinkHooks): Promise<void> {
+  if (!target || target.includes('\0')) throw new HelperError('PATH_UNSAFE', 'Invalid skill link target.');
+  const parent = dirname(path), directory = await realDirectory(parent);
+  if (expected !== null && !preserved) throw new HelperError('PATH_UNSAFE', 'Replacing a skill path requires a transaction preservation slot.');
+  if (preserved) await realDirectory(dirname(preserved));
+  const checkExpected = async (candidate: string) => {
+    const info = await maybeStat(candidate);
+    if (expected === null ? info !== null : !info || info.uid !== process.getuid?.() || (typeof expected === 'string'
+      ? !info.isSymbolicLink() || await readlink(candidate) !== expected : !info.isDirectory())) {
+      throw new HelperError('PATH_CHANGED', 'The skill link changed before it could be placed.');
+    }
+    return info;
+  };
+  let journal: LinkJournal | undefined;
+  if (preserved) {
+    try {
+      journal = JSON.parse(await readPrivateFile(preserved + '.json', 4096)) as LinkJournal;
+      if (!journal || typeof journal !== 'object' || Array.isArray(journal) || journal.format !== 1 || journal.path !== path || journal.target !== target || journal.preserved !== preserved ||
+          !journal.identity || !['dev', 'ino', 'type'].every(key => Number.isSafeInteger(journal!.identity[key as keyof LinkIdentity]))) {
+        throw new HelperError('BACKUP_INVALID', 'The skill link operation journal is invalid.');
+      }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  }
+  const moved = preserved ? await maybeStat(preserved) : null;
+  if (moved && (!journal || !sameIdentity(journal.identity, moved))) throw new HelperError('PATH_CHANGED', 'The displaced skill object changed; it remains preserved in the transaction backup.');
+  if (moved) {
+    await checkExpected(preserved!);
+    const current = await maybeStat(path);
+    if (current?.isSymbolicLink() && current.uid === process.getuid?.() && await readlink(path) === target) {
+      await syncDirectory(dirname(preserved!)); await syncDirectory(parent);
+      return;
+    }
+    if (current) throw new HelperError('PATH_CHANGED', 'The skill destination became occupied; both objects were preserved.');
+  }
+  const before = moved ? null : await checkExpected(path);
+  if (journal && before && !sameIdentity(journal.identity, before)) throw new HelperError('PATH_CHANGED', 'The journaled skill object changed.');
+  const temporary = join(parent, `.${randomUUID()}.tmp`);
+  await hooks.beforeStage?.();
+  await symlink(target, temporary);
+  const staged = await lstat(temporary);
+  try {
+    await syncDirectory(parent);
+    if (!sameFile(directory, await realDirectory(parent)) || !sameFile(staged, await lstat(temporary)) || await readlink(temporary) !== target) {
+      throw new HelperError('PATH_CHANGED', 'The skill link directory changed before it could be placed.');
+    }
+    if (before && preserved) {
+      if (!journal) {
+        journal = {format: 1, path, target, preserved, identity: linkIdentity(before)};
+        await atomicWrite(preserved + '.json', JSON.stringify(journal) + '\n');
+      }
+      await hooks.beforePreserve?.();
+      if (!sameFile(directory, await realDirectory(parent))) throw new HelperError('PATH_CHANGED', 'The skill directory changed before preservation.');
+      if (await maybeStat(preserved)) throw new HelperError('DESTINATION_EXISTS', 'The preservation slot is already occupied.');
+      // Never rename over the live path. Whatever actually occupies it is
+      // retained before its identity is inspected, including a raced-in file.
+      await rename(path, preserved);
+      await syncDirectory(dirname(preserved)); await syncDirectory(parent);
+      if (!sameIdentity(journal.identity, await lstat(preserved))) {
+        throw new HelperError('PATH_CHANGED', 'The displaced skill object changed; it remains preserved in the transaction backup.');
+      }
+      await checkExpected(preserved);
+      await hooks.afterPreserve?.();
+    }
+    await hooks.beforePlace?.();
+    if (!sameFile(directory, await realDirectory(parent))) throw new HelperError('PATH_CHANGED', 'The skill directory changed before link placement.');
+    // Exclusive creation also protects files that appear after preservation.
+    // rename(temporary, path) would reopen the original destructive race.
+    await symlink(target, path);
+    await syncDirectory(parent);
+  } finally {
+    // Only our generated temporary link is removed. Originals stay in backups.
+    try {
+      if (sameFile(directory, await realDirectory(parent)) && sameFile(staged, await lstat(temporary))) await unlink(temporary);
+    } catch { /* Preserve anything whose identity changed. */ }
+  }
+}
+
+export async function atomicSymlink(path: string, target: string, expected: string | null,
+  options: {preserved?: string; hooks?: SymlinkHooks} = {}): Promise<void> {
+  await placeSymlink(path, target, expected, options.preserved, options.hooks ?? {});
+}
+
+/** The manifest and this operation's inode journal precede moving the primary folder. */
+export async function directorySymlink(path: string, target: string, preserved: string, hooks: SymlinkHooks = {}): Promise<void> {
+  await placeSymlink(path, target, {directory: true}, preserved, hooks);
+}
+
 /** Atomically replace a private serialized build, including base64 payloads. */
 export async function atomicWriteBuild(path: string, content: string): Promise<void> {
   const limit = 16 * 1024 * 1024;
@@ -182,6 +304,179 @@ export async function stageBuild(paths: HelperPaths, files: readonly SafeBuildFi
 }
 
 export type RenameOptions = { rename?: (source: string, destination: string) => Promise<void> };
+
+export type RestorePlacementOptions = {
+  beforePlace?: () => Promise<void>;
+  afterIntent?: () => Promise<void>;
+  afterPlace?: () => Promise<void>;
+  beforeConsume?: () => Promise<void>;
+  afterConsume?: () => Promise<void>;
+  /** The caller has already restored an alias with exclusive symlink creation. */
+  alreadyPlaced?: boolean;
+  /** Repoint an alias after its saved identity and restore intent are durable. */
+  placeAlias?: () => Promise<void>;
+};
+
+type RestoreIdentity = LinkIdentity & {size: number; digest: string | null};
+type RestoreJournal = {format: 1; source: string; destination: string; state: 'placing' | 'consumed'; identity: RestoreIdentity};
+const restoreChanged = () => new HelperError('PATH_CHANGED', 'The restore object changed; remaining objects were preserved.');
+
+/** Bound the sidecar component even when the saved basename is 255 bytes. */
+export const restoreJournalPath = (source: string): string => join(dirname(source), `.restore-${createHash('sha256').update(basename(source)).digest('hex')}.json`);
+
+/** Hash an open regular file, never a target reached through a saved symlink. */
+async function restoreIdentity(path: string, expected: Stats): Promise<RestoreIdentity> {
+  let digest: string | null = null;
+  if (expected.isFile()) {
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const before = await file.stat();
+      if (!before.isFile() || !sameFile(expected, before) || before.size !== expected.size) throw restoreChanged();
+      const hash = createHash('sha256'), buffer = Buffer.alloc(64 * 1024);
+      let offset = 0;
+      while (offset < before.size) {
+        const {bytesRead} = await file.read(buffer, 0, Math.min(buffer.length, before.size - offset), offset);
+        if (!bytesRead) throw restoreChanged();
+        hash.update(buffer.subarray(0, bytesRead)); offset += bytesRead;
+      }
+      const after = await file.stat();
+      if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw restoreChanged();
+      digest = hash.digest('hex');
+    } finally { await file.close(); }
+  } else if (expected.isSymbolicLink()) digest = createHash('sha256').update(await readlink(path)).digest('hex');
+  else if (!expected.isDirectory()) throw new HelperError('PATH_UNSAFE', 'Only ordinary files, real folders, and symbolic links can be restored.');
+  const after = await lstat(path);
+  if (!sameIdentity(linkIdentity(expected), after) || after.size !== expected.size ||
+      after.mtimeMs !== expected.mtimeMs || after.ctimeMs !== expected.ctimeMs) throw restoreChanged();
+  return {...linkIdentity(expected), size: expected.size, digest};
+}
+
+async function readRestoreJournal(source: string, destination?: string): Promise<RestoreJournal | null> {
+  let value: RestoreJournal;
+  try { value = JSON.parse(await readPrivateFile(restoreJournalPath(source), 16 * 1024)) as RestoreJournal; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  if (!value || value.format !== 1 || value.source !== source || typeof value.destination !== 'string' || !isAbsolute(value.destination) ||
+      (destination !== undefined && value.destination !== destination) || !['placing', 'consumed'].includes(value.state) || !value.identity ||
+      !['dev', 'ino', 'type', 'size'].every(key => Number.isSafeInteger(value.identity[key as keyof RestoreIdentity]) && Number(value.identity[key as keyof RestoreIdentity]) >= 0) ||
+      ![constants.S_IFREG, constants.S_IFLNK, constants.S_IFDIR].includes(value.identity.type) ||
+      (value.identity.type === constants.S_IFDIR ? value.identity.digest !== null : typeof value.identity.digest !== 'string' || !/^[0-9a-f]{64}$/u.test(value.identity.digest))) {
+    throw new HelperError('BACKUP_INVALID', 'The restore operation journal is invalid.');
+  }
+  return value;
+}
+
+async function matchesRestore(path: string, identity: RestoreIdentity, recreatedLink = false): Promise<boolean> {
+  const current = await maybeStat(path);
+  if (!current || current.size !== identity.size || (recreatedLink && identity.type === constants.S_IFLNK
+    ? !current.isSymbolicLink() : !sameIdentity(identity, current))) return false;
+  return (await restoreIdentity(path, current)).digest === identity.digest;
+}
+
+/** Without a destination, classify the saved slot for listing: a different
+ * object is pending content. With a destination, recover the journaled operation
+ * independently of that slot, so a retry never starts restoring its replacement. */
+export async function restoredObjectState(source: string, destination?: string): Promise<'missing' | 'pending' | 'restoring' | 'restored'> {
+  await realDirectory(dirname(source));
+  const journal = await readRestoreJournal(source, destination), current = await maybeStat(source);
+  if (journal && (destination !== undefined || !current || await matchesRestore(source, journal.identity))) return journal.state === 'consumed' ? 'restored' : 'restoring';
+  return current ? 'pending' : 'missing';
+}
+
+/**
+ * Restore without replacing an occupied file or link destination. Keep the saved
+ * source as evidence and journal consumption after the new entry is durable.
+ *
+ * Node exposes no portable rename-noreplace for directories, so their final
+ * absence check and rename still have a race with an arriving empty directory.
+ * Parent-path checks and source-identity checks also cannot be joined atomically
+ * to placement without native directory-relative/conditional operations.
+ */
+export async function placeRestoredObject(source: string, destination: string, options: RestorePlacementOptions = {}): Promise<void> {
+  const sourceParent = dirname(source), destinationParent = dirname(destination);
+  const sourceDirectory = await realDirectory(sourceParent), destinationDirectory = await realDirectory(destinationParent);
+  let journal = await readRestoreJournal(source, destination);
+  const state = await restoredObjectState(source, destination);
+  if (state === 'restored') return;
+  const original = await maybeStat(source);
+  if (!original && (state !== 'restoring' || !journal)) throw restoreChanged();
+  const identity = state === 'restoring' ? journal!.identity : await restoreIdentity(source, original!);
+  const isDirectory = identity.type === constants.S_IFDIR, isFile = identity.type === constants.S_IFREG;
+  const checkParents = async () => {
+    if (!sameFile(sourceDirectory, await realDirectory(sourceParent)) || !sameFile(destinationDirectory, await realDirectory(destinationParent))) {
+      throw new HelperError('PATH_CHANGED', 'A restore parent changed; the saved object was preserved.');
+    }
+  };
+  const checkSource = async () => {
+    const current = await maybeStat(source);
+    if (!current || !await matchesRestore(source, identity)) {
+      throw new HelperError('PATH_CHANGED', 'The saved object changed before restore completed.');
+    }
+  };
+  const occupied = () => new HelperError('DESTINATION_EXISTS', 'The restore destination is occupied; the saved object was preserved.');
+  await checkParents();
+  let placed = await maybeStat(destination);
+  const alreadyPlaced = (state === 'restoring' || options.alreadyPlaced) && placed && await matchesRestore(destination, identity, true);
+  if (state !== 'restoring') {
+    await checkSource();
+    if (!alreadyPlaced && !options.placeAlias && await maybeStat(destination)) throw occupied();
+    journal = {format: 1, source, destination, state: 'placing', identity};
+    await atomicWrite(restoreJournalPath(source), JSON.stringify(journal) + '\n');
+  }
+  await options.afterIntent?.();
+  if (!alreadyPlaced) {
+    if (!options.placeAlias) await options.beforePlace?.();
+    await checkParents();
+    await checkSource();
+    try {
+      if (options.placeAlias) {
+        if (identity.type !== constants.S_IFLNK) throw new HelperError('PATH_UNSAFE', 'Alias placement requires a saved symbolic link.');
+        await options.placeAlias();
+      } else if (isDirectory) {
+        // Keep this last check adjacent to rename. A file or symlink arriving in
+        // the remaining gap is refused by rename, but an empty folder can be lost.
+        if (await maybeStat(destination)) throw occupied();
+        await rename(source, destination);
+      } else if (isFile) {
+        // link is exclusive even if a destination appears after all path checks.
+        await link(source, destination);
+      } else {
+        // Recreate exact link text: macOS cannot hard-link a symbolic link.
+        await symlink(await readlink(source), destination);
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST' || code === 'ENOTEMPTY' || code === 'EISDIR' || code === 'ENOTDIR') throw occupied();
+      if (code === 'EXDEV') throw new HelperError('EXDEV', 'The helper cannot restore between volumes; the source was preserved.');
+      throw error;
+    }
+  }
+  await options.afterPlace?.();
+  await checkParents();
+  placed = await lstat(destination);
+  const checkDestination = async () => {
+    const current = await maybeStat(destination);
+    if (!current || !sameIdentity(linkIdentity(placed!), current) || !await matchesRestore(destination, identity, true)) {
+      throw new HelperError('PATH_CHANGED', 'The restore destination changed; remaining objects were preserved.');
+    }
+  };
+  await checkDestination();
+  if (isFile) {
+    const file = await open(destination, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      if (!sameIdentity(identity, await file.stat())) throw new HelperError('PATH_CHANGED', 'The restored file changed before syncing.');
+      await file.sync();
+    } finally { await file.close(); }
+  }
+  await syncDirectory(destinationParent);
+  await checkParents();
+  await checkDestination();
+  if (sourceParent !== destinationParent) await syncDirectory(sourceParent);
+  await options.beforeConsume?.();
+  // Never unlink or archive this pathname: another process may have replaced
+  // it since validation. Consumption describes only the restored identity.
+  await atomicWrite(restoreJournalPath(source), JSON.stringify({...journal!, state: 'consumed'}) + '\n');
+  await options.afterConsume?.();
+}
 
 /** Rename only. A different volume is a reported error, never a copy fallback. */
 export async function durableRename(source: string, destination: string, options: RenameOptions = {}): Promise<void> {

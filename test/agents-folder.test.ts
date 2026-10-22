@@ -470,7 +470,13 @@ test('TLS-15 inventory reports a canonical unmanaged conflict without moving the
       await engine.applyPlan(f.plan([f.item(build, {state, answer: state === 'asking' ? null : 'update'})]));
       const inventory = await engine.inventory();
       // Release 7 merge: TLS-18's inventory names the home by its folder key ('.agents'), not the route.
-      assert.deepEqual(inventory.unmanaged, [{home: '.agents', folderName: 'example', link: null, hasScripts: false,
+      assert.deepEqual(inventory.unmanaged.map(entry => {
+        assert.ok(entry !== null && typeof entry === 'object' && !Array.isArray(entry));
+        assert.ok('physicalSourceId' in entry && typeof entry.physicalSourceId === 'string');
+        const {physicalSourceId, ...display} = entry;
+        assert.match(physicalSourceId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+        return display;
+      }), [{home: '.agents', folderName: 'example', link: null, hasScripts: false,
         canonicalConflict: {skillId: build.skillId, target: build.target, name: build.name}}]);
       assert.deepEqual(inventory.duplicates, []);
       assert.deepEqual(await engine.localCopyQuestions(), []);

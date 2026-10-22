@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { treeDigest } from '../src/shared/build-format.js';
 import type { HelperImportSession } from '../src/shared/helper-imports-protocol.js';
 import { ApiClient } from '../src/api.js';
-import { listBackups, restoreBackup } from '../src/backups.js';
+import { backupUnmanaged, listBackups, restoreBackup } from '../src/backups.js';
 import { runCli } from '../src/cli.js';
 import { readConfig } from '../src/config.js';
 import { FolderDeliveryTarget } from '../src/delivery/index.js';
@@ -62,9 +62,9 @@ async function fixture() {
   const skill = async (name: string, text = 'Original local content\n', key = '.codex') => {
     await mkdir(original(name, key), {recursive: true}); await writeFile(join(original(name, key), 'SKILL.md'), text);
   };
-  function build(name = 'example', hasCode = false): SignedBuild {
-    const content = Buffer.from(hasCode ? '! echo managed\n' : name === 'example' ? 'Managed delivery\n' : `Managed ${name}\n`);
-    const build: SignedBuild = {format: 1, skillId: name === 'other' ? 'skill-other' : 'skill-test', version: 1, settingsRevision: 0, level: 'workspace', workspaceId: 'workspace-test', boardId: null,
+  function build(name = 'example', hasCode = false, version = 1): SignedBuild {
+    const content = Buffer.from(hasCode ? '! echo managed\n' : name === 'example' ? `Managed delivery${version > 1 ? ' v' + version : ''}\n` : `Managed ${name}\n`);
+    const build: SignedBuild = {format: 1, skillId: name === 'other' ? 'skill-other' : 'skill-test', version, settingsRevision: 0, level: 'workspace', workspaceId: 'workspace-test', boardId: null,
       target: 'folder', name, keyId, signature: '', digest: treeDigest([{path: 'SKILL.md', mode: '100644', content}]), hasCode, draft: false,
       files: [{path: 'SKILL.md', mode: '100644', size: content.length, content: content.toString('base64'), sha256: createHash('sha256').update(content).digest('hex')}],
       report: {renamedFrom: null, unsetSettings: [], unresolvedOptionalReferences: []}};
@@ -164,12 +164,12 @@ test('code held for Allow keeps local copies; replacement runs after that exact 
     assert.equal((await listBackups(f.paths)).length, 0); await assert.rejects(lstat(join(f.home, '.agents/skills/example')), {code: 'ENOENT'});
     assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
     const allowed = f.sync(true); await allowed.reconcile(); await allowed.applyPlan(f.plan([f.item(build)], [f.instruction(session)]));
-    assert.equal((await listBackups(f.paths)).length, 1); await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+    assert.equal((await listBackups(f.paths)).length, 1); assert.equal(await readlink(f.original('example')), '../../.agents/skills/example');
     assert.equal(await readFile(join(f.home, '.agents/skills/example/SKILL.md'), 'utf8'), '! echo managed\n');
   } finally {await f.close();}
 });
 
-test('replacement needs the instruction and verified delivered copy, preserves originals and removes linked aliases', async () => {
+test('three-home import and Replace preserve originals, repoint aliases and keep them live through Update', async () => {
   const f = await fixture();
   try {
     await f.skill('example');
@@ -180,14 +180,48 @@ test('replacement needs the instruction and verified delivered copy, preserves o
     assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
     assert.equal((await listBackups(f.paths)).length, 0);
     const build = f.build(); await sync.applyPlan(f.plan([f.item(build)], [f.instruction(session)]));
-    for (const home of ['.codex', '.codex-work', '.codex-client']) await assert.rejects(lstat(f.original('example', home)), {code: 'ENOENT'});
+    for (const home of ['.codex', '.codex-work', '.codex-client']) {
+      assert.equal(await readlink(f.original('example', home)), '../../.agents/skills/example');
+      assert.equal(await readFile(join(f.original('example', home), 'SKILL.md'), 'utf8'), 'Managed delivery\n');
+    }
     const backups = await listBackups(f.paths); assert.equal(backups.length, 1); assert.equal(backups[0].unmanaged!.links.length, 2);
     assert.equal(await readFile(join(f.paths.backups, backups[0].id, 'local-import/example/SKILL.md'), 'utf8'), 'Original local content\n');
     assert.equal(await readFile(join(f.home, '.agents/skills/example/SKILL.md'), 'utf8'), 'Managed delivery\n');
     const lock = JSON.parse(await readFile(join(f.paths.data, 'lock.json'), 'utf8')); assert.equal(lock.replaced[0].backupId, backups[0].id);
     assert.ok(f.calls.some(call => call.body?.status === 'replaced' && call.body.backupId === backups[0].id));
+    const aliases = await Promise.all(['.codex', '.codex-work', '.codex-client'].map(home => lstat(f.original('example', home))));
+    const next = f.build('example', false, 2);
+    await sync.applyPlan(f.plan([{...f.item(next), kind: 'update', fromVersion: 1}]));
+    for (const [index, home] of ['.codex', '.codex-work', '.codex-client'].entries()) {
+      assert.equal((await lstat(f.original('example', home))).ino, aliases[index].ino);
+      assert.equal(await readFile(join(f.original('example', home), 'SKILL.md'), 'utf8'), 'Managed delivery v2\n');
+    }
+    const code = f.build('example', true, 3);
+    await sync.applyPlan(f.plan([{...f.item(code), kind: 'update', fromVersion: 2}]));
+    for (const home of ['.codex', '.codex-work', '.codex-client']) {
+      assert.equal(await readFile(join(f.original('example', home), 'SKILL.md'), 'utf8'), 'Managed delivery v2\n', 'a held update keeps the last allowed copy in every home');
+    }
     await restoreBackup(f.paths, backups[0].id); await sync.applyPlan(f.plan([], [f.instruction(session)]));
     assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n', 'replayed instructions cannot move a restored copy again');
+  } finally {await f.close();}
+});
+
+test('replacement warns about every affected home and captures links added since import', async () => {
+  const f = await fixture();
+  try {
+    await f.skill('example');
+    await symlink(f.original('example'), f.original('example', '.codex-work'));
+    const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+    await symlink(f.original('example'), f.original('example', '.codex-client'));
+    const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())]));
+    const warnings: string[] = [];
+    await f.engine({output: line => {warnings.push(line);}}).applyInstructions([f.instruction(session)]);
+    assert.equal(warnings.length, 1);
+    for (const home of ['.codex', '.codex-work', '.codex-client']) {
+      assert.ok(warnings[0].includes(home));
+      assert.equal(await readlink(f.original('example', home)), '../../.agents/skills/example');
+    }
+    assert.match(warnings[0], /backed up; links will be preserved and pointed/);
   } finally {await f.close();}
 });
 
@@ -207,7 +241,7 @@ test('TLS-49 replaces a dsh copy only after Replace local copies and preserves i
     assert.deepEqual(await listBackups(f.paths), [], 'Import and ordinary sync leave the local copy in place.');
     const instruction = {...f.instruction(session), home: '.dsh'};
     await sync.applyPlan(f.plan([], [instruction]));
-    await assert.rejects(lstat(original), {code: 'ENOENT'});
+    assert.equal(await readlink(original), '../../.agents/skills/example');
     const [backup] = await listBackups(f.paths);
     assert.ok(backup); assert.equal((await listBackups(f.paths)).length, 1);
     assert.equal(backup.originalPath, '.dsh/skills/example');
@@ -257,10 +291,10 @@ test('an outer selected alias and its canonical folder are preserved once before
     const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
     const instruction = {...f.instruction(session), home: '.codex-work', alsoLinkedFrom: [{home: '.codex-work', folderName: 'example'}]};
     const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())], [instruction]));
-    const backup = (await listBackups(f.paths))[0]; assert.equal(backup.unmanaged!.links.length, 1);
+    const backup = (await listBackups(f.paths))[0]; assert.ok(backup, await readFile(join(f.paths.data, 'imports.json'), 'utf8')); assert.equal(backup.unmanaged!.links.length, 1);
     assert.equal(backup.originalPath, '.codex-work/skills/example');
-    await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
-    await assert.rejects(lstat(f.original('example', '.codex-work')), {code: 'ENOENT'});
+    assert.equal(await readlink(f.original('example')), '../../.agents/skills/example');
+    assert.equal(await readlink(f.original('example', '.codex-work')), '../../.agents/skills/example');
     assert.equal(await readFile(join(f.paths.backups, backup.id, 'local-import/example/SKILL.md'), 'utf8'), 'Canonical original\n');
   } finally {await f.close();}
 });
@@ -306,7 +340,7 @@ test('an authorized deferred replacement survives restart and recovers on 304 wi
     assert.equal((await listBackups(f.paths)).length, 0);
     await writeFile(managed, 'Managed delivery\n');
     f.advance(60_000); await restarted.tick(); restarted.close();
-    await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+    assert.equal(await readlink(f.original('example')), '../../.agents/skills/example');
     assert.equal((await listBackups(f.paths)).length, 1);
     assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 1);
   } finally {await f.close();}
@@ -333,7 +367,7 @@ for (const mismatch of ['omitted', 'sessionId', 'skillId', 'home', 'folderName']
       const folder = JSON.parse(await readFile(join(f.paths.data, 'imports.json'), 'utf8')).sessions[0].folders[0];
       assert.equal(folder.authorized, false); assert.equal(folder.failed, undefined);
       await sync.applyPlan(f.plan([], [instruction]));
-      await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+      assert.equal(await readlink(f.original('example')), '../../.agents/skills/example');
       assert.equal((await listBackups(f.paths)).length, 1);
     } finally {await f.close();}
   });
@@ -352,7 +386,7 @@ test('an older journal without retained full-plan authorization cannot start a r
     assert.equal((await listBackups(f.paths)).length, 0);
     assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
     await sync.applyPlan(f.plan([], [f.instruction(session)]));
-    await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+    assert.equal(await readlink(f.original('example')), '../../.agents/skills/example');
   } finally {await f.close();}
 });
 
@@ -368,7 +402,7 @@ test('an older queued replacement requests a full plan on restart and resumes wh
     await atomicWrite(file, JSON.stringify(journal)); f.setPlan(plan);
     sync.close(); const restarted = f.sync(); await restarted.tick(); restarted.close();
     assert.equal(f.calls.filter(call => call.path === '/api/helper/plan').at(-1)!.revision, null);
-    await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+    assert.equal(await readlink(f.original('example')), '../../.agents/skills/example');
     assert.equal((await listBackups(f.paths)).length, 1);
   } finally {await f.close();}
 });
@@ -383,7 +417,8 @@ test('CLI backups lists and restores offline, preserving an occupied current cop
       runner: async () => {assert.fail('Offline backups must not use credentials or external commands');},
       request: async () => {assert.fail('Offline backups must not call the server');}};
     await runCli(['backups'], options); assert.ok(output.some(line => line.includes(backup.id)));
-    await f.skill('example', 'Current local edit\n'); await runCli(['backups', 'restore', backup.id], options);
+    await rm(f.original('example')); await f.skill('example', 'Current local edit\n');
+    await runCli(['backups', 'restore', backup.id], options);
     assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
     assert.equal((await listBackups(f.paths))[0].reason, 'restore-replaced');
     await assert.rejects(runCli(['backups', 'restore', '../escape'], options), {code: 'USAGE'});
@@ -479,7 +514,7 @@ test('an absent alsoLinkedFrom alias is skipped and the original is replaced wit
     await sync.applyPlan(f.plan([], [instruction]));
     const backups = await listBackups(f.paths); assert.equal(backups.length, 1);
     assert.deepEqual(backups[0].unmanaged!.links, []);
-    await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+    assert.equal(await readlink(f.original('example')), '../../.agents/skills/example');
     assert.equal(await readFile(join(f.paths.backups, backups[0].id, 'local-import/example/SKILL.md'), 'utf8'), 'Original local content\n');
     assert.deepEqual(f.calls.filter(call => call.body?.status === 'replaced').map(call => call.body.backupId), [backups[0].id]);
   } finally {await f.close();}
@@ -535,7 +570,7 @@ test('replacement of a selected repository link preserves the target inode and u
     const sync = f.sync(); await sync.reconcile();
     await sync.applyPlan(f.plan([f.item(f.build('ai-discovery'))], [f.instruction(session, 'ai-discovery')]));
     assert.equal((await lstat(original)).ino, inode); assert.equal(await readFile(join(original, 'SKILL.md'), 'utf8'), 'Repository original\n');
-    for (const home of ['.codex', '.codex-work']) await assert.rejects(lstat(f.original('ai-discovery', home)), {code: 'ENOENT'});
+    for (const home of ['.codex', '.codex-work']) assert.equal(await readlink(f.original('ai-discovery', home)), '../../.agents/skills/ai-discovery');
     const backups = await listBackups(f.paths); assert.equal(backups.length, 1); assert.equal(backups[0].unmanaged!.keepOriginal, true);
     assert.equal(await readFile(join(f.original('unticked'), 'SKILL.md'), 'utf8'), 'Original local content\n');
     assert.ok(f.calls.some(call => call.body?.status === 'replaced'));
@@ -580,7 +615,7 @@ test('a managed copy on an unrelated route cannot replace the importing tool ori
     assert.equal((await listBackups(f.paths)).length, 0); assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 0);
     // Distinct names keep the lock entries independent while testing route coverage for the same skill.
     await sync.applyPlan(f.plan([f.item(f.build('managed-codex'))], [f.instruction(session)]));
-    assert.equal((await listBackups(f.paths)).length, 1); await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+    assert.equal((await listBackups(f.paths)).length, 1); assert.equal(await readlink(f.original('example')), '../../.agents/skills/managed-codex');
   } finally {await f.close();}
 });
 
@@ -717,7 +752,160 @@ test('a session-local refusal is recorded as failed and does not prevent a later
   } finally {await f.close();}
 });
 
-for (const outer of [false, true]) test(`engine restart resumes ${outer ? 'outer alias' : 'canonical original'} backup after the original moved`, async () => {
+for (const phase of ['prepared', 'original_moved', 'one_alias_moved', 'all_moved'] as const)
+  test(`upgrade resumes a helper 0.1.3 replacement at ${phase} and its backup restores every home`, async () => {
+    const f = await fixture();
+    try {
+      await f.skill('example');
+      const original = f.original('example'), links = ['.codex-work', '.codex-client'].map(home => ({home, folderName: 'example', target: original}));
+      for (const link of links) await symlink(link.target, f.original(link.folderName, link.home));
+      const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+      const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())]));
+      const instruction = f.instruction(session), file = join(f.paths.data, 'imports.json');
+      let backupId = '';
+      // The legacy API path writes the exact 0.1.3 manifest shape, without a
+      // managedTarget, then moves the original and alias inodes into backup.
+      await assert.rejects(backupUnmanaged(f.paths, original, {home: '.codex', folderName: 'example'}, links, f.timing.now(), async manifest => {
+        backupId = manifest.id;
+        assert.deepEqual(manifest.unmanaged, {original: {home: '.codex', folderName: 'example'}, links});
+        const journal = JSON.parse(await readFile(file, 'utf8'));
+        Object.assign(journal.sessions[0].folders[0], {backupId, instruction, authorized: true});
+        await atomicWrite(file, JSON.stringify(journal));
+        if (phase !== 'prepared') await durableRename(original, join(f.paths.backups, backupId, 'local-import/example'));
+        if (phase === 'one_alias_moved' || phase === 'all_moved')
+          await rename(f.original('example', links[0].home), join(f.paths.backups, backupId, 'links/0'));
+        if (phase === 'all_moved') await rename(f.original('example', links[1].home), join(f.paths.backups, backupId, 'links/1'));
+        throw Object.assign(new Error('Interrupted helper 0.1.3 replacement'), {code: 'EIO'});
+      }), {code: 'EIO'});
+      await f.engine().applyInstructions([]);
+      for (const home of ['.codex', ...links.map(link => link.home)]) await assert.rejects(lstat(f.original('example', home)), {code: 'ENOENT'});
+      const backups = await listBackups(f.paths);
+      assert.equal(backups.length, 1); assert.equal(backups[0].id, backupId);
+      assert.equal(backups[0].unmanaged!.managedTarget, undefined);
+      assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 1);
+      assert.equal(JSON.parse(await readFile(file, 'utf8')).sessions.length, 0, 'recovery reports and closes the legacy transaction');
+      await restoreBackup(f.paths, backupId);
+      for (const home of ['.codex', ...links.map(link => link.home)])
+        assert.equal(await readFile(join(f.original('example', home), 'SKILL.md'), 'utf8'), 'Original local content\n');
+      for (const link of links) assert.equal(await readlink(f.original('example', link.home)), link.target);
+    } finally {await f.close();}
+  });
+
+test('a zero-alias replacement keeps a home linked after backup preparation live through replacement and Update', async () => {
+  const f = await fixture();
+  try {
+    await f.skill('example');
+    const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+    const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())]));
+    const alias = f.original('example', '.codex-work'), target = f.original('example');
+    await f.engine({crash: async () => {
+      // Add a linked home after the final alias scan and manifest write.
+      await symlink(target, alias);
+    }}).applyInstructions([f.instruction(session)]);
+    const [backup] = await listBackups(f.paths);
+    assert.deepEqual(backup.unmanaged!.links, []);
+    assert.equal(backup.unmanaged!.managedTarget, '.agents/skills/example');
+    const inode = (await lstat(alias)).ino;
+    assert.equal(await readlink(alias), target);
+    assert.equal(await readlink(target), '../../.agents/skills/example');
+    assert.equal(await readFile(join(alias, 'SKILL.md'), 'utf8'), 'Managed delivery\n');
+    await sync.applyPlan(f.plan([{...f.item(f.build('example', false, 2)), kind: 'update', fromVersion: 1}]));
+    assert.equal((await lstat(alias)).ino, inode);
+    assert.equal(await readFile(join(alias, 'SKILL.md'), 'utf8'), 'Managed delivery v2\n');
+    await restoreBackup(f.paths, backup.id);
+    assert.equal(await readFile(join(alias, 'SKILL.md'), 'utf8'), 'Original local content\n');
+  } finally {await f.close();}
+});
+
+for (const phase of ['prepared', 'original_moved'] as const)
+  test(`zero-alias replacement recovery at ${phase} keeps a home added after interruption live`, async () => {
+    const f = await fixture();
+    try {
+      await f.skill('example');
+      const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+      const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())]));
+      const journalPath = join(f.paths.data, 'imports.json'), original = f.original('example');
+      await assert.rejects(f.engine({crash: async () => {
+        if (phase === 'original_moved') {
+          const journal = JSON.parse(await readFile(journalPath, 'utf8')), id = journal.sessions[0].folders[0].backupId;
+          await durableRename(original, join(f.paths.backups, id, 'local-import/example'));
+        }
+        throw Object.assign(new Error('Interrupted zero-alias replacement'), {code: 'EIO'});
+      }}).applyInstructions([f.instruction(session)]), {code: 'EIO'});
+      const pending = JSON.parse(await readFile(journalPath, 'utf8')).sessions[0].folders[0];
+      const manifest = JSON.parse(await readFile(join(f.paths.backups, pending.backupId, 'manifest.json'), 'utf8'));
+      assert.deepEqual(manifest.unmanaged.links, []);
+      assert.equal(manifest.unmanaged.managedTarget, '.agents/skills/example');
+      const alias = f.original('example', '.codex-client');
+      await symlink(original, alias);
+      const inode = (await lstat(alias)).ino;
+      await f.engine().applyInstructions([]);
+      assert.equal(await readlink(original), '../../.agents/skills/example');
+      assert.equal(await readlink(alias), original);
+      assert.equal((await lstat(alias)).ino, inode);
+      assert.equal(await readFile(join(alias, 'SKILL.md'), 'utf8'), 'Managed delivery\n');
+      const backups = await listBackups(f.paths);
+      assert.equal(backups.length, 1); assert.equal(backups[0].id, pending.backupId);
+      assert.equal(JSON.parse(await readFile(journalPath, 'utf8')).sessions.length, 0);
+      assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 1);
+      await restoreBackup(f.paths, pending.backupId);
+      assert.equal(await readFile(join(alias, 'SKILL.md'), 'utf8'), 'Original local content\n');
+    } finally {await f.close();}
+  });
+
+for (const linked of [false, true]) test(`new ${linked ? 'linked' : 'zero-alias'} transactions still enforce the delivered managed target during recovery`, async () => {
+  const f = await fixture();
+  try {
+    await f.skill('example');
+    if (linked) await symlink(f.original('example'), f.original('example', '.codex-work'));
+    const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+    const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())]));
+    await assert.rejects(f.engine({crash: () => {throw Object.assign(new Error('Stop after prepare'), {code: 'EIO'});}})
+      .applyInstructions([f.instruction(session)]), {code: 'EIO'});
+    const journalPath = join(f.paths.data, 'imports.json'), journal = JSON.parse(await readFile(journalPath, 'utf8'));
+    const id = journal.sessions[0].folders[0].backupId, manifestPath = join(f.paths.backups, id, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    assert.equal(manifest.unmanaged.managedTarget, '.agents/skills/example');
+    manifest.unmanaged.managedTarget = '.agents/skills/other';
+    await atomicWrite(manifestPath, JSON.stringify(manifest));
+    await f.engine().applyInstructions([]);
+    assert.equal(JSON.parse(await readFile(journalPath, 'utf8')).sessions[0].folders[0].failed, 'BACKUP_INVALID');
+    assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
+    if (linked) assert.equal(await readlink(f.original('example', '.codex-work')), f.original('example'));
+    assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 0);
+  } finally {await f.close();}
+});
+
+test('upgrade resumes legacy outer-only alias moves and restores them without moving the external original', async () => {
+  const f = await fixture();
+  try {
+    const original = join(f.home, 'my-skills/example');
+    await mkdir(original, {recursive: true}); await writeFile(join(original, 'SKILL.md'), 'External original\n');
+    const links = ['.codex', '.codex-work', '.codex-client'].map(home => ({home, folderName: 'example', target: original}));
+    for (const link of links) await symlink(original, f.original('example', link.home));
+    const session = f.session(['example']); f.setSessions([session]); await f.engine().poll();
+    const sync = f.sync(); await sync.reconcile(); await sync.applyPlan(f.plan([f.item(f.build())]));
+    const file = join(f.paths.data, 'imports.json'); let backupId = '';
+    await assert.rejects(backupUnmanaged(f.paths, original, {home: '.codex', folderName: 'example'}, links, f.timing.now(), async manifest => {
+      backupId = manifest.id;
+      assert.equal(manifest.unmanaged!.managedTarget, undefined); assert.equal(manifest.unmanaged!.keepOriginal, true);
+      const journal = JSON.parse(await readFile(file, 'utf8'));
+      Object.assign(journal.sessions[0].folders[0], {backupId, instruction: f.instruction(session), authorized: true});
+      await atomicWrite(file, JSON.stringify(journal));
+      await rename(f.original('example'), join(f.paths.backups, backupId, 'links/0'));
+      throw Object.assign(new Error('Interrupted legacy alias move'), {code: 'EIO'});
+    }), {code: 'EIO'});
+    await f.engine().applyInstructions([]);
+    assert.equal(await readFile(join(original, 'SKILL.md'), 'utf8'), 'External original\n');
+    assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 1);
+    for (const link of links) await assert.rejects(lstat(f.original('example', link.home)), {code: 'ENOENT'});
+    await restoreBackup(f.paths, backupId);
+    for (const link of links) assert.equal(await readFile(join(f.original('example', link.home), 'SKILL.md'), 'utf8'), 'External original\n');
+  } finally {await f.close();}
+});
+
+for (const outer of [false, true]) for (const failure of ['EIO', 'ENOSPC', 'EDQUOT'])
+test(`engine restart resumes ${outer ? 'outer alias' : 'canonical original'} backup after the original moved (${failure})`, async () => {
   const f = await fixture();
   try {
     const canonicalHome = outer ? '.codex-work' : '.codex';
@@ -731,13 +919,16 @@ for (const outer of [false, true]) test(`engine restart resumes ${outer ? 'outer
       const journal = JSON.parse(await readFile(join(f.paths.data, 'imports.json'), 'utf8')), id = journal.sessions[0].folders[0].backupId;
       // Simulate the durable original move followed by interruption before alias moves and the lock commit.
       await durableRename(f.original('example', canonicalHome), join(f.paths.backups, id, 'local-import/example'));
-      throw Object.assign(new Error('Injected I/O interruption'), {code: 'EIO'});
+      throw Object.assign(new Error('Injected filesystem interruption'), {code: failure});
     }});
-    await assert.rejects(crashing.applyInstructions([instruction]), {code: 'EIO'});
+    await assert.rejects(crashing.applyInstructions([instruction]), {code: failure});
     const before = JSON.parse(await readFile(join(f.paths.data, 'imports.json'), 'utf8')).sessions[0].folders[0];
-    assert.ok(before.backupId); assert.equal(before.complete, undefined);
+    assert.ok(before.backupId); assert.equal(before.complete, undefined); assert.equal(before.failed, undefined);
     await f.engine().applyInstructions([]);
-    for (const home of ['.codex', '.codex-work', '.codex-client']) await assert.rejects(lstat(f.original('example', home)), {code: 'ENOENT'});
+    for (const home of ['.codex', '.codex-work', '.codex-client']) {
+      assert.equal(await readlink(f.original('example', home)), '../../.agents/skills/example');
+      assert.equal(await readFile(join(f.original('example', home), 'SKILL.md'), 'utf8'), 'Managed delivery\n');
+    }
     assert.equal((await listBackups(f.paths)).length, 1);
     assert.equal(JSON.parse(await readFile(join(f.paths.data, 'lock.json'), 'utf8')).replaced.length, 1);
     assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 1);
@@ -864,7 +1055,7 @@ for (const code of ['IMPORT_JOURNAL_INVALID', 'IMPORT_JOURNAL_FULL', 'FILE_UNSAF
     assert.equal(JSON.parse(await readFile(join(f.paths.data, 'sync-meta.json'), 'utf8')).planRevision, next.planRevision);
     const backups = await listBackups(f.paths); assert.equal(backups.length, 1);
     assert.equal(await readFile(join(f.paths.backups, backups[0].id, 'local-import/example/SKILL.md'), 'utf8'), 'Original local content\n');
-    await assert.rejects(lstat(f.original('example')), {code: 'ENOENT'});
+    assert.equal(await readlink(f.original('example')), '../../.agents/skills/example');
     f.advance(60_000); await sync.tick(); // The accepted revision now gets a 304, with no duplicate move or receipt.
     assert.equal((sync as any).failures, 0); assert.equal((await listBackups(f.paths)).length, 1);
     assert.deepEqual(f.calls.filter(call => call.body?.status === 'replaced').map(call => call.body.backupId), [backups[0].id]);
@@ -912,7 +1103,7 @@ for (const code of ['IMPORT_JOURNAL_INVALID', 'IMPORT_JOURNAL_FULL', 'FILE_UNSAF
   } finally {await f.close();}
 });
 
-test('permission interruption after an original move stays local and keeps a journaled backup retryable', async t => {
+test('permission interruption before repoint keeps every home readable and the journaled backup retryable', async t => {
   if (process.getuid?.() === 0) {t.skip('Root bypasses alias directory permissions'); return;}
   const f = await fixture(), aliasRoot = join(f.home, '.codex-work/skills');
   try {
@@ -922,6 +1113,8 @@ test('permission interruption after an original move stays local and keeps a jou
     await chmod(aliasRoot, 0o555); await assert.rejects(f.engine().applyInstructions([f.instruction(session)]), {code: 'EACCES'});
     const journal = JSON.parse(await readFile(join(f.paths.data, 'imports.json'), 'utf8')), folder = journal.sessions[0].folders[0];
     assert.ok(folder.backupId); assert.equal(folder.failed, undefined); assert.equal(folder.complete, undefined);
+    assert.equal(await readFile(join(f.original('example'), 'SKILL.md'), 'utf8'), 'Original local content\n');
+    assert.equal(await readFile(join(f.original('example', '.codex-work'), 'SKILL.md'), 'utf8'), 'Original local content\n');
     const log = t.mock.method(console, 'error', () => {});
     const retryPlan = f.plan(); await sync.applyPlan(retryPlan);
     assert.deepEqual((await sync.inventory()).deliveryErrors, []);
@@ -930,7 +1123,9 @@ test('permission interruption after an original move stays local and keeps a jou
     f.conditional(); f.advance(60_000); await sync.tick(); assert.equal((sync as any).failures, 0);
     assert.ok(f.calls.filter(call => call.path === '/api/helper/inventory').every(call => call.body.deliveryErrors.length === 0));
     await chmod(aliasRoot, 0o755); await f.engine().applyInstructions([]);
-    assert.equal((await listBackups(f.paths)).length, 1); await assert.rejects(lstat(f.original('example', '.codex-work')), {code: 'ENOENT'});
+    assert.equal((await listBackups(f.paths)).length, 1);
+    assert.equal(await readlink(f.original('example', '.codex-work')), '../../.agents/skills/example');
+    assert.equal(await readFile(join(f.original('example', '.codex-work'), 'SKILL.md'), 'utf8'), 'Managed delivery\n');
     assert.equal(f.calls.filter(call => call.body?.status === 'replaced').length, 1);
   } finally {await chmod(aliasRoot, 0o755); await f.close();}
 });

@@ -6,8 +6,8 @@ import { dirname, join, resolve } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-export const modules = ['api', 'backups', 'build-keys', 'cli', 'config', 'detect', 'imports', 'lock', 'npm', 'pairing', 'paths', 'release-identity', 'runtime', 'safe-fs', 'scan', 'secret-store', 'service', 'stamp', 'state', 'sync', 'token', 'unmanaged', 'updater', 'verify', 'duplicates', 'holding', 'allow', 'notify', 'code-reasons', 'local-edits', 'proposals', 'unmanaged-replacement'];
-const shared = ['build-format', 'error-codes', 'helper-protocol', 'skill-errors', 'skill-limits', 'skill-types', 'tool-matrix', 'helper-imports-protocol', 'skill-code', 'plan-item-id', 'runner-protocol', 'helper-http-diagnostics', 'sync-protocol'];
+export const modules = ['api', 'backups', 'build-keys', 'cli', 'config', 'detect', 'imports', 'linked-homes', 'lock', 'npm', 'pairing', 'paths', 'provider-keys', 'release-identity', 'runtime', 'safe-fs', 'scan', 'secret-store', 'service', 'stamp', 'state', 'sync', 'token', 'unmanaged', 'updater', 'verify', 'duplicates', 'holding', 'allow', 'notify', 'code-reasons', 'local-edits', 'proposals', 'unmanaged-replacement'];
+const shared = ['build-format', 'error-codes', 'helper-protocol', 'skill-errors', 'skill-limits', 'skill-types', 'tool-matrix', 'helper-imports-protocol', 'skill-code', 'skill-folder-names', 'plan-item-id', 'runner-protocol', 'helper-http-diagnostics', 'sync-protocol'];
 const runner = ['adapter', 'adapters/index', 'adapters/codex', 'adapters/claude-code', 'card-prompt', 'device-key', 'maddots-api', 'process', 'protocol-client', 'run-folder', 'runner', 'state', 'token-check', 'post', 'runs-on', 'test-run', 'agents-local', 'stage-skills', 'cli-runs'];
 export function allowedRuntimePath(path) {
   if (['package.json', 'npm-shrinkwrap.json', 'LICENSE', 'dist/shared/tool-matrix.json', 'dist/shared/runner-contract.json'].includes(path)) return true;
@@ -22,6 +22,7 @@ export function checkManifest(pkg) {
   assert.equal(pkg.name, 'maddots-ai');
   assert.equal(pkg.private, true, 'npm publication must remain disabled.');
   assert.equal(pkg.license, 'MIT');
+  assert.ok(!Object.hasOwn(pkg.dependencies || {}, 'yaml'), 'YAML is only used by source-only adapters.');
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
   assert.deepEqual(pkg.bin, { 'maddots-ai': 'dist/cli.js' });
   assert.match(pkg.repository?.url || '', /^git\+https:\/\/github\.com\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\.git$/);
@@ -63,7 +64,8 @@ async function main() {
         for (const match of code.matchAll(/\bfrom\s+(['"])([^'"\n]+)\1|(?:^|\n)\s*import\s+(['"])([^'"\n]+)\3/g)) {
           const imported = match[2] || match[4];
           const local = imported.startsWith('.') && resolve('/', dirname(path), imported).slice(1);
-          assert.ok(imported.startsWith('node:') || Object.hasOwn(pkg.dependencies || {}, imported) || (local && allowedRuntimePath(local) && compiled.includes(local)), 'Unreviewed compiled helper import: ' + path);
+          const dependency = Object.hasOwn(pkg.dependencies || {}, imported) && imported !== 'yaml';
+          assert.ok(imported.startsWith('node:') || dependency || (local && allowedRuntimePath(local) && compiled.includes(local)), 'Unreviewed compiled helper import: ' + path);
         }
       }
     }

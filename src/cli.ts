@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { hostname } from 'node:os';
 import { realpathSync } from 'node:fs';
+import { readdir } from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
@@ -12,6 +13,7 @@ import { describeUnmanaged, ImportEngine } from './imports.js';
 import { grokDuplicateWarning } from './duplicates.js';
 import { TOOL_MATRIX } from './shared/tool-matrix.js';
 import { LockStore } from './lock.js';
+import { discoverManagedLinks, linkedHomeRefs, linkedHomesWarning } from './linked-homes.js';
 import { ClaudePluginDeliveryTarget, ClaudePluginSyncEngine } from './delivery/claude-plugin.js';
 import { AgentsFolderDeliveryTarget } from './delivery/agents-folder.js';
 import { PairingFlow, helperOs } from './pairing.js';
@@ -19,6 +21,7 @@ import { createPaths, ensurePaths, withWriteLock } from './paths.js';
 import { RELEASE_IDENTITY, VERSION } from './release-identity.js';
 import { bundledRuntime, launchCli, type RuntimeContext } from './runtime.js';
 import { FILE_STORAGE_WARNING, FileSecretStore, KeychainSecretStore, type SecretStore } from './secret-store.js';
+import { KeychainProviderKeyStore, readProviderKey } from './provider-keys.js';
 import { installService, removeService, runService } from './service.js';
 import { StateStore } from './state.js';
 import { TokenManager } from './token.js';
@@ -32,12 +35,14 @@ import type { HelperState } from './state.js';
 import { runnerBusy, stopRunners, tickRunners } from './runner/runner.js';
 import { cleanupRunHomes } from './runner/process.js';
 import { RunsRuntime } from './runner/cli-runs.js';
+import { RunnerState } from './runner/state.js';
+import { recoverTestRuns } from './runner/test-run.js';
 
 export type CliOptions = {
   env?: NodeJS.ProcessEnv; home?: string; runner?: Runner; request?: typeof fetch; timing?: Timing;
   output?: (line: string) => void; confirm?: (warning: string) => Promise<string>; signal?: AbortSignal;
   runtime?: RuntimeContext;
-  isTTY?: boolean; deliveryTargets?: readonly DeliveryTarget[]; verifier?: BuildVerifier; watchRoute?: SyncOptions['watchRoute'];
+  isTTY?: boolean; readKey?: () => Promise<string>; deliveryTargets?: readonly DeliveryTarget[]; verifier?: BuildVerifier; watchRoute?: SyncOptions['watchRoute'];
   updates?: {
     check?: (options: UpdateOptions) => Promise<UpdateResult>;
     rollback?: (options: UpdateOptions) => Promise<UpdateResult>;
@@ -49,10 +54,17 @@ async function prompt(_warning: string): Promise<string> {
   const input = createInterface({ input: process.stdin, output: process.stdout });
   try { return await input.question('> '); } finally { input.close(); }
 }
-function argumentsFor(argv: string[]): { command: string; tokenFile?: string; restoreId?: string; rollback: boolean; all?: boolean } {
+function argumentsFor(argv: string[]): { command: string; tokenFile?: string; restoreId?: string; rollback: boolean; all?: boolean; keyAction?: 'set' | 'status' | 'delete' } {
   const commands = ['connect', 'status', 'allow', 'backups', 'import', 'uninstall', 'update', 'service'];
   const command = argv[0] ?? 'help';
   if (command === 'runs' || command === 'agent') return {command, rollback: false};
+  if (command === 'keys') {
+    const keyAction = argv[1];
+    if (keyAction === 'status' && argv.length === 2 || (keyAction === 'set' || keyAction === 'delete') && argv[2] === 'deepseek' && argv.length === 3) {
+      return {command, keyAction, rollback: false};
+    }
+    throw new HelperError('USAGE', 'Use maddots-ai keys set deepseek, keys status, or keys delete deepseek. Key values are accepted only at the hidden terminal prompt.');
+  }
   if (['help', '--help', '-h', '--version', '--self-test'].includes(command)) {
     if (argv.length > 1) throw new HelperError('USAGE', 'Unexpected command arguments.');
     return { command, rollback: false };
@@ -87,10 +99,11 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
   // Candidate validation must never read credentials or pair with the server.
   if (args.command === '--self-test') return;
   if (['help', '--help', '-h'].includes(args.command)) {
-    output('maddots-ai connect | status | allow [--all] | runs [test <tool> [--model <model>]] | agent setup [handle|agent-id] | agent access <handle|agent-id> folder-only|full | backups [restore <id>] | import | uninstall | update [--rollback] | service | --version'); return;
+    output('maddots-ai connect | status | allow [--all] | runs [test <tool> [--model <model>]] | agent setup [handle|agent-id] | agent access <handle|agent-id> folder-only|full | keys set deepseek | keys status | keys delete deepseek | backups [restore <id>] | import | uninstall | update [--rollback] | service | --version'); return;
   }
   if (args.command === 'runs' || args.command === 'agent') requireRunsPlatform();
   const isTTY = options.isTTY ?? !!(process.stdin.isTTY && process.stdout.isTTY);
+  if (args.command === 'keys' && args.keyAction === 'set' && !isTTY) throw new HelperError('PROVIDER_KEY_TTY_REQUIRED', 'Setting a provider key requires an interactive terminal on this computer.');
   if (args.command === 'allow' && !isTTY) throw new HelperError('ALLOW_TTY_REQUIRED', 'Allow requires an interactive terminal on this computer.');
   if (args.command === 'update' && !RELEASE_IDENTITY && !options.updates) {
     throw new HelperError('RELEASE_UNCONFIGURED', 'The source helper has no pinned release channel. Export it with the approved release identity first.');
@@ -107,10 +120,25 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
         output(`Restored ${backup.originalPath}. Any current local copy was preserved in a new backup.`);
       } else {
         const backups = await listBackups(paths);
-        for (const backup of backups) output(`${backup.id}  ${backup.originalPath}  ${backup.reason}`);
+        for (const backup of backups) output(`${backup.id}  ${backup.originalPath}  ${backup.reason}${backup.attention ? `  needs attention (${backup.attention})` : ''}`);
         if (!backups.length) output('No backups.');
       }
     }, timing);
+    return;
+  }
+  if (args.command === 'keys') {
+    const saved = await new StateStore(paths, config.endpoint).read();
+    if (args.keyAction === 'set' && saved.tokenStorage === 'file') throw new HelperError('FILE_RUNS_REFUSED', 'Agent runs need the Keychain.');
+    const keys = new KeychainProviderKeyStore(options.runner ?? runCommand, config.env);
+    if (args.keyAction === 'status') output(`deepseek: ${await keys.get('deepseek') === undefined ? 'not set' : 'set'}`);
+    else if (args.keyAction === 'delete') {
+      await withWriteLock(paths, () => keys.delete('deepseek'), timing);
+      output('deepseek: not set');
+    } else {
+      const key = await (options.readKey ?? readProviderKey)();
+      await withWriteLock(paths, () => keys.set('deepseek', key), timing);
+      output('deepseek: set');
+    }
     return;
   }
   const runtime = options.runtime ?? await bundledRuntime();
@@ -177,7 +205,7 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
     }
     await withWriteLock(paths, async () => {
       for (const line of await describeUnmanaged(paths, saved.helperId!)) output(line);
-      const receipts = await new ImportEngine({paths, helperId: saved.helperId!, client: tokens, timing}).uploadPending();
+      const receipts = await new ImportEngine({paths, helperId: saved.helperId!, client: tokens, timing, output}).uploadPending();
       for (const receipt of receipts) output(`Import ${receipt.sessionId}: ${receipt.state}.`);
       if (!receipts.length) output('Choose From my AI tool on ai.maddots.app and tick the folders to import.');
     }, timing);
@@ -197,7 +225,7 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
       return definition?.kind === 'folder' ? [new FolderDeliveryTarget(paths, route, join(paths.home, definition.path.slice(2)))] : [];
     });
     const syncOptions = {paths, helperId: state.helperId, client: tokens, targets, verifier: options.verifier,
-      timing, computerName: syncComputerName, tools: state.tools, tokenStorage: state.tokenStorage, watchRoute: options.watchRoute};
+      timing, computerName: syncComputerName, tools: state.tools, tokenStorage: state.tokenStorage, watchRoute: options.watchRoute, output};
     const plugin = targets.find((target): target is ClaudePluginDeliveryTarget => target instanceof ClaudePluginDeliveryTarget);
     return plugin ? new ClaudePluginSyncEngine(syncOptions, plugin) : new SyncEngine(syncOptions);
   };
@@ -257,6 +285,12 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
         try {
           const lock = await new LockStore(paths, status.state.helperId).read();
           lockRoutes = lock.entries.filter(entry => !entry.removed).map(entry => entry.route);
+          const links = await discoverManagedLinks({paths, managed: lock.entries.filter(entry => !entry.removed),
+            verifier: options.verifier ?? new BuildVerifier(), helperIds: [lock.helperId, ...lock.previousHelperIds ?? []]});
+          for (const entry of lock.entries.filter(entry => !entry.removed)) {
+            const warning = linkedHomesWarning(entry.name, linkedHomeRefs(links, entry));
+            if (warning) output(warning);
+          }
         } catch (error) {
           // Status is diagnostic and read-only: report the unreadable lock, never fail on the advisory lookup.
           output(`The skill lock in ${paths.data} could not be read${error instanceof HelperError ? `: ${error.message}` : '.'}`);
@@ -275,14 +309,29 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
     }, timing);
   } else if (args.command === 'uninstall') {
     await stopRunners();
-    const homesCleaned = await cleanupRunHomes(paths.data).then(() => true, () => false);
     await withWriteLock(paths, async () => {
       await removeService(paths, { runner, env: config.env });
+      let homesCleaned = false;
+      try {
+        // The service runs in another process. Its saved authority must be
+        // recovered by the runner before uninstall can discard any run home.
+        const active = await new RunnerState(paths.data).active();
+        const unverified = active.some(row => row.phase !== 'posting' || row.pid > 0 || row.fence || row.pgid || row.processGroups?.length);
+        const testsRecovered = await recoverTestRuns({data: paths.data, skipBusy: true});
+        if (!unverified && testsRecovered) {
+          // A new diagnostic can acquire its own lease after recovery returns.
+          // Only that lease's owner may remove a test home, never this sweep.
+          await cleanupRunHomes(paths.data, {skipTests: true});
+          homesCleaned = await readdir(join(paths.data, 'run-homes')).then(names => names.length === 0,
+            (error: NodeJS.ErrnoException) => {if (error.code === 'ENOENT') return true; throw error;});
+        }
+      } catch { /* Preserve homes whenever process evidence cannot be verified. */ }
       try { await tokens.revoke(); }
       catch { output('The server could not confirm token revocation. Revoke this computer on ai.maddots.app.'); }
       // Local credentials are removed even when the service cannot be reached.
       await tokens.clearCredentials();
-      if (!homesCleaned) output(`Some run homes were kept for safety in ${join(paths.data, 'run-homes')}.`);
+      await new KeychainProviderKeyStore(runner, config.env).delete('deepseek');
+      if (!homesCleaned) output(`Some run homes were kept for safety in ${join(paths.data, 'run-homes')}. Process cleanup could not be verified, or a diagnostic is still active.`);
       await stateStore.write({ format: 1, endpoint: config.endpoint.href, status: 'unpaired', scopes: [], tools: [], pendingTools: [], tokenStorage: 'keychain' });
       output(`Skills remain in their tool folders. The lock file and backups remain in ${paths.data}.`);
       output('Run npm uninstall -g maddots-ai to remove the helper package.');
@@ -314,7 +363,7 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
           const refreshed = await tokens.refreshStatus(data => {grants = data.runGrants ?? [];});
           if (refreshed.status === 'connected' && tools) await tokens.proposeTools(tools);
           if (refreshed.status === 'connected' && refreshed.helperId && refreshed.scopes.includes('import_upload')) {
-            await new ImportEngine({paths, helperId: refreshed.helperId, client: tokens, timing}).uploadPending();
+            await new ImportEngine({paths, helperId: refreshed.helperId, client: tokens, timing, output}).uploadPending();
           }
         } catch (error) {
           if (!(error instanceof HelperError)) throw error;

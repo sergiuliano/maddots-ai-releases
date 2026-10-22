@@ -139,6 +139,9 @@ test('verified adapter rejects prohibited subcommands after global options and w
         const run = f.matrix.tools.find(item => item.key === 'codex')!.run!;
         const target = f.matrix.tools.find(item => item.run?.adapter === tool)!;
         target.run = { ...run, adapter: tool };
+        // This synthetic accepted CLI must reach the command guard, including
+        // when the production tool remains sync-only pending acceptance.
+        target.variants = target.variants.map(variant => variant.key === 'cli' ? {...variant, syncOnly: false} : variant);
         f.spec.bin = join(f.root, `${canonical}${version}`);
         await writeFile(f.spec.bin, '#!/bin/sh\nprintf "launched\\n"\n', { mode: 0o700 });
         const original = f.adapter.build;
@@ -232,7 +235,7 @@ test('large arg prompts are replaced with the prompt-file instruction', async ()
   } finally { await f.cleanup(); }
 });
 
-test('unsupported run-home and secret-env behavior fails closed until TLS-50', async () => {
+test('run-home and secret-env behavior stays unavailable to other tools', async () => {
   const f = await fixture();
   try {
     f.adapter.info.runHome = true;
@@ -544,7 +547,9 @@ test('tool-specific forbidden flags are enforced exactly and only for their tool
         await assert.rejects(launch(f), {code: 'adapter_refused'});
       }
       f.adapter.build = spec => ({...original(spec), argv: [spec.bin, fake, 'echo', `quoted ${flags[0]} is material`]});
-      assert.equal((await (await launch(f)).finished).ok, true);
+      // dsh accepts only its closed launcher vector; all prompt material uses stdin.
+      if (tool === 'continue') assert.equal((await (await launch(f)).finished).ok, true);
+      else await assert.rejects(launch(f), {code: 'adapter_refused'});
     } finally { await f.cleanup(); }
   }
   const f = await fixture();

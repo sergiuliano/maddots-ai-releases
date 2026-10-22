@@ -18,7 +18,8 @@ async function fixture() {
   await writeFile(join(directory, 'LICENSE'), 'Synthetic MIT fixture');
   await writeFile(join(directory, '.env'), 'SYNTHETIC_SECRET=fixture-only');
   await writeFile(join(directory, 'private-source.ts'), 'export {};');
-  for (const name of ['api', 'backups', 'build-keys', 'config', 'detect', 'imports', 'lock', 'npm', 'pairing', 'paths', 'release-identity', 'runtime', 'safe-fs', 'scan', 'secret-store', 'service', 'stamp', 'state', 'sync', 'token', 'unmanaged', 'updater', 'verify', 'duplicates', 'holding', 'allow', 'notify', 'code-reasons', 'local-edits', 'proposals', 'unmanaged-replacement']) await writeFile(join(directory, 'dist', name + '.js'), 'export {};\n');
+  for (const name of ['api', 'backups', 'build-keys', 'config', 'detect', 'imports', 'linked-homes', 'lock', 'npm', 'pairing', 'paths', 'provider-keys', 'release-identity', 'runtime', 'safe-fs', 'scan', 'secret-store', 'service', 'stamp', 'state', 'sync', 'token', 'unmanaged', 'updater', 'verify', 'duplicates', 'holding', 'allow', 'notify', 'code-reasons', 'local-edits', 'proposals', 'unmanaged-replacement']) await writeFile(join(directory, 'dist', name + '.js'), 'export {};\n');
+  await writeFile(join(directory, 'dist/shared/skill-folder-names.js'), 'export {};\n');
   for (const extension of ['js', 'd.ts']) await writeFile(join(directory, 'dist/delivery/index.' + extension), 'export {};\n');
   for (const extension of ['js', 'd.ts']) await writeFile(join(directory, 'dist/shared/skill-checks/secret-rules.' + extension), 'export {};\n');
   await writeFile(join(directory, 'dist/shared/tool-matrix.json'), '{}');
@@ -65,6 +66,8 @@ test('release preparation packs only runtime bytes reproducibly and exercises th
     assert.ok(entries.includes('package/dist/cli.js'));
     assert.ok(entries.includes('package/dist/scan.js'));
     assert.ok(entries.includes('package/dist/unmanaged-replacement.js'));
+    assert.ok(entries.includes('package/dist/linked-homes.js'));
+    assert.ok(entries.includes('package/dist/shared/skill-folder-names.js'));
     assert.ok(entries.includes('package/dist/shared/skill-checks/secret-rules.js'));
     assert.ok(entries.includes('package/dist/shared/skill-checks/secret-rules.d.ts'));
     assert.ok(!entries.some(path => /private-source|\.env|node_modules|scripts|package-lock/.test(path)));

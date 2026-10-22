@@ -189,7 +189,13 @@ export function validateToolMatrix(value: unknown): ToolMatrix {
       } else if (models.pattern !== null) invalid(`${path}.models.pattern`);
     });
     if (!variantKeys.size) invalid(`${path}.variants`);
-    if (tool.run !== null && !(tool.variants as ToolVariant[]).some((variant) => variant.key === 'cli' && !variant.syncOnly)) invalid(`${path}.run`);
+    if (tool.run !== null) {
+      const run = tool.run as ToolRun;
+      const cli = (tool.variants as ToolVariant[]).find((variant) => variant.key === 'cli' && variant.detect.binaries.length > 0);
+      // Keep the refusal reason visible for a CLI reviewed as skills sync only.
+      // Such an entry can never advertise runs, even if offered is edited alone.
+      if (!cli || (cli.syncOnly && (run.offered || run.folderOnly !== 'none' || !run.reason?.trim()))) invalid(`${path}.run`);
+    }
   });
   if (!toolKeys.size) invalid('tools');
   return value as ToolMatrix;

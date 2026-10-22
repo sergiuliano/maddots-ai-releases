@@ -21,6 +21,8 @@ export interface RunSpec {
   effort: string | null;
   access: Access;
   skillsDir: string;
+  /** Names from the verified staged builds, for tools with explicit skill lists. */
+  skillNames?: readonly string[];
   maxTurns: number;
   timeoutSeconds: number;
   runHome: string | null;
@@ -39,14 +41,16 @@ export interface Invocation {
   secretEnv: Record<string, 'provider-key:deepseek'>;
 }
 
-export interface ParsedResult { ok: boolean; text: string; failureCode: string | null }
+export interface ParsedResult { ok: boolean; text: string; failureCode: string | null; failureDetail?: 'workspace_not_pinned' }
 
 export interface Adapter {
   info: AdapterInfo;
   identity(bin: string): Promise<{ ok: boolean; version: string | null }>;
   supports(input: Pick<RunSpec, 'provider' | 'model' | 'effort' | 'access'>): { ok: boolean; reason: string | null };
+  /** Read-only runtime eligibility checks, before any configuration or tool launch. */
+  preflight?(): Promise<{ ok: boolean; reason: string | null }>;
   build(spec: RunSpec): Invocation;
-  parse(result: { stdout: string; stderr: string; exitCode: number | null; signal: string | null; runDir: string }): ParsedResult;
+  parse(result: { stdout: string; stderr: string; exitCode: number | null; signal: string | null; runDir: string; cwd?: string }): ParsedResult;
   selfCheck?(stdoutSoFar: string): { mcpServers: string[]; browserTools: string[] } | null;
   agentSetup?(bin: string, folder: string): string[];
 }

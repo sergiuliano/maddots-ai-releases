@@ -9,6 +9,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { TOOL_MATRIX, type ToolMatrix } from '../shared/tool-matrix.js';
 import { RELEASE } from '../release-identity.js';
 import { assertNoSymlinks } from '../paths.js';
+import { isValidDeepseekKey, KeychainProviderKeyStore } from '../provider-keys.js';
 import type { Adapter, AdapterFile, ParsedResult, RunSpec } from './adapter.js';
 
 const exec = promisify(execFile);
@@ -18,12 +19,45 @@ const forbidden = new Set(['--bare', '--mcp-config', '--approve-mcps', '--allow-
 const dshForbidden = new Set(['--session-id', '--from-default-profile', '--dump-config', '--dump-default-config', '--dump-config-schema']);
 const PS_ENV = Object.freeze({ TZ: 'UTC0', LC_ALL: 'C' });
 
+/** Accepted key characters may be literal or JSON Unicode escapes, even in mixed form. */
+function outputKeyRedactor(key: string) {
+  const characters = [...key].map(literal => ({literal, escaped: '\\u' + literal.charCodeAt(0).toString(16).padStart(4, '0')}));
+  return (input: string, final: boolean) => {
+    let output = '', cursor = 0, copied = 0, found = false;
+    let raw = input.indexOf(key[0]), escaped = input.indexOf('\\');
+    while (cursor < input.length) {
+      if (raw >= 0 && raw < cursor) raw = input.indexOf(key[0], cursor);
+      if (escaped >= 0 && escaped < cursor) escaped = input.indexOf('\\', cursor);
+      const start = raw < 0 ? escaped : escaped < 0 ? raw : Math.min(raw, escaped);
+      if (start < 0) break;
+      let end = start, matched = 0, mismatch = false;
+      for (const character of characters) {
+        if (end === input.length) break;
+        if (input[end] === character.literal) {end++; matched++; continue;}
+        if (input[end] !== '\\') {mismatch = true; break;}
+        const fragment = input.slice(end, end + 6);
+        // Only hex digits are case insensitive. JSON requires a lowercase u.
+        if (!character.escaped.startsWith(fragment.slice(0, 2) + fragment.slice(2).toLowerCase())) {mismatch = true; break;}
+        if (fragment.length < 6) break;
+        end += 6; matched++;
+      }
+      if (mismatch) {cursor = start + 1; continue;}
+      // A partial match ends at EOF or inside its last Unicode escape.
+      if (matched < characters.length) return {text: output + input.slice(copied, start) + (final ? '[REDACTED]' : ''), pending: final ? '' : input.slice(start), found};
+      output += input.slice(copied, start) + '[REDACTED]';
+      found = true;
+      copied = cursor = end;
+    }
+    return {text: output + input.slice(copied), pending: '', found};
+  };
+}
+
 // These are the global options of the verified adapter, not the executable's
 // physical filename (package managers commonly version that filename).
 const commandRules: Record<string, { forbidden: string; values: Set<string>; flags: Set<string> }> = {
   codex: { forbidden: 'app', values: new Set(['-c', '--config', '-m', '--model', '-p', '--profile', '-s', '--sandbox', '-a', '--ask-for-approval', '-C', '--cd', '--add-dir', '--enable', '--disable', '--local-provider', '-i', '--image']), flags: new Set(['--oss', '--full-auto', '--dangerously-bypass-approvals-and-sandbox', '--ignore-user-config', '--search', '--no-alt-screen', '-h', '--help', '-V', '--version']) },
   cursor: { forbidden: 'agent', values: new Set(['--model', '--output-format', '--workspace', '--sandbox', '--config', '--user-data-dir', '--extensions-dir', '--profile', '--locale', '--log']), flags: new Set(['-p', '--print', '--trust', '--force', '--yolo', '--list-models', '-h', '--help', '-v', '--version', '--verbose', '--wait', '--new-window', '--reuse-window']) },
-  copilot: { forbidden: 'copilot', values: new Set(['-p', '--prompt', '--model', '--output-format', '--add-dir', '--disable-mcp-server', '--available-tools', '--hostname', '--config-dir', '--log-level', '--log-dir']), flags: new Set(['--no-ask-user', '--no-auto-update', '--allow-all-tools', '--disable-builtin-mcps', '-s', '--silent', '-h', '--help', '-v', '--version']) },
+  copilot: { forbidden: 'copilot', values: new Set(['-p', '--prompt', '--model', '--output-format', '--add-dir', '--disable-mcp-server', '--available-tools', '--additional-mcp-config', '--hostname', '--config-dir', '--log-level', '--log-dir']), flags: new Set(['--no-ask-user', '--no-auto-update', '--allow-all-tools', '--allow-all', '--disable-builtin-mcps', '-s', '--silent', '-h', '--help', '-v', '--version']) },
   devin: { forbidden: '.', values: new Set(['--model', '--permission-mode', '--respect-workspace-trust', '--export', '--prompt-file', '--config']), flags: new Set(['-p', '--print', '--sandbox', '-h', '--help', '-v', '--version']) },
 };
 
@@ -83,8 +117,10 @@ export async function enforceAdapter(input: AdapterCheck): Promise<{ ok: boolean
     const recorded = input.recordedRealpath ?? bin;
     if (!isAbsolute(bin) || !isAbsolute(recorded) || basename(bin) === 'agent' || basename(recorded) === 'agent') return fail('adapter_refused');
     if (await realpath(bin) !== recorded || await realpath(recorded) !== recorded) return fail('tool_identity');
-    const run = (input.matrix ?? TOOL_MATRIX).tools.find((tool) => tool.run?.adapter === adapter.info.tool)?.run;
-    if (!run || run.adapter !== adapter.info.tool || (input.allowNotOffered && RELEASE) || (!run.offered && !(!RELEASE && input.allowNotOffered))) return fail('adapter_refused');
+    const definition = (input.matrix ?? TOOL_MATRIX).tools.find((tool) => tool.run?.adapter === adapter.info.tool);
+    const run = definition?.run;
+    if (!run || !definition?.variants.some(variant => variant.key === 'cli' && !variant.syncOnly) ||
+      run.adapter !== adapter.info.tool || (input.allowNotOffered && RELEASE) || (!run.offered && !(!RELEASE && input.allowNotOffered))) return fail('adapter_refused');
     const folderRank = { none: 0, 'no-shell': 1, 'os-sandbox': 2 };
     if (folderRank[run.folderOnly] > folderRank[adapter.info.folderOnly] || (run.mcpLevel === 'servers-off' && adapter.info.mcpLevel !== 'servers-off')) return fail('adapter_refused');
     if (input.access === 'folder_only' && run.folderOnly === 'none') return fail('adapter_refused');
@@ -419,14 +455,14 @@ export async function recoverProcess(pid: number, startedAt: string, inspector: 
 }
 
 /** Call only after crash recovery or service stop has removed every process tree. */
-export async function cleanupRunHomes(dataDir: string): Promise<void> {
+export async function cleanupRunHomes(dataDir: string, options: {skipTests?: boolean} = {}): Promise<void> {
   if (!isAbsolute(dataDir) || resolve(dataDir) !== dataDir || dirname(dataDir) === dataDir) throw new ProcessRefusal('adapter_refused');
   const root = join(dataDir, 'run-homes');
   await assertNoSymlinks(root);
   let entries: string[];
   try {
     if (!(await lstat(root)).isDirectory()) throw new ProcessRefusal('adapter_refused');
-    entries = await readdir(root);
+    entries = (await readdir(root)).filter(name => !(options.skipTests && /^test-[a-f0-9]{32}$/u.test(name)));
   } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
   const validateTree = async (path: string): Promise<void> => {
     if (!inside(root, path)) throw new ProcessRefusal('adapter_refused');
@@ -466,14 +502,60 @@ export interface StartToolOptions {
   /** Host operations are injectable so socket-free unit tests need no process-table permission. */
   processes?: ProcessInspector;
   now?: () => number;
+  /** Private helper data, outside the workspace. The core owns every run home. */
+  dataDir?: string;
+  runId?: string;
+  /** Source-only loopback probes. Never accepted by a release artifact. */
+  qaEnv?: Record<string, string>;
+  /** Source-only fake Keychain for socket-free tests. */
+  readProviderKey?: () => Promise<string | null | undefined>;
+}
+
+export function validateQaEnv(env: Record<string, string> | undefined, release = RELEASE): Record<string, string> {
+  if (env === undefined) return {};
+  if (release) throw new ProcessRefusal('adapter_refused');
+  for (const [name, value] of Object.entries(env)) {
+    if (!['DEEPSEEK_BASE_URL', 'DSH_TELEMETRY_OTLP_URL'].includes(name)) throw new ProcessRefusal('adapter_refused');
+    let url: URL;
+    try { url = new URL(value); } catch { throw new ProcessRefusal('adapter_refused'); }
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port || url.username || url.password || url.search || url.hash) throw new ProcessRefusal('adapter_refused');
+  }
+  return {...env};
+}
+
+async function runHomePath(dataDir: string, runId: string): Promise<string> {
+  if (!isAbsolute(dataDir) || resolve(dataDir) !== dataDir || dirname(dataDir) === dataDir ||
+      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(runId)) throw new ProcessRefusal('adapter_refused');
+  const home = join(dataDir, 'run-homes', runId);
+  await assertNoSymlinks(home);
+  return home;
+}
+
+/** Only call after the named run's complete process tree is verified gone. */
+export async function cleanupRunHome(dataDir: string, runId: string): Promise<void> {
+  const home = await runHomePath(dataDir, runId);
+  try {
+    if (!(await lstat(home)).isDirectory() || await realpath(home) !== home) throw new ProcessRefusal('adapter_refused');
+    // rm does not follow symlinks within a tree; the root and its ancestors are checked above.
+    await rm(home, {recursive: true});
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 }
 
 export async function startTool(options: StartToolOptions): Promise<RunningTool> {
+  validateQaEnv(options.qaEnv);
+  if (RELEASE && options.readProviderKey || options.spec.runHome !== null) throw new ProcessRefusal('adapter_refused');
+  if (!options.adapter.info.runHome) return startPreparedTool(options);
+  throw new ProcessRefusal('adapter_refused');
+}
+
+async function startPreparedTool(options: StartToolOptions): Promise<RunningTool> {
   const { adapter, spec } = options;
   const inspector = options.processes ?? systemInspector;
   const now = options.now ?? Date.now;
   const checked = await enforceAdapter({ ...spec, ...options });
   if (!checked.ok) throw new ProcessRefusal(checked.code!);
+  if (adapter.preflight && !(await adapter.preflight()).ok) throw new ProcessRefusal('adapter_refused');
+  const workspace = await realpath(spec.cwd);
   const deadline = computeRunDeadline(options.claimedAt, options.expiresAt, options.maxRunMinutes);
   if (deadline <= now()) throw new ProcessRefusal('run_time_limit');
   const recorded = options.recordedRealpath ?? spec.bin;
@@ -484,8 +566,18 @@ export async function startTool(options: StartToolOptions): Promise<RunningTool>
   const tokenPattern = /(?:pm_run_|mdai_skill_)[A-Za-z0-9_-]+/u;
   if (invocation.argv.some((arg) => tokenPattern.test(arg)) || [...invocation.files, ...invocation.projectFiles].some((file) => tokenPattern.test(file.path) || tokenPattern.test(file.content))) throw new ProcessRefusal('adapter_refused');
   checkSubcommand(adapter.info.tool, invocation.argv);
-  // TLS-50 implements isolated run homes and the sole provider-key exception.
-  if (adapter.info.runHome || spec.runHome || invocation.spawnCwd || Object.keys(invocation.secretEnv ?? {}).length) throw new ProcessRefusal('adapter_refused');
+  const isDsh = adapter.info.tool === 'deepseek-harness';
+  const secretNames = Object.keys(invocation.secretEnv ?? {});
+  if (isDsh) {
+    if (!adapter.info.runHome || !spec.runHome || invocation.spawnCwd !== join(spec.runHome, 'launch') ||
+        invocation.env.DSH_HOME !== join(spec.runHome, 'dsh-home') || invocation.env.TMPDIR !== join(spec.runHome, 'tmp') || invocation.env.DSH_TELEMETRY_DISABLED !== '1' ||
+        invocation.env.DSH_PERMISSION_MODE !== (spec.access === 'folder_only' ? 'workspace-write' : 'danger-full-access') ||
+        secretNames.length !== 1 || invocation.secretEnv.DEEPSEEK_API_KEY !== 'provider-key:deepseek' ||
+        invocation.argv.length !== 7 || invocation.argv.slice(1).join('\0') !== ['--profile', 'headless', '--patch', join(spec.runDir, 'config/dsh.patch.yml'), '--json', '-'].join('\0') ||
+        Object.keys(invocation.env).some(name => !['DSH_HOME', 'TMPDIR', 'DSH_TELEMETRY_DISABLED', 'DSH_PERMISSION_MODE', ...(!RELEASE ? ['HOME'] : [])].includes(name))) throw new ProcessRefusal('adapter_refused');
+    await assertNoSymlinks(invocation.spawnCwd);
+    if (await realpath(invocation.spawnCwd) !== invocation.spawnCwd) throw new ProcessRefusal('adapter_refused');
+  } else if (adapter.info.runHome || spec.runHome || invocation.spawnCwd || secretNames.length || options.qaEnv !== undefined || options.readProviderKey) throw new ProcessRefusal('adapter_refused');
   const prompt = await readFile(spec.promptFile, 'utf8');
   if (adapter.info.promptVia === 'arg' && Buffer.byteLength(prompt) > 64 * 1024) {
     const index = invocation.argv.indexOf(prompt);
@@ -496,12 +588,9 @@ export async function startTool(options: StartToolOptions): Promise<RunningTool>
   const config = join(await realpath(spec.runDir), 'config');
   await mkdir(config, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'EEXIST') throw error; });
   if ((await lstat(config)).isSymbolicLink() || !(await lstat(config)).isDirectory()) throw new ProcessRefusal('adapter_refused');
-  for (const file of invocation.files) await configFile(config, file);
-  for (const file of invocation.projectFiles) {
-    if (!options.stageProjectFile) throw new ProcessRefusal('adapter_refused');
-    await options.stageProjectFile(file);
-  }
   const env = await buildToolEnvironment(recorded, invocation.env, invocation.envUnset);
+  if (isDsh && (env.DSH_HOME !== invocation.env.DSH_HOME || env.TMPDIR !== invocation.env.TMPDIR || env.DSH_TELEMETRY_DISABLED !== '1' || env.DSH_PERMISSION_MODE !== invocation.env.DSH_PERMISSION_MODE)) throw new ProcessRefusal('adapter_refused');
+  Object.assign(env, validateQaEnv(options.qaEnv));
   const fence = options.fence ?? randomBytes(16).toString('hex');
   if (!/^[a-f0-9]{32}$/u.test(fence)) throw new ProcessRefusal('adapter_refused');
   // Added last, so neither adapter env nor envUnset can replace the run's fence.
@@ -509,10 +598,35 @@ export async function startTool(options: StartToolOptions): Promise<RunningTool>
   // Without process inspection, escaped descendants and safe crash recovery cannot be enforced.
   try { await inspector.table(); await (inspector.fencePids ?? fencePids)(fence); } catch { throw new ProcessRefusal('adapter_refused'); }
   if (await fingerprint(recorded) !== preparedFingerprint || await realpath(spec.bin) !== recorded) throw new ProcessRefusal('tool_identity');
+  let providerKey: string | undefined;
+  if (isDsh) {
+    try { providerKey = await (options.readProviderKey ? options.readProviderKey() : new KeychainProviderKeyStore().get('deepseek')) ?? undefined; }
+    catch { throw new ProcessRefusal('provider_key_missing'); }
+    if (!providerKey || !isValidDeepseekKey(providerKey)) throw new ProcessRefusal('provider_key_missing');
+    if ([...invocation.argv, ...Object.values(invocation.env), ...[...invocation.files, ...invocation.projectFiles].flatMap(file => [file.path, file.content])].some(value => value.includes(providerKey!))) throw new ProcessRefusal('adapter_refused');
+    env.DEEPSEEK_API_KEY = providerKey;
+  }
+  for (const file of invocation.files) await configFile(config, file);
+  for (const file of invocation.projectFiles) {
+    if (!options.stageProjectFile) throw new ProcessRefusal('adapter_refused');
+    await options.stageProjectFile(file);
+  }
+  if (await fingerprint(recorded) !== preparedFingerprint || await realpath(spec.bin) !== recorded) throw new ProcessRefusal('tool_identity');
   const stdoutFd = openSync(join(spec.runDir, 'stdout.log'), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
   let stderrFd: number;
   try { stderrFd = openSync(join(spec.runDir, 'stderr.log'), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); } catch (error) { closeSync(stdoutFd); throw error; }
-  const child = spawn(recorded, invocation.argv.slice(1), { cwd: spec.cwd, env, detached: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+  let transcriptFd: number | undefined;
+  try {
+    if (isDsh) {
+      // Do not let dsh persist raw events: its NDJSON projection can truncate a secret
+      // before the core ever sees it. This transcript uses only the redacted pipe.
+      const transcript = join(await realpath(spec.runDir), 'transcript');
+      await mkdir(transcript, { mode: 0o700 });
+      transcriptFd = openSync(join(transcript, 'events.jsonl'), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    }
+  } catch (error) { closeSync(stdoutFd); closeSync(stderrFd); throw error; }
+  const child = spawn(recorded, invocation.argv.slice(1), { cwd: invocation.spawnCwd ?? spec.cwd, env, detached: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
+  delete env.DEEPSEEK_API_KEY;
   const spawnedBy = Date.now();
   let stdout = '';
   let stderr = '';
@@ -569,12 +683,38 @@ export async function startTool(options: StartToolOptions): Promise<RunningTool>
     reason ??= code;
     return cleanup();
   };
+  const pending = {stdout: '', stderr: ''};
+  const loggedBytes = {stdout: 0, stderr: 0};
+  const redactKey = providerKey ? outputKeyRedactor(providerKey) : undefined;
+  const append = (value: string, output: 'stdout' | 'stderr', final = false) => {
+    let text = pending[output] + value;
+    pending[output] = '';
+    if (redactKey) {
+      const redacted = redactKey(text, final);
+      text = redacted.text;
+      pending[output] = redacted.pending;
+      if (redacted.found) void stop('secret_in_output');
+    }
+    const bytes = Buffer.from(text).subarray(0, Math.max(0, OUTPUT_LIMIT - loggedBytes[output]));
+    writeSync(output === 'stdout' ? stdoutFd : stderrFd, bytes);
+    if (output === 'stdout' && transcriptFd !== undefined) writeSync(transcriptFd, bytes);
+    loggedBytes[output] += bytes.length;
+    if (output === 'stdout') stdout += text;
+    else stderr += text;
+  };
   const handleChunk = (chunk: Buffer, output: 'stdout' | 'stderr') => {
     const bytes = output === 'stdout' ? stdoutBytes : stderrBytes;
     const allowed = chunk.subarray(0, Math.max(0, OUTPUT_LIMIT - bytes));
-    writeSync(output === 'stdout' ? stdoutFd : stderrFd, allowed);
-    if (output === 'stdout') { stdoutBytes += chunk.length; stdout += stdoutDecoder.write(allowed); }
-    else { stderrBytes += chunk.length; stderr += stderrDecoder.write(allowed); }
+    if (!providerKey) writeSync(output === 'stdout' ? stdoutFd : stderrFd, allowed);
+    if (output === 'stdout') {
+      stdoutBytes += chunk.length;
+      const text = stdoutDecoder.write(allowed);
+      if (providerKey) append(text, output); else stdout += text;
+    } else {
+      stderrBytes += chunk.length;
+      const text = stderrDecoder.write(allowed);
+      if (providerKey) append(text, output); else stderr += text;
+    }
     if (bytes + chunk.length > OUTPUT_LIMIT) { void stop('output_too_large'); return; }
     if (output === 'stdout' && adapter.selfCheck) {
       try {
@@ -599,17 +739,23 @@ export async function startTool(options: StartToolOptions): Promise<RunningTool>
       clearTimeout(timer);
       clearTimeout(pipeTimer);
       pipesClosed = true;
+      if (providerKey) {
+        append(stdoutDecoder.end(), 'stdout', true);
+        append(stderrDecoder.end(), 'stderr', true);
+      } else {
+        stdout += stdoutDecoder.end();
+        stderr += stderrDecoder.end();
+      }
       closeSync(stdoutFd);
       closeSync(stderrFd);
-      stdout += stdoutDecoder.end();
-      stderr += stderrDecoder.end();
+      if (transcriptFd !== undefined) closeSync(transcriptFd);
       void (async () => {
         try {
           await cleanup();
           await snapshot;
         } catch { throw new ProcessCleanupError(); }
         finally { clearInterval(interval); }
-        const result = reason ? { ok: false, text: '', failureCode: reason } : spawnError ? { ok: false, text: '', failureCode: 'tool_not_found' } : adapter.parse({ stdout, stderr, exitCode, signal, runDir: spec.runDir });
+        const result = reason ? { ok: false, text: '', failureCode: reason } : spawnError ? { ok: false, text: '', failureCode: 'tool_not_found' } : adapter.parse({ stdout, stderr, exitCode, signal, runDir: spec.runDir, cwd: workspace });
         done({ ...result, exitCode, signal, stopped: reason !== null });
       })().catch(reject);
     });

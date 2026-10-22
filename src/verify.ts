@@ -7,6 +7,7 @@ import { RELEASE_BUILD_KEYS } from './build-keys.js';
 import { canonicalInstructionPath } from './code-reasons.js';
 import { HelperError } from './config.js';
 import { RELEASE } from './release-identity.js';
+import type { FolderRef } from './unmanaged.js';
 
 export interface BuildPublicKey { keyId: string; publicKey: string }
 export interface PlanItem {
@@ -33,6 +34,7 @@ export interface PlanItem {
   state: 'asking' | 'approved' | 'later' | 'kept_local' | 'forced' | 'held' | 'delivered' | 'failed';
   answer: 'update' | 'later' | 'always' | 'send_proposal' | 'publish' | 'keep_local' | 'replace' | 'replace_unmanaged' | null;
   availableAnswers?: NonNullable<PlanItem['answer']>[];
+  linkedHomes?: FolderRef[];
   reason: 'revoked' | 'archived' | 'security_fix' | null;
   restartHints: { tool: string; reload: 'live' | 'command' | 'restart'; command: string | null }[];
 }

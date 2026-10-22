@@ -140,7 +140,8 @@ export class RunnerCore {
       // Homes are cleaned only after every recorded process was safely verified gone.
       if ([...this.unrecovered.values()].some(row => row.pid > 0 || row.fence)) this.runHomesUnsafe = true;
       else {
-        try { await cleanupRunHomes(this.options.data); }
+        // Runs-on diagnostics have their own process ledger and lease, and may be live.
+        try { await cleanupRunHomes(this.options.data, {skipTests: true}); }
         catch { this.runHomesUnsafe = true; }
       }
       // Recover processes before validating pending files. A row without an outcome already finished.
@@ -324,10 +325,12 @@ export class RunnerCore {
       if (!supported.ok) throw new HelperError('adapter_refused', 'The claimed settings are unsupported.');
       const deadline = computeRunDeadline(claimedAt, Date.parse(claim.expiresAt), claim.maxRunMinutes);
       const tool = await startTool({adapter, spec: {bin: connection.bin, cwd: folder.cwd, runDir: folder.runDir, promptFile: folder.promptFile,
-        model: claim.model, provider: claim.provider, effort: claim.effort, access: local.access, skillsDir, maxTurns: 50,
+        model: claim.model, provider: claim.provider, effort: claim.effort, access: local.access, skillsDir,
+        skillNames: claim.skills.map(skill => skill.name), maxTurns: 50,
         timeoutSeconds: timeoutSeconds(deadline, this.now()), runHome: null}, recordedRealpath: connection.realpath, claimedAt,
         expiresAt: Date.parse(claim.expiresAt), maxRunMinutes: claim.maxRunMinutes, matrix: this.options.matrix, processes: this.options.processes, now: this.options.now,
         fence: this.active.get(claim.runId)!.fence,
+        dataDir: this.options.data, runId: claim.runId,
         stageProjectFile: file => folder.stageProjectFile({...file, kind: 'config'}),
         onSpawn: async (pid, startedAt, pgid) => {
           const row = this.active.get(claim.runId)!;
@@ -342,6 +345,7 @@ export class RunnerCore {
       this.tools.set(claim.runId, tool);
       if (controller.signal.aborted) await tool.stop(this.reasons.get(claim.runId) ?? 'runner_stopped');
       const result = await tool.finished;
+      if (result.failureDetail) await this.state.log(claim.runId, 'running', result.failureDetail, this.now() - claimedAt);
       this.tools.delete(claim.runId);
       // Completion verified the process tree. Never retain group authority
       // while a posting outcome waits, because its numeric ID can be reused.

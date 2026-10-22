@@ -15,7 +15,7 @@ export const SECRET_RULES: readonly SecretRule[] = Object.freeze([
   { id: 'private-key', pattern: /-----BEGIN (?:(?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----/, description: 'Private key material.' },
   { id: 'aws-key', pattern: /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/, description: 'AWS access key.' },
   { id: 'github-token', pattern: /\bgh[pos]_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b/, description: 'GitHub access token.' },
-  { id: 'openai-key', pattern: /\bsk-(?!ant-)(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b/, description: 'OpenAI API key.' },
+  { id: 'openai-key', pattern: /\bsk-(?!ant-)(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b/, description: 'OpenAI or DeepSeek API key.' },
   { id: 'anthropic-key', pattern: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/, description: 'Anthropic API key.' },
   { id: 'slack-token', pattern: /\bxox[a-z]-[A-Za-z0-9-]{10,}\b/, description: 'Slack access token.' },
   { id: 'stripe-live-key', pattern: /\b(?:sk|rk|pk)_live_[A-Za-z0-9]{16,}\b/, description: 'Stripe live key.' },

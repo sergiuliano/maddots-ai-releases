@@ -5,7 +5,7 @@ import { HELPER_IMPORT_UPLOAD_BYTES, type HelperImportReceipt, type HelperImport
 import { scanSecrets } from './shared/skill-checks/secret-rules.js';
 import { TOOL_MATRIX } from './shared/tool-matrix.js';
 import { ApiError, isObject, type ApiClient } from './api.js';
-import { backupUnmanaged, finishUnmanagedBackup, type BackupManifest } from './backups.js';
+import { backupUnmanaged, finishUnmanagedBackup, readBackupManifest, type BackupManifest } from './backups.js';
 import { HelperError, clock, type Timing } from './config.js';
 import { DeliveryRegistry, type DeliveryTarget } from './delivery/index.js';
 import { LockStore, safeName } from './lock.js';
@@ -27,9 +27,11 @@ const MAX_SESSIONS = 1000, MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 export type ImportOptions = {
   paths: HelperPaths; helperId: string; client: Pick<ApiClient, 'request'>;
   targets?: readonly DeliveryTarget[]; verifier?: BuildVerifier; timing?: Timing;
+  output?: (line: string) => void;
   crash?: (step: 'backup_prepared') => void | Promise<void>;
 };
 const identity = (ref: FolderRef) => JSON.stringify([ref.home, ref.folderName]);
+const visible = (value: string) => value.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, character => '\\u{' + character.codePointAt(0)!.toString(16) + '}');
 const absent = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT';
 const invalid = () => new HelperError('IMPORT_SESSION_INVALID', 'Use the folders in an open import started on ai.maddots.app.');
 function validRef(value: unknown): value is FolderRef & Record<string, unknown> {
@@ -57,7 +59,7 @@ async function homeOwners(paths: HelperPaths, refs: readonly FolderRef[]) {
 const errorCode = (error: unknown) => error instanceof HelperError ? error.code : (error as NodeJS.ErrnoException)?.code ?? 'REPLACE_FAILED';
 const transient = (error: unknown) => error instanceof ApiError
   ? error.status >= 500 || error.status === 429 || error.code === 'READ_ONLY' || error.code.startsWith('TOKEN_')
-  : /^(API_|TOKEN_)/.test(errorCode(error)) || ['EBUSY', 'EAGAIN', 'EMFILE', 'ENFILE', 'EIO'].includes(errorCode(error));
+  : /^(API_|TOKEN_)/.test(errorCode(error)) || ['EBUSY', 'EAGAIN', 'EMFILE', 'ENFILE', 'EIO', 'ENOSPC', 'EDQUOT'].includes(errorCode(error));
 export function replaceInstruction(value: unknown): ReplaceLocalInstruction | null {
   if (!isObject(value) || value.type !== 'replace_local') return null;
   if (!validRef(value) || !safeName(value.sessionId) || !safeName(value.skillId) || !Array.isArray(value.alsoLinkedFrom) ||
@@ -249,10 +251,10 @@ export class ImportEngine {
       throw error;
     }
   }
-  private async delivered(skillId: string, original: string, refs: readonly FolderRef[]): Promise<boolean> {
+  private async delivered(skillId: string, original: string, refs: readonly FolderRef[]): Promise<{target: string | null} | null> {
     const lock = await this.locks.read();
     const revoked = await this.revoked();
-    const covered = new Set<string>();
+    const covered = new Map<string, string>();
     for (const entry of lock.entries.filter(entry => entry.skillId === skillId && !entry.removed)) {
       if (covered.has(entry.route)) continue;
       if (revoked.some(value => value.digest === entry.digest) || entry.hasCode && !entry.allowedDigests.includes(entry.digest)) continue;
@@ -266,17 +268,21 @@ export class ImportEngine {
       try {
         await assertNoSymlinks(destination, this.options.paths.home);
         if (stampMatches(await readStamp(destination, this.verifier, this.locks.knownIds(lock)), entry) &&
-            treeDigest(await readSkillTree(destination, this.options.paths.home)) === entry.digest) covered.add(entry.route);
+            treeDigest(await readSkillTree(destination, this.options.paths.home)) === entry.digest) covered.set(entry.route, destination);
       } catch (error) { if (!absent(error) && !(error instanceof HelperError)) throw error; }
     }
     // An outer alias may target another tool's physical home under a different name.
     const canonical = (await toolHomes(this.options.paths)).filter(home => inside(home.root, original))
       .map(home => ({home: home.home, folderName: refs[0].folderName}));
     const owners = await homeOwners(this.options.paths, [...refs, ...canonical]);
-    return owners.length > 0 && owners.every(tool => [...covered].some(route => {
+    const delivered = owners.length > 0 && owners.every(tool => [...covered.keys()].some(route => {
       const definition = TOOL_MATRIX.routes[route];
       return tool.reads.includes(definition.readPath ?? definition.path);
     }));
+    return delivered ? {target: [...covered].find(([route]) => {
+      const definition = TOOL_MATRIX.routes[route];
+      return definition.kind === 'folder' && owners.some(tool => tool.reads.includes(definition.readPath ?? definition.path));
+    })?.[1] ?? null} : null;
   }
   /** Older journals need one fresh full plan before an unstarted replacement can resume. */
   async needsFullPlan(): Promise<boolean> {
@@ -346,7 +352,24 @@ export class ImportEngine {
       return;
     }
     if (!folder.complete) {
-      if (!await this.delivered(instruction.skillId, original, [folder, ...folder.links, ...instruction.alsoLinkedFrom])) return;
+      // A prepared 0.1.3 transaction already authorized moving its aliases into
+      // backup. Finish that durable operation with its original semantics before
+      // applying the linked-replacement target contract to newer transactions.
+      const prepared = folder.backupId ? await readBackupManifest(this.options.paths, folder.backupId) : undefined;
+      const legacy = prepared !== undefined && prepared.unmanaged?.managedTarget === undefined;
+      const delivered = await this.delivered(instruction.skillId, original, [folder, ...folder.links, ...instruction.alsoLinkedFrom]);
+      if (!delivered) return;
+      // Accounts can be added after import. Capture any new direct aliases before
+      // moving their source, so a later home cannot silently become dangling.
+      if (!folder.backupId) {
+        const current = (await listUnmanaged(this.options.paths, {verifier: this.verifier,
+          helperIds: this.locks.knownIds(await this.locks.read())})).find(value => value.realPath === original);
+        for (const ref of current ? [current, ...current.alsoLinkedFrom] : []) {
+          if (folder.links.some(link => identity(link) === identity(ref))) continue;
+          const alias = await resolveToolFolder(this.options.paths, ref);
+          if (alias.link && alias.realPath === original) folder.links.push({home: ref.home, folderName: ref.folderName, target: await readlink(alias.path)});
+        }
+      }
       // Once backupId is journaled, aliases were saved with it and the original may already have moved.
       if (!folder.backupId) for (const ref of instruction.alsoLinkedFrom) {
         if (folder.links.some(link => identity(link) === identity(ref))) continue;
@@ -356,9 +379,14 @@ export class ImportEngine {
         if (!alias.link || alias.realPath !== original) throw invalid();
         folder.links.push({...ref, target: await readlink(alias.path)});
       }
+      // Keep the primary pathname live even with no known aliases. Another
+      // home may start linking to it after this transaction has been prepared.
+      if (!legacy && !delivered.target) return;
+      if (!folder.backupId) this.options.output?.(visible(`Replace local copies: originals will be backed up; links will be preserved and pointed at the managed copy. Affected homes: ${[...new Set([folder.home, ...folder.links.map(link => link.home)])].join(', ')}.`));
       let backup: BackupManifest;
       if (folder.backupId) backup = await finishUnmanagedBackup(this.options.paths, folder.backupId,
-        {originalPath: folder.originalPath, original: {home: folder.home, folderName: folder.folderName}, links: folder.links});
+        {originalPath: folder.originalPath, original: {home: folder.home, folderName: folder.folderName}, links: folder.links,
+          ...(!legacy ? {managedTarget: relative(this.options.paths.home, delivered.target!).split(sep).join('/')} : {})});
       else {
         const current = await resolveToolFolder(this.options.paths, folder);
         if (current.realPath !== original) throw new HelperError('PATH_CHANGED', 'The imported original moved; replacement stopped.');
@@ -366,7 +394,7 @@ export class ImportEngine {
           folder.backupId = manifest.id;
           await this.save(journal);
           await this.options.crash?.('backup_prepared');
-        });
+        }, delivered.target!);
       }
       const lock = await this.locks.read();
       if (!lock.replaced.some(value => value.sessionId === instruction.sessionId && identity(value) === identity(folder))) {
