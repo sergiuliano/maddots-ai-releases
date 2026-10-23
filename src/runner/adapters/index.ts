@@ -2,6 +2,7 @@ import type { Adapter } from '../adapter.js';
 import { TOOL_MATRIX } from '../../shared/tool-matrix.js';
 import { codexAdapter } from './codex.js';
 import { claudeCodeAdapter } from './claude-code.js';
+import { openCodeAdapter } from './opencode.js';
 
 /** Availability is enforced separately by the matrix's real-tool acceptance gate. */
 export class AdapterRegistry {
@@ -25,4 +26,4 @@ export class AdapterRegistry {
   list(): Adapter[] { return [...this.#adapters.values()]; }
 }
 
-export const adapters = new AdapterRegistry([codexAdapter, claudeCodeAdapter]);
+export const adapters = new AdapterRegistry([codexAdapter, claudeCodeAdapter, openCodeAdapter]);

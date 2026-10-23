@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 export const modules = ['api', 'backups', 'build-keys', 'cli', 'config', 'detect', 'imports', 'linked-homes', 'lock', 'npm', 'pairing', 'paths', 'provider-keys', 'release-identity', 'runtime', 'safe-fs', 'scan', 'secret-store', 'service', 'stamp', 'state', 'sync', 'token', 'unmanaged', 'updater', 'verify', 'duplicates', 'holding', 'allow', 'notify', 'code-reasons', 'local-edits', 'proposals', 'unmanaged-replacement'];
 const shared = ['build-format', 'error-codes', 'helper-protocol', 'skill-errors', 'skill-limits', 'skill-types', 'tool-matrix', 'helper-imports-protocol', 'skill-code', 'skill-folder-names', 'plan-item-id', 'runner-protocol', 'helper-http-diagnostics', 'sync-protocol'];
-const runner = ['adapter', 'adapters/index', 'adapters/codex', 'adapters/claude-code', 'card-prompt', 'device-key', 'maddots-api', 'process', 'protocol-client', 'run-folder', 'runner', 'state', 'token-check', 'post', 'runs-on', 'test-run', 'agents-local', 'stage-skills', 'cli-runs'];
+const runner = ['adapter', 'adapters/index', 'adapters/codex', 'adapters/claude-code', 'adapters/opencode', 'card-prompt', 'device-key', 'maddots-api', 'process', 'protocol-client', 'run-folder', 'runner', 'state', 'token-check', 'post', 'runs-on', 'test-run', 'agents-local', 'stage-skills', 'cli-runs'];
 export function allowedRuntimePath(path) {
   if (['package.json', 'npm-shrinkwrap.json', 'LICENSE', 'dist/shared/tool-matrix.json', 'dist/shared/runner-contract.json'].includes(path)) return true;
   const runnerPath = /^dist\/runner\/([a-z/-]+)\.(?:js|d\.ts)$/.exec(path);
