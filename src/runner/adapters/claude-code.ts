@@ -1,10 +1,10 @@
-import { execFile } from 'node:child_process';
+import {guardToolRunner, runToolCommand} from '../../tool-command.js';
+import {assertLinuxToolClosure, linuxToolClosure} from '../../linux-tool-closures.js';
 import { realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join } from 'node:path';
-import { promisify } from 'node:util';
-import type { Adapter, ParsedResult, RunSpec } from '../adapter.js';
+import {LINUX_FOLDER_ONLY_REASON} from '../../shared/tool-capabilities.js';
+import { executeAdapterProbe, type Adapter, type ParsedResult, type RunSpec } from '../adapter.js';
 
-const exec = promisify(execFile);
 const sandbox = JSON.stringify({ sandbox: {
   enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true,
 } });
@@ -56,71 +56,101 @@ function checkInit(rows: Event[]): { mcpServers: string[]; browserTools: string[
 
 function failed(failureCode: string): ParsedResult { return { ok: false, text: '', failureCode }; }
 
-export const claudeCodeAdapter: Adapter = {
-  info: {
-    tool: 'claude-code', harness: 'claude_code', card: 'TLS-26', folderOnly: 'os-sandbox', mcpLevel: 'servers-off',
-    skillsDir: '{runDir}/plugin/skills',
-    // RunSpec carries a path, not prompt text. The final argument points at that file
-    // for every size, including prompts above the core's 64 KiB inline-argument cap.
-    promptVia: 'file', runHome: false,
-  },
+export interface ClaudeCodeOptions {
+  platform?: NodeJS.Platform;
+}
 
-  async identity(bin) {
-    try {
-      if (!isAbsolute(bin) || basename(bin) === 'agent' || desktopPath.test(bin)) return { ok: false, version: null };
-      const resolved = await realpath(bin);
-      if (basename(resolved) === 'agent' || desktopPath.test(resolved)) return { ok: false, version: null };
-      const { stdout, stderr } = await exec(resolved, ['--version'], {
-        timeout: 10_000, maxBuffer: 16 * 1024, encoding: 'utf8', shell: false,
-        env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, TERM: 'dumb', NO_COLOR: '1' },
-      });
-      const match = /^(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?) \(Claude Code\)$/u.exec(stdout.trim());
-      return match && !stderr.trim() ? { ok: true, version: match[1] } : { ok: false, version: null };
-    } catch { return { ok: false, version: null }; }
-  },
+export function createClaudeCodeAdapter(runner: typeof runToolCommand = runToolCommand, options: ClaudeCodeOptions = {}): Adapter {
+  const platform = options.platform ?? process.platform;
+  const exec = guardToolRunner('claude-code', runner, {platform});
+  const adapter: Adapter = {
+    info: {
+      tool: 'claude-code', harness: 'claude_code', card: 'TLS-26', folderOnly: 'os-sandbox', mcpLevel: 'servers-off',
+      skillsDir: '{runDir}/plugin/skills',
+      // RunSpec carries a path, not prompt text. The final argument points at that file
+      // for every size, including prompts above the core's 64 KiB inline-argument cap.
+      promptVia: 'file', runHome: false,
+    },
 
-  supports(input) {
-    if (input.provider !== null) return { ok: false, reason: 'Claude Code uses its saved login; explicit providers are unsupported.' };
-    if (!argument(input.model)) return { ok: false, reason: 'A valid Claude Code model is required.' };
-    if (input.effort !== null && !argument(input.effort)) return { ok: false, reason: 'Invalid Claude Code effort.' };
-    if (input.access !== 'folder_only' && input.access !== 'full_access') return { ok: false, reason: 'Unsupported access mode.' };
-    return { ok: true, reason: null };
-  },
+    async identity(bin, operation) {
+      try {
+        if (!isAbsolute(bin) || basename(bin) === 'agent' || desktopPath.test(bin)) return { ok: false, version: null };
+        const resolved = await realpath(bin);
+        if (basename(resolved) === 'agent' || desktopPath.test(resolved)) return { ok: false, version: null };
+        if (platform === 'linux') await assertLinuxToolClosure('claude-code', bin);
+        const { stdout, stderr } = await executeAdapterProbe(exec, 'claude-code.version', resolved, operation, {
+          platform, encoding: 'utf8', shell: false,
+          env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, TERM: 'dumb', NO_COLOR: '1', DISABLE_AUTOUPDATER: '1' },
+        });
+        const match = /^(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?) \(Claude Code\)$/u.exec(stdout.trim());
+        return match && !stderr.trim() && (platform !== 'linux' || match[1] === linuxToolClosure('claude-code')!.version)
+          ? { ok: true, version: match[1] } : { ok: false, version: null };
+      } catch { return { ok: false, version: null }; }
+    },
 
-  build(spec: RunSpec) {
-    if (!claudeCodeAdapter.supports(spec).ok) throw new Error('adapter_refused');
-    const argv = [spec.bin, '-p', '--output-format', 'stream-json', '--verbose', '--permission-prompts', 'none',
-      '--no-session-persistence', '--plugin-dir', join(spec.runDir, 'plugin'), '--model', spec.model];
-    if (spec.effort !== null) argv.push('--effort', spec.effort);
-    if (spec.access === 'folder_only') argv.push('--permission-mode', 'acceptEdits', '--settings', sandbox);
-    else argv.push('--permission-mode', 'bypassPermissions');
-    argv.push('--strict-mcp-config', '--disallowedTools', 'mcp__*', '--no-chrome', `Follow the task in ${spec.promptFile}.`);
-    return {
-      argv, env: { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' }, envUnset: ['ANTHROPIC_API_KEY'], stdinFile: null,
-      // TLS-25 stageSkills runs before startTool and must create the skills-only
-      // plugin, including .claude-plugin/plugin.json with name "maddots-run".
-      // Core config files are config-only; project staging rejects .maddots paths.
-      files: [], projectFiles: [], spawnCwd: null, secretEnv: {},
-    };
-  },
+    async preflight(input) {
+      if (platform !== 'darwin' && platform !== 'linux') return { ok: false, reason: 'Claude Code runs require macOS or Linux.' };
+      if (input?.operation?.signal?.aborted || (input?.operation?.deadline !== undefined &&
+          (!Number.isFinite(input.operation.deadline) || Date.now() >= input.operation.deadline))) return { ok: false, reason: 'Claude Code prerequisite operation was cancelled or expired.' };
+      if (platform === 'darwin') return { ok: true, reason: null };
+      if (!input || (input.access !== 'folder_only' && input.access !== 'full_access')) return { ok: false, reason: 'A verified Claude Code access mode is required.' };
+      if (input.access === 'folder_only') return { ok: false, reason: LINUX_FOLDER_ONLY_REASON };
+      // Linux Full access relies on S3. No nested Claude sandbox is enabled,
+      // so bubblewrap and socat are not adapter prerequisites.
+      return { ok: true, reason: null };
+    },
 
-  parse(result) {
-    if (result.exitCode !== 0 || result.signal !== null) return failed('tool_failed');
-    if (!result.stdout.trim()) return failed('output_empty');
-    try {
-      const rows = events(result.stdout, false), init = checkInit(rows);
-      if (!init) return failed('tool_failed');
-      if (init.mcpServers.length || init.browserTools.length) return failed('mcp_started');
-      if (rows.some(row => row.type === 'error' || row.is_error === true ||
-          (row.error !== undefined && row.error !== null))) return failed('tool_failed');
-      const results = rows.filter(row => row.type === 'result');
-      if (results.length !== 1) return failed('tool_failed');
-      const final = results[0];
-      if (final.subtype !== 'success' || final.is_error !== false || typeof final.result !== 'string' || rows.at(-1) !== final) return failed('tool_failed');
-      const text = final.result.trim();
-      return text ? { ok: true, text, failureCode: null } : failed('output_empty');
-    } catch { return failed('tool_failed'); }
-  },
+    supports(input) {
+      if (platform !== 'darwin' && platform !== 'linux') return { ok: false, reason: 'Claude Code runs require macOS or Linux.' };
+      if (input.provider !== null) return { ok: false, reason: 'Claude Code uses its saved login; explicit providers are unsupported.' };
+      if (!argument(input.model)) return { ok: false, reason: 'A valid Claude Code model is required.' };
+      if (input.effort !== null && !argument(input.effort)) return { ok: false, reason: 'Invalid Claude Code effort.' };
+      if (input.access !== 'folder_only' && input.access !== 'full_access') return { ok: false, reason: 'Unsupported access mode.' };
+      if (platform === 'linux' && input.access === 'folder_only') return { ok: false, reason: LINUX_FOLDER_ONLY_REASON };
+      return { ok: true, reason: null };
+    },
 
-  selfCheck(stdoutSoFar) { return checkInit(events(stdoutSoFar, true)); },
-};
+    build(spec: RunSpec) {
+      if (!adapter.supports(spec).ok) throw new Error('adapter_refused');
+      const argv = [spec.bin, '-p', '--output-format', 'stream-json', '--verbose', '--permission-prompts', 'none',
+        '--no-session-persistence', '--plugin-dir', join(spec.runDir, 'plugin'), '--model', spec.model];
+      if (spec.effort !== null) argv.push('--effort', spec.effort);
+      if (spec.access === 'folder_only') argv.push('--permission-mode', 'acceptEdits', '--settings', sandbox);
+      else argv.push('--permission-mode', 'bypassPermissions');
+      argv.push('--strict-mcp-config', '--disallowedTools', 'mcp__*', '--no-chrome', `Follow the task in ${spec.promptFile}.`);
+      return {
+        argv, env: {
+          ENABLE_CLAUDEAI_MCP_SERVERS: 'false',
+          DISABLE_AUTOUPDATER: '1',
+          ...(platform === 'linux' ? {CLAUDE_CONFIG_DIR: '/work/.mdai-home/claude'} : {}),
+        }, envUnset: ['ANTHROPIC_API_KEY'], stdinFile: null,
+        // TLS-25 stageSkills runs before startTool and must create the skills-only
+        // plugin, including .claude-plugin/plugin.json with name "maddots-run".
+        // Core config files are config-only; project staging rejects .maddots paths.
+        files: [], projectFiles: [], spawnCwd: null, secretEnv: {},
+      };
+    },
+
+    parse(result) {
+      if (result.exitCode !== 0 || result.signal !== null) return failed('tool_failed');
+      if (!result.stdout.trim()) return failed('output_empty');
+      try {
+        const rows = events(result.stdout, false), init = checkInit(rows);
+        if (!init) return failed('tool_failed');
+        if (init.mcpServers.length || init.browserTools.length) return failed('mcp_started');
+        if (rows.some(row => row.type === 'error' || row.is_error === true ||
+            (row.error !== undefined && row.error !== null))) return failed('tool_failed');
+        const results = rows.filter(row => row.type === 'result');
+        if (results.length !== 1) return failed('tool_failed');
+        const final = results[0];
+        if (final.subtype !== 'success' || final.is_error !== false || typeof final.result !== 'string' || rows.at(-1) !== final) return failed('tool_failed');
+        const text = final.result.trim();
+        return text ? { ok: true, text, failureCode: null } : failed('output_empty');
+      } catch { return failed('tool_failed'); }
+    },
+
+    selfCheck(stdoutSoFar) { return checkInit(events(stdoutSoFar, true)); },
+  };
+  return adapter;
+}
+export const claudeCodeAdapter = createClaudeCodeAdapter();

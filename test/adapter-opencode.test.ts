@@ -1,22 +1,30 @@
+import {directFixtureProcesses} from './native-process-fixture.js';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { TOOL_MATRIX } from '../src/shared/tool-matrix.js';
 import type { Adapter, RunSpec } from '../src/runner/adapter.js';
-import { createOpenCodeAdapter, inspectOpenCodeOutput, openCodeAdapter as adapter, openCodeManagedPaths, openCodeRunPaths } from '../src/runner/adapters/opencode.js';
+import { createOpenCodeAdapter, inspectOpenCodeOutput, openCodeManagedPaths, openCodeRunPaths } from '../src/runner/adapters/opencode.js';
 import { buildToolEnvironment, enforceAdapter, startTool, type ProcessInspector } from '../src/runner/process.js';
+import {cleanLinuxToolEnvironment} from '../src/runner/linux-containment.js';
+import {LINUX_LOCAL_PROVIDER_MODEL} from '../src/runner/linux-local-provider.js';
+import {withClaimedToolCommands, type runToolCommand, type ToolCommandOptions} from '../src/tool-command.js';
+import {darwinNativeSkip, scopedAdapterPlatform} from './support/adapter-platform-fixture.js';
 
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/adapters/opencode/${name}`, import.meta.url));
+// Historical local-provider controls exercise the macOS adapter contract.
+const adapter = createOpenCodeAdapter({platform: 'darwin'});
 const spec: RunSpec = {
   bin: '/fixture/home/.local/bin/opencode', cwd: '/fixture/project with spaces',
   runDir: '/fixture/project with spaces/.maddots/runs/run-1', promptFile: '/fixture/project with spaces/.maddots/runs/run-1/prompt.md',
   model: 'qwen3:8b', provider: 'ollama', effort: 'high', access: 'full_access',
   skillsDir: '/fixture/project with spaces/.maddots/runs/run-1/skills', maxTurns: 50, timeoutSeconds: 120, runHome: null,
 };
+const linuxSpec = {...spec, model: LINUX_LOCAL_PROVIDER_MODEL};
 const permission = { '*': 'deny', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow', edit: 'allow', bash: 'allow',
   skill: 'allow', todowrite: 'allow', todoread: 'allow', external_directory: 'allow', task: 'deny', question: 'deny',
   webfetch: 'deny', websearch: 'deny', codesearch: 'deny', 'mcp*': 'deny', 'browser*': 'deny' };
@@ -32,9 +40,21 @@ const jsonl = (...rows: unknown[]) => `${rows.map(value => JSON.stringify(value)
 const parse = (stdout: string, overrides: Partial<Parameters<Adapter['parse']>[0]> = {}) => adapter.parse({
   stdout, stderr: '', exitCode: 0, signal: null, runDir: spec.runDir, ...overrides,
 });
-const processes: ProcessInspector = { table: async () => [], fencePids: async () => [], identity: async pid => {
-  try { process.kill(pid, 0); return `fixture-${pid}`; } catch { return null; }
-} };
+const processes: ProcessInspector = directFixtureProcesses();
+
+const identityRunner: typeof runToolCommand = async (file, args, options) => {
+  const mode = basename(dirname(file));
+  if (mode === 'nonzero') throw new Error('fixture command exited 1');
+  if (args.length === 1 && args[0] === '--version') return {
+    stdout: ({v2: '2.0.28', wrong: 'codex-cli 1.19.0', multiline: 'wrapper\n1.19.0', overflow: 'x'.repeat(20 * 1024)}[mode] ?? '1.19.0') + '\n',
+    stderr: mode === 'stderr' ? 'warning\n' : '',
+  };
+  assert.deepEqual(args, ['run', '--help']);
+  assert(options?.env?.XDG_CONFIG_HOME?.includes('mdai-opencode-identity-'));
+  assert.equal(options?.env?.OPENCODE_PURE, '1');
+  return {stdout: '', stderr: mode === 'wrong-help' ? 'Other CLI --pure --format --auto --dir --variant\n'
+    : 'opencode run [message..]\n--pure --format --auto --dir --variant\n'};
+};
 
 async function temporary(t: TestContext): Promise<string> {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-opencode-'));
@@ -56,7 +76,8 @@ async function runSpec(t: TestContext, prompt = 'Complete the fixture task.'): P
 }
 function matrix() {
   const result = structuredClone(TOOL_MATRIX);
-  Object.assign(result.tools.find(tool => tool.key === 'opencode')!.run!, { offered: true, folderOnly: 'none', reason: null });
+  Object.assign(result.tools.find(tool => tool.key === 'opencode')!.run!, { offered: true,
+    platforms: {darwin: {accepted: true}, linux: {accepted: false}}, folderOnly: 'none', reason: null });
   return result;
 }
 const launch = (input: RunSpec, maxRunMinutes = 1) => startTool({ adapter, spec: input, matrix: matrix(), processes,
@@ -67,6 +88,16 @@ test('TLS-28 OpenCode metadata keeps real acceptance and Folder only closed', ()
     skillsDir: '{runDir}/skills', promptVia: 'stdin', runHome: false });
   const run = TOOL_MATRIX.tools.find(tool => tool.key === 'opencode')!.run!;
   assert.equal(run.offered, false); assert.equal(run.folderOnly, 'none'); assert.equal(run.mcpLevel, 'servers-off');
+});
+
+test('TLS-28 OpenCode native Darwin fixture acceptance admits Full access before execution', async t => {
+  scopedAdapterPlatform(t, 'darwin');
+  const input = await runSpec(t);
+  const candidate = {...createOpenCodeAdapter({platform: 'darwin', pathPresent: () => false}),
+    identity: async () => assert.fail('Static admission must not execute identity.'),
+    preflight: async () => assert.fail('Static admission must not execute preflight.')};
+  assert.equal((await enforceAdapter({...input, adapter: candidate})).code, 'adapter_refused');
+  assert.deepEqual(await enforceAdapter({...input, adapter: candidate, matrix: matrix()}), {ok: true, code: null, version: null});
 });
 
 test('TLS-28 OpenCode Full access golden argv, environment and run config', () => {
@@ -161,11 +192,114 @@ test('TLS-28 OpenCode managed configuration paths cover higher-priority system a
   assert.deepEqual(openCodeManagedPaths('linux', 'tester'), [join('/', 'etc', 'opencode/opencode.json'), join('/', 'etc', 'opencode/opencode.jsonc')]);
 });
 
-test('TLS-28 OpenCode identity accepts pinned v1 and a resolved install symlink', async t => {
+test('Linux OpenCode rejects either managed config from metadata before probing the CLI', async t => {
+  const root = await temporary(t), bin = await executable(root);
+  const managedRoot = join('/', 'etc', 'opencode');
+  for (const managed of [join(managedRoot, 'opencode.json'), join(managedRoot, 'opencode.jsonc')]) {
+    const inspected: string[] = [];
+    const linux = createOpenCodeAdapter({ platform: 'linux', home: () => '/fixture/home', username: () => 'fixture',
+      pathPresent: path => { inspected.push(path); return path === managed; } });
+    assert.match(linux.supports(linuxSpec).reason!, /Managed OpenCode configuration/u);
+    assert.equal((await linux.preflight!()).ok, false);
+    assert.deepEqual(await linux.identity(bin), { ok: false, version: null });
+    assert.throws(() => linux.build(linuxSpec), /adapter_refused/u);
+    assert(inspected.includes(managed));
+    assert(inspected.every(path => path.startsWith(managedRoot + '/')));
+  }
+});
+
+test('Linux OpenCode configuration inspection errors and invalid HOME fail closed', async () => {
+  for (const code of ['EACCES', 'EIO', 'ENOTDIR']) {
+    const linux = createOpenCodeAdapter({ platform: 'linux', home: () => '/fixture/home', username: () => 'fixture',
+      pathPresent: () => { throw Object.assign(new Error('inspection unavailable'), { code }); } });
+    assert.match(linux.supports(linuxSpec).reason!, /isolation could not be verified/u);
+    assert.equal((await linux.preflight!()).ok, false);
+    assert.throws(() => linux.build(linuxSpec), /adapter_refused/u);
+  }
+  for (const home of ['', '.', 'relative/home']) {
+    const linux = createOpenCodeAdapter({ platform: 'linux', home: () => home, pathPresent: () => false });
+    assert.equal(linux.supports(linuxSpec).ok, false);
+  }
+  for (const platform of ['win32', 'freebsd'] as const) {
+    const unsupported = createOpenCodeAdapter({ platform, pathPresent: () => assert.fail('Unsupported platforms must not inspect configuration.') });
+    assert.equal(unsupported.supports(spec).ok, false);
+    assert.equal((await unsupported.preflight!()).ok, false);
+  }
+});
+
+test('Linux OpenCode repeats isolation checks when configuration changes after selection', async () => {
+  let configured = false;
+  const linux = createOpenCodeAdapter({ platform: 'linux', home: () => '/fixture/home', username: () => 'fixture',
+    pathPresent: path => configured && path === join('/', 'etc', 'opencode', 'opencode.json') });
+  assert.equal(linux.supports(linuxSpec).ok, true);
+  assert.equal((await linux.preflight!()).ok, true);
+  configured = true;
+  assert.equal((await linux.preflight!()).ok, false);
+  assert.throws(() => linux.build(linuxSpec), /adapter_refused/u);
+});
+
+test('OpenCode identity binds profiles, checks cancellation before help and requires Linux operation authority', async t => {
+  const root = await temporary(t), bin = await executable(root);
+  const controller = new AbortController(), deadline = Date.now() + 1000;
+  const profiles: string[] = [];
+  let cancelAfterVersion = false;
+  const runner = async (file: string, argv: readonly string[], options?: ToolCommandOptions) => {
+    profiles.push(options?.probe?.id ?? 'missing');
+    assert.equal(file, bin); assert.equal(options?.probe?.purpose, 'identity');
+    assert.equal(options?.signal, controller.signal);
+    const timeout = options?.timeout ?? 0;
+    assert(timeout > 0 && timeout <= 1000);
+    if (argv[0] === '--version') {
+      if (cancelAfterVersion) controller.abort();
+      return {stdout: '1.19.0', stderr: ''};
+    }
+    assert.deepEqual(argv, ['run', '--help']);
+    return {stdout: 'opencode run [message..]\n--pure --format --auto --dir --variant', stderr: ''};
+  };
+  const options = {home: () => '/fixture/home', username: () => 'fixture', pathPresent: () => false, runner};
+  const linux = createOpenCodeAdapter({...options, platform: 'linux'});
+  for (const operation of [undefined, Object.freeze({kind: 'linux-acceptance-operation' as const})]) {
+    assert.equal((await withClaimedToolCommands({tool: 'opencode', file: bin, deadline,
+      signal: controller.signal, contained: true, operation}, () => linux.identity(bin, {deadline, signal: controller.signal}))).ok, false);
+  }
+  assert.deepEqual(profiles, [], 'a contained claim or fabricated operation must not dispatch a Linux identity probe');
+  // Profile transport and cancellation stay testable in the release export,
+  // whose verifier intentionally cannot trust an ephemeral test signer.
+  const candidate = createOpenCodeAdapter({...options, platform: 'darwin'});
+  const identify = () => candidate.identity(bin, {deadline, signal: controller.signal});
+  assert.equal((await identify()).ok, true);
+  assert.deepEqual(profiles, ['opencode.version', 'opencode.run-help']);
+  profiles.length = 0; cancelAfterVersion = true;
+  assert.equal((await identify()).ok, false);
+  assert.deepEqual(profiles, ['opencode.version']);
+});
+
+test('OpenCode refuses a dangling personal configuration symlink without reading it', async t => {
+  const root = await temporary(t), home = join(root, 'home');
+  await mkdir(home); await symlink(join(root, 'missing-target'), join(home, '.opencode'));
+  const isolated = createOpenCodeAdapter({ home: () => home });
+  assert.match(isolated.supports(linuxSpec).reason!, /personal ~\/.opencode/u);
+  assert.equal((await isolated.preflight!()).ok, false);
+  assert.deepEqual(await isolated.identity(await executable(root)), { ok: false, version: null });
+});
+
+test('OpenCode refuses configuration under an unresolved parent instead of treating it as absent', async t => {
+  const root = await temporary(t), home = join(root, 'unresolved', 'home');
+  await symlink(join(root, 'missing-target'), join(root, 'unresolved'));
+  const isolated = createOpenCodeAdapter({ home: () => home });
+  assert.match(isolated.supports(linuxSpec).reason!, /isolation could not be verified/u);
+  assert.equal((await isolated.preflight!()).ok, false);
+});
+
+async function identityAcceptance(t: TestContext, adapter: Adapter) {
   const root = await temporary(t), bin = await executable(root), alias = join(root, 'opencode.exe'); await symlink(bin, alias);
   assert.deepEqual(await adapter.identity(bin), { ok: true, version: '1.19.0' });
   assert.deepEqual(await adapter.identity(alias), { ok: true, version: '1.19.0' });
-});
+}
+
+test('TLS-28 OpenCode identity accepts pinned v1 and a resolved install symlink', {skip: darwinNativeSkip}, t => identityAcceptance(t, adapter));
+test('TLS-28 OpenCode identity parses deterministic pinned version and help replies',
+  t => identityAcceptance(t, createOpenCodeAdapter({platform: 'darwin', runner: identityRunner})));
 
 test('TLS-28 OpenCode refuses personal native configuration without reading or redirecting HOME', async t => {
   const root = await temporary(t), ambientHome = join(root, 'normal-home'), config = join(ambientHome, '.opencode');
@@ -180,7 +314,7 @@ test('TLS-28 OpenCode refuses personal native configuration without reading or r
   } finally { if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome; }
 });
 
-test('TLS-28 OpenCode identity rejects v2, wrong output, wrappers, errors and unrelated binaries', async t => {
+async function identityRejection(t: TestContext, adapter: Adapter) {
   const root = await temporary(t);
   for (const mode of ['v2', 'wrong', 'wrong-help', 'multiline', 'stderr', 'nonzero', 'overflow']) assert.deepEqual(await adapter.identity(await executable(root, mode)), { ok: false, version: null });
   for (const bin of ['opencode', root, join(root, 'missing/opencode'), process.execPath]) assert.deepEqual(await adapter.identity(bin), { ok: false, version: null });
@@ -189,9 +323,14 @@ test('TLS-28 OpenCode identity rejects v2, wrong output, wrappers, errors and un
   const wrongTarget = join(root, 'real-agent'); await copyFile(bin, wrongTarget); await chmod(wrongTarget, 0o700);
   const alias = join(root, 'alias/opencode'); await mkdir(dirname(alias)); await symlink(wrongTarget, alias);
   assert.deepEqual(await adapter.identity(alias), { ok: false, version: null });
-});
+}
 
-test('TLS-28 OpenCode environment preserves HOME, isolates XDG and strips inherited auth/config', async () => {
+test('TLS-28 OpenCode identity rejects v2, wrong output, wrappers, errors and unrelated binaries', {skip: darwinNativeSkip}, t => identityRejection(t, adapter));
+test('TLS-28 OpenCode identity parsing rejects deterministic errors and unrelated binary paths',
+  t => identityRejection(t, createOpenCodeAdapter({platform: 'darwin', runner: identityRunner})));
+
+test('TLS-28 OpenCode Darwin environment preserves HOME, isolates XDG and strips inherited auth/config', async t => {
+  scopedAdapterPlatform(t, 'darwin');
   const invocation = adapter.build(spec), env = await buildToolEnvironment(spec.bin, invocation.env, invocation.envUnset, {
     HOME: '/ambient/home', XDG_CONFIG_HOME: '/ambient/config', OPENCODE_CONFIG: '/ambient/config/opencode.json',
     OPENCODE_AUTH_CONTENT: 'synthetic-auth', OPENCODE_PERMISSION: '{"*":"allow"}', OPENROUTER_API_KEY: 'synthetic-key',
@@ -200,6 +339,16 @@ test('TLS-28 OpenCode environment preserves HOME, isolates XDG and strips inheri
   assert.equal(invocation.env.HOME, undefined); assert.equal(env.HOME, '/ambient/home'); assert.equal(env.XDG_CONFIG_HOME, invocation.env.XDG_CONFIG_HOME);
   assert.equal(env.OPENCODE_CONFIG, invocation.env.OPENCODE_CONFIG); assert.equal(env.OPENCODE_PERMISSION, invocation.env.OPENCODE_PERMISSION);
   for (const key of ['OPENCODE_AUTH_CONTENT', 'OPENROUTER_API_KEY', 'SSH_AUTH_SOCK', 'MADDOTS_TOKEN', 'HTTP_PROXY']) assert.equal(env[key], undefined);
+});
+
+test('TLS-28 OpenCode Linux environment replaces HOME and XDG with private paths', async t => {
+  scopedAdapterPlatform(t, 'linux');
+  const invocation = adapter.build(spec), environment = await buildToolEnvironment(spec.bin, invocation.env, invocation.envUnset,
+    {HOME: '/ambient/home', XDG_CONFIG_HOME: '/ambient/config', SSH_AUTH_SOCK: '/ambient/agent', OPENROUTER_API_KEY: 'fixture-only'});
+  assert.equal(environment.HOME, undefined); assert.equal(environment.OPENROUTER_API_KEY, undefined);
+  const isolated = cleanLinuxToolEnvironment(environment, '/private/fixture/work');
+  assert.equal(isolated.HOME, '/tmp/home'); assert.equal(isolated.XDG_CONFIG_HOME, '/tmp/home/.config');
+  assert(!JSON.stringify(isolated).includes('/ambient/'));
 });
 
 test('TLS-28 OpenCode parses final assistant text parts, replacing repeated part updates', () => {
@@ -280,7 +429,7 @@ test('TLS-28 OpenCode skill proof uses completed tool metadata and staged locati
   for (const value of ['malformed', jsonl(start, { ...text, sessionID: 'ses_other' }, finish)]) assert.equal(inspectOpenCodeOutput(value, skill).sessionID, null);
 });
 
-test('TLS-28 OpenCode succeeds through core with a large stdin prompt and staged skill', async t => {
+test('TLS-28 OpenCode succeeds through core with a large stdin prompt and staged skill', {skip: darwinNativeSkip}, async t => {
   const prompt = 'Complete the task. '.repeat(6000), input = await runSpec(t, prompt), result = await (await launch(input)).finished;
   assert.equal(result.ok, true, await readFile(join(input.runDir, 'stderr.log'), 'utf8'));
   assert.equal(result.stopped, false); assert.equal(result.exitCode, 0);
@@ -292,26 +441,26 @@ test('TLS-28 OpenCode succeeds through core with a large stdin prompt and staged
 });
 
 for (const [prompt, code] of [['FAIL synthetic', 'tool_failed'], ['MALFORMED synthetic', 'tool_failed'], ['MCP synthetic', 'mcp_started']] as const) {
-  test(`TLS-28 OpenCode core rejects fake ${prompt.split(' ')[0].toLowerCase()} output`, async t => {
+  test(`TLS-28 OpenCode core rejects fake ${prompt.split(' ')[0].toLowerCase()} output`, {skip: darwinNativeSkip}, async t => {
     const input = await runSpec(t, prompt), result = await (await launch(input)).finished;
     assert.equal(result.ok, false); assert.equal(result.text, ''); assert.equal(result.failureCode, code);
   });
 }
 
-test('TLS-28 OpenCode core deadline terminates a hanging CLI', async t => {
+test('TLS-28 OpenCode core deadline terminates a hanging CLI', {skip: darwinNativeSkip}, async t => {
   const input = await runSpec(t, 'HANG synthetic'), running = await launch(input, 0.02), result = await running.finished;
   assert.equal(result.ok, false); assert.equal(result.stopped, true); assert.equal(result.failureCode, 'run_time_limit');
   assert.throws(() => process.kill(running.pid, 0), { code: 'ESRCH' });
 });
 
-test('TLS-28 OpenCode core stop terminates a hanging CLI', async t => {
+test('TLS-28 OpenCode core stop terminates a hanging CLI', {skip: darwinNativeSkip}, async t => {
   const input = await runSpec(t, 'HANG synthetic'), running = await launch(input);
   await running.stop('runner_stopped'); const result = await running.finished;
   assert.equal(result.ok, false); assert.equal(result.stopped, true); assert.equal(result.failureCode, 'runner_stopped');
   assert.throws(() => process.kill(running.pid, 0), { code: 'ESRCH' });
 });
 
-test('TLS-28 OpenCode fake canary positive control starts normal MCP and plugin children', async t => {
+test('TLS-28 OpenCode fake canary positive control starts normal MCP and plugin children', {skip: darwinNativeSkip}, async t => {
   const input = await runSpec(t), home = join(input.cwd, 'normal-home'), config = join(home, '.config/opencode');
   const mcpMarker = join(input.cwd, 'mcp-started'), pluginMarker = join(input.cwd, 'plugin-started');
   const plugin = join(input.cwd, 'fixture-plugin.mjs');
@@ -329,7 +478,7 @@ test('TLS-28 OpenCode fake canary positive control starts normal MCP and plugin 
   assert.equal(await readFile(mcpMarker, 'utf8'), 'started\n'); assert.equal(await readFile(pluginMarker, 'utf8'), 'started');
 });
 
-test('TLS-28 OpenCode fake canary negative control isolates global and project config without mutation', async t => {
+test('TLS-28 OpenCode fake canary negative control isolates global and project config without mutation', {skip: darwinNativeSkip}, async t => {
   const input = await runSpec(t), marker = join(input.cwd, 'canary-started'), pluginMarker = join(input.cwd, 'plugin-started');
   const plugin = join(input.cwd, 'fixture-plugin.mjs'); await writeFile(plugin, `import {writeFileSync} from 'node:fs';writeFileSync(${JSON.stringify(pluginMarker)},'started');`);
   const config = JSON.stringify({ mcp: { canary: { type: 'local', command: [process.execPath, fixture('canary.mjs'), marker], enabled: true } }, plugin: [plugin] });

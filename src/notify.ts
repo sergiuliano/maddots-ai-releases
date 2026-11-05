@@ -1,3 +1,4 @@
+import { helperPlatform } from './platform.js';
 import { constants } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { lstat, open, rename } from 'node:fs/promises';
@@ -5,13 +6,14 @@ import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HelperError, cleanEnvironment, clock, endpointUrl, runCommand, type Runner, type Timing } from './config.js';
 import { assertNoSymlinks, atomicWrite, ensurePrivateDirectory, readPrivateFile, type HelperPaths } from './paths.js';
+import { assertLockUpgradeReady } from './write-lock-upgrade.js';
 
 export const ALLOW_NOTIFICATION_INTERVAL_MS = 4 * 60 * 60 * 1000;
 export const ALLOW_DIALOG_GIVE_UP_S = ALLOW_NOTIFICATION_INTERVAL_MS / 1000 - 60;
 export type WaitingNotification = { skillId: string; version: number; digests: readonly string[] };
 export type PendingDialog = { count: number; command: string; fingerprint: string; reservedAt: number };
 export type NotifyOptions = {
-  runner?: Runner; timing?: Timing; execPath?: string; entrypoint?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal;
+  platform?: NodeJS.Platform; output?: (line: string) => void; runner?: Runner; timing?: Timing; execPath?: string; entrypoint?: string; env?: NodeJS.ProcessEnv; signal?: AbortSignal;
 };
 export type NotifyResult = 'empty' | 'unchanged' | 'throttled' | 'later' | 'opened';
 type NotificationState = { format: 1; notifiedSets: string[]; lastDialogAt?: number; interruptedSet?: string };
@@ -108,6 +110,7 @@ async function writeLauncher(paths: HelperPaths, content: string): Promise<strin
 export async function reserveWaitingDialog(paths: HelperPaths, waiting: readonly WaitingNotification[], options: NotifyOptions = {}): Promise<'empty' | 'unchanged' | 'throttled' | PendingDialog> {
   const set = waitingSet(waiting);
   if (!set.count) return 'empty';
+  if (process.platform === 'linux') await assertLockUpgradeReady(paths, options.timing);
   await ensurePrivateDirectory(paths.data);
   const statePath = join(paths.data, 'notification-state.json');
   const state = await readNotificationState(statePath);
@@ -119,7 +122,8 @@ export async function reserveWaitingDialog(paths: HelperPaths, waiting: readonly
   const next: NotificationState = { format: 1, notifiedSets: [...new Set([...state.notifiedSets, set.fingerprint])], lastDialogAt: now };
   const content = JSON.stringify(next) + '\n';
   if (Buffer.byteLength(content) > 1024 * 1024) throw new HelperError('NOTIFY_STATE_INVALID', 'The desktop notification state exceeded its size limit.');
-  const command = await writeLauncher(paths, launcher(paths, options));
+  const command = helperPlatform(options.platform ?? paths.platform) === 'darwin'
+    ? await writeLauncher(paths, launcher(paths, options)) : 'maddots-ai allow';
   // Reserve the attempt before displaying it so a crash or dialog failure cannot
   // repeatedly interrupt the person. Throttled sets are never marked as shown.
   await atomicWrite(statePath, content);
@@ -128,6 +132,7 @@ export async function reserveWaitingDialog(paths: HelperPaths, waiting: readonly
 
 /** Call under the write lock after cancelling a service-owned child, retaining its set for restart. */
 export async function interruptWaitingDialog(paths: HelperPaths, dialog: PendingDialog): Promise<void> {
+  if (process.platform === 'linux') await assertLockUpgradeReady(paths);
   const statePath = join(paths.data, 'notification-state.json');
   const state = await readNotificationState(statePath);
   if (state.lastDialogAt !== dialog.reservedAt || !state.notifiedSets.includes(dialog.fingerprint)) return;
@@ -136,6 +141,10 @@ export async function interruptWaitingDialog(paths: HelperPaths, dialog: Pending
 
 /** Call outside the helper write lock and do not await it from the sync tick. */
 export async function showWaitingDialog(dialog: PendingDialog, options: NotifyOptions = {}): Promise<'later' | 'opened'> {
+  if (helperPlatform(options.platform) === 'linux') {
+    (options.output ?? (line => process.stdout.write(line + '\n')))(`${dialog.count} skills with code wait for Allow on this computer. Run maddots-ai allow in an interactive terminal.`);
+    return 'later';
+  }
   const runner = options.runner ?? runCommand;
   const env = cleanEnvironment(options.env ?? process.env);
   const script = `display dialog "${dialog.count} skills with code wait for Allow on this computer" buttons {"Later", "Open Allow list"} default button "Later" with title "MadDots AI" giving up after ${ALLOW_DIALOG_GIVE_UP_S}`;
@@ -149,5 +158,5 @@ export async function showWaitingDialog(dialog: PendingDialog, options: NotifyOp
 
 export async function notifyWaiting(paths: HelperPaths, waiting: readonly WaitingNotification[], options: NotifyOptions = {}): Promise<NotifyResult> {
   const pending = await reserveWaitingDialog(paths, waiting, options);
-  return typeof pending === 'string' ? pending : showWaitingDialog(pending, options);
+  return typeof pending === 'string' ? pending : showWaitingDialog(pending, {...options, platform: options.platform ?? paths.platform});
 }

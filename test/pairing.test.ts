@@ -21,9 +21,9 @@ function fakeClock() {
 
 test('Node platforms map to the pairing protocol OS names', () => {
   assert.equal(helperOs('darwin'), 'macos');
-  assert.equal(helperOs('win32'), 'windows');
+  assert.throws(() => helperOs('win32'), {code: 'PLATFORM_UNSUPPORTED'});
   assert.equal(helperOs('linux'), 'linux');
-  assert.equal(helperOs('freebsd'), 'linux');
+  assert.throws(() => helperOs('freebsd'), {code: 'PLATFORM_UNSUPPORTED'});
   assert.equal(helperOs(), helperOs(process.platform));
 });
 

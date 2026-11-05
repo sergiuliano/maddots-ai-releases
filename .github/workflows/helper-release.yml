@@ -1,10 +1,16 @@
 name: Release MadDots AI helper
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
+      mode:
+        description: Release normally or retain attested bytes without publishing a Release
+        type: choice
+        required: true
+        default: release
+        options:
+          - release
+          - attest-only
       bootstrap_release:
         description: Also publish the package version from an existing trusted signed tag
         type: boolean
@@ -20,7 +26,7 @@ concurrency:
 
 jobs:
   release:
-    if: github.repository == 'sergiuliano/maddots-ai-releases' && github.ref == 'refs/heads/main'
+    if: github.repository == 'sergiuliano/maddots-ai-releases' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.mode == 'release'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -131,3 +137,91 @@ jobs:
                 --notes "Version-pinned bootstrap from the trusted signed source tag. Assets are identical to helper-$GITHUB_SHA. npm publication remains disabled."
             fi
           fi
+
+  attest-only:
+    if: github.repository == 'sergiuliano/maddots-ai-releases' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.mode == 'attest-only'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      MADDOTS_AI_AUTO_UPDATE: '0'
+    steps:
+      - name: Check out the exact release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.22.3'
+      - name: Verify the signed source tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node --input-type=module -e 'import { readFileSync } from "node:fs"; process.stdout.write(JSON.parse(readFileSync("package.json", "utf8")).version)')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-linux\.[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]]
+          git fetch --no-tags origin "refs/tags/v$version:refs/tags/v$version"
+          test "$(git cat-file -t "v$version")" = tag
+          printf '%s\n' 'sergiuliano namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIRSFnznywnHjMXqQnEA4nbVU7RW4X30NAP1dDmDRxtr' > "$RUNNER_TEMP/helper-allowed-signers"
+          git -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/helper-allowed-signers" verify-tag "v$version"
+          test "$(git rev-parse "v$version^{commit}")" = "$GITHUB_SHA"
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Test the helper
+        run: npm test
+      - name: Check the package boundary
+        run: npm run pack:check -- --attest-only
+      - name: Prepare and clean-install the exact runtime artifact
+        run: node scripts/prepare-release.mjs --attest-only --output "$RUNNER_TEMP/helper-release"
+      - name: Attest the runtime artifact with GitHub SLSA provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/helper-release/helper.tgz
+          create-storage-record: false
+      - name: Verify and collect the attested bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/helper-release"
+          cp "$ATTESTATION_BUNDLE" "$release_dir/helper.sigstore.json"
+          cp export-manifest.json "$release_dir/export-manifest.json"
+          (cd "$release_dir" && sha256sum --check helper.tgz.sha256)
+          gh attestation verify "$release_dir/helper.tgz" \
+            --bundle "$release_dir/helper.sigstore.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --cert-identity 'https://github.com/sergiuliano/maddots-ai-releases/.github/workflows/helper-release.yml@refs/heads/main' \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --source-ref refs/heads/main --source-digest "$GITHUB_SHA" \
+            --signer-digest "$GITHUB_SHA" --deny-self-hosted-runners
+      - name: Retain the attested bytes without a Release
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: helper-attested-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/helper-release/helper.tgz
+            ${{ runner.temp }}/helper-release/helper.sigstore.json
+            ${{ runner.temp }}/helper-release/helper.tgz.sha256
+            ${{ runner.temp }}/helper-release/export-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+      - name: Record artifact identity and retention
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Mode: attest-only. Release job skipped.\nCommit: `%s`, run `%s`, attempt `%s`.\nArtifact ID: `%s`\nArtifact URL: %s\nArtifact ZIP SHA-256: `%s`\nRequested retention: 30 days. Archive before the API expires_at deadline.\n' \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$ARTIFACT_ID" "$ARTIFACT_URL" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"

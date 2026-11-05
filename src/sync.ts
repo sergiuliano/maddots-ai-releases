@@ -5,6 +5,8 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { treeDigest } from './shared/build-format.js';
 import { planItemId } from './shared/plan-item-id.js';
 import { TOOL_MATRIX } from './shared/tool-matrix.js';
+import { helperOs } from './platform.js';
+import type { SecretStorage } from './secret-store.js';
 import type { DetectedTool } from './detect.js';
 import { ApiError, type ApiClient } from './api.js';
 import { HelperError, clock, type Timing } from './config.js';
@@ -13,7 +15,8 @@ import { DeliveryRegistry, type DeliveryTarget } from './delivery/index.js';
 import { ImportEngine } from './imports.js';
 import { agentsFolderReloadHints } from './delivery/agents-folder.js';
 import { duplicateQuestions, scanDuplicates, type DuplicateQuestion, type SyncQuestion } from './duplicates.js';
-import { entryKey, LockStore, safeName, type LockEntry, type PendingWrite, type SkillLock } from './lock.js';
+import { entryKey, LockStore, safeName, validEntry, type LockEntry, type PendingWrite, type SkillLock } from './lock.js';
+import { withAgentDestinationLocks } from './agent-fence.js';
 import { atomicWrite, assertNoSymlinks, ensurePaths, ensurePrivateDirectory, inside, readPrivateFile, withWriteLock, type HelperPaths } from './paths.js';
 import { VERSION } from './release-identity.js';
 import { assertRouteRoot, atomicWriteBuild, durableRename, readSkillTree, stageBuild } from './safe-fs.js';
@@ -33,14 +36,16 @@ export type SyncPlan = {planRevision: string; degraded: boolean; pollAfterSecond
 export type DeliveryError = {skillId: string; target: string; name: string; code: string};
 export type ManagedInventory = {skillId: string; target: string; name: string; version: number; settingsRevision: number;
   digest: string; localDigest: string | null; state: 'ok' | 'edited' | 'missing' | 'held'; linkedHomes?: FolderRef[]};
+export type AgentManagedInventory = ManagedInventory & {agentId: string};
 export type SyncInventory = {
-  helperVersion: string; computerName: string; os: 'macos' | 'linux' | 'windows'; tokenStorage: 'keychain' | 'file'; tools: ReportedTool[];
-  managed: ManagedInventory[]; duplicates: unknown[]; unmanaged: unknown[]; holdingCount: number; deliveryErrors: DeliveryError[];
+  helperVersion: string; computerName: string; os: 'macos' | 'linux' | 'windows'; tokenStorage: SecretStorage; tools: ReportedTool[];
+  previousHelperIds?: string[];
+  managed: ManagedInventory[]; agentManaged?: AgentManagedInventory[]; duplicates: unknown[]; unmanaged: unknown[]; holdingCount: number; deliveryErrors: DeliveryError[];
   capabilities?: {allow: boolean; 'linked-replacement'?: boolean}; waitingForAllow?: {skillId: string; version: number; itemIds: string[]}[];
 };
 export type SyncOptions = {
   paths: HelperPaths; helperId: string; client: Pick<ApiClient, 'request'>; targets: readonly DeliveryTarget[];
-  verifier?: BuildVerifier; timing?: Timing; computerName?: string; tools?: ReportedTool[]; tokenStorage?: 'keychain' | 'file';
+  verifier?: BuildVerifier; timing?: Timing; computerName?: string; tools?: ReportedTool[]; tokenStorage?: SecretStorage;
   /** TLS-14 checks a local Allow record for this exact skill/version/settings/digest. */
   allowedBuild?: (build: SignedBuild) => Promise<boolean>;
   /** A Replace choice needs a new local Allow, rather than an earlier build allowance. */
@@ -63,9 +68,27 @@ const cachedEnvelope = (paths: HelperPaths, digest: string, signature: string) =
 /** Independently checks the on-disk cache. C2 must supply this helper's paths and trust roots. */
 export async function verifiedBuild(digest: string, options: {paths: HelperPaths; verifier?: BuildVerifier;
   helperId: string; agentId?: string; revoked?: SyncPlan['revoked']; accepted?: Pick<LockEntry, 'skillId' | 'target' | 'name'>;
+  /** Exact acceptance captured under the write lock when this agent claimed a run. */
+  claimed?: LockEntry;
   allowedBuild?: (build: SignedBuild) => Promise<boolean>}): Promise<VerifiedBuild> {
   if (!/^[a-f0-9]{64}$/.test(digest)) throw new HelperError('BUILD_DIGEST_INVALID', 'Invalid build digest.');
   const verifier = options.verifier ?? new BuildVerifier();
+  if (options.claimed && (!validEntry(options.claimed) || !options.agentId || options.claimed.agentId !== options.agentId)) {
+    throw new HelperError('BUILD_NOT_ACCEPTED', 'The claimed build does not belong to this agent.');
+  }
+  const locks = await Promise.all([new LockStore(options.paths, options.helperId).read(), new LockStore(options.paths, options.helperId, 'agent-lock.json').read()]);
+  const current = options.agentId ? locks[1].entries.filter(entry => entry.agentId === options.agentId) : locks[0].entries;
+  // A newer accepted version may replace the claim's lock. Removal still fences
+  // the destination, and revocations below still fence the claimed bytes.
+  if (options.claimed && !current.some(entry => !entry.removed && entryKey(entry) === entryKey(options.claimed!))) {
+    throw new HelperError('BUILD_NOT_ACCEPTED', 'The claimed skill is no longer accepted for this agent.');
+  }
+  const accepted = (options.claimed ? [options.claimed] : current).find(entry => entry.digest === digest && !entry.removed &&
+    (!options.accepted || entryKey(entry) === entryKey(options.accepted)));
+  if (!accepted) throw new HelperError('BUILD_NOT_ACCEPTED', 'This build is not the accepted version for this tool or agent.');
+  const envelope = JSON.parse(await readPrivateFile(cachedEnvelope(options.paths, digest, accepted.signature), 16 * 1024 * 1024));
+  // Sync persists revocations before replacing acceptance. Read them after the
+  // lock and cache so a restored destination cannot authorize revoked claimed bytes.
   let revoked: SyncPlan['revoked'] = [];
   try {
     const meta: SyncMeta = JSON.parse(await readPrivateFile(join(options.paths.data, 'sync-meta.json'), 4 * 1024 * 1024));
@@ -73,11 +96,7 @@ export async function verifiedBuild(digest: string, options: {paths: HelperPaths
     revoked = meta.revoked;
   } catch (error) { if (!absent(error)) throw error; }
   revoked = [...revoked, ...options.revoked ?? []];
-  const locks = await Promise.all([new LockStore(options.paths, options.helperId).read(), new LockStore(options.paths, options.helperId, 'agent-lock.json').read()]);
-  const accepted = (options.agentId ? locks[1].entries.filter(entry => entry.agentId === options.agentId) : locks[0].entries).find(entry => entry.digest === digest && !entry.removed &&
-    (!options.accepted || entryKey(entry) === entryKey(options.accepted)));
-  if (!accepted) throw new HelperError('BUILD_NOT_ACCEPTED', 'This build is not the accepted version for this tool or agent.');
-  const build = verifier.verifyCached(JSON.parse(await readPrivateFile(cachedEnvelope(options.paths, digest, accepted.signature), 16 * 1024 * 1024)), digest, revoked);
+  const build = verifier.verifyCached(envelope, digest, revoked);
   if (entryKey(accepted) !== entryKey(build.build) || accepted.version !== build.build.version || accepted.settingsRevision !== build.build.settingsRevision || accepted.signature !== build.build.signature) {
     throw new HelperError('BUILD_CACHE_INVALID', 'The cached envelope does not match its accepted version.');
   }
@@ -311,8 +330,27 @@ export class SyncEngine {
   private async localDigest(folder: string): Promise<string | null> {
     try { return treeDigest(await readSkillTree(folder, this.options.paths.home)); } catch { return null; }
   }
+  private async agentInventory(): Promise<AgentManagedInventory[]> {
+    const lock = await this.agentLocks.read(), managed: AgentManagedInventory[] = [];
+    for (const entry of lock.entries.filter(entry => !entry.removed)) {
+      let state: ManagedInventory['state'] = 'missing', localDigest: string | null = null;
+      try {
+        // An agent runs its accepted signed cache, independently of the tool's route.
+        const envelope = JSON.parse(await readPrivateFile(cachedEnvelope(this.options.paths, entry.digest, entry.signature), 16 * 1024 * 1024));
+        const {build} = this.verifier.verifyCached(envelope, entry.digest, this.meta.revoked);
+        if (!(['skillId', 'target', 'name', 'workspaceId', 'version', 'settingsRevision', 'digest', 'keyId', 'signature', 'draft'] as const)
+          .every(field => build[field] === entry[field])) throw new HelperError('BUILD_CACHE_INVALID', 'The cached envelope does not match its accepted version.');
+        state = 'ok'; localDigest = entry.digest;
+      } catch (error) { if (!absent(error)) state = 'edited'; }
+      managed.push({agentId: entry.agentId!, skillId: entry.skillId, target: entry.target, name: entry.name, version: entry.version,
+        settingsRevision: entry.settingsRevision, digest: entry.digest, localDigest, state});
+    }
+    return managed;
+  }
   async inventory(): Promise<SyncInventory> {
     const lock = await this.locks.read(); const managed: ManagedInventory[] = [];
+    const agentLock = await this.agentLocks.read();
+    const agentManaged = await this.agentInventory();
     const live = lock.entries.filter(entry => !entry.removed);
     const links = await discoverManagedLinks({paths: this.options.paths, managed: live, verifier: this.verifier, helperIds: this.locks.knownIds(lock)});
     const heldKeys = new Set<string>();
@@ -363,9 +401,12 @@ export class SyncEngine {
       return conflict ? [entryKey(conflict)] : [];
     }));
     this.conflictSnapshots.set(unmanaged, (this.conflictSnapshots.get(extras.unmanaged) ?? []).filter(snapshot => reportedConflicts.has(entryKey(snapshot))));
-    return {helperVersion: VERSION, computerName: this.options.computerName ?? 'Computer', os: 'macos', tokenStorage: this.options.tokenStorage ?? 'keychain',
-      tools: (this.options.tools ?? []).map(tool => ({tool: tool.tool, variant: tool.variant, version: tool.version, models: tool.models.slice(0, 50), syncOnly: tool.syncOnly})), managed,
+    // Preserve the legacy constructor default. Production always supplies the
+    // paired backend; running a sync client on Linux cannot select file storage.
+    return {helperVersion: VERSION, computerName: this.options.computerName ?? 'Computer', os: helperOs(this.options.paths.platform), tokenStorage: this.options.tokenStorage ?? 'keychain',
+      tools: (this.options.tools ?? []).map(tool => ({tool: tool.tool, variant: tool.variant, version: tool.version, models: tool.models.slice(0, 50), syncOnly: tool.syncOnly})), managed, agentManaged,
       unmanaged, duplicates: extras.duplicates.slice(0, 2000), holdingCount, capabilities: {allow: true, 'linked-replacement': true},
+      previousHelperIds: [...new Set([...(lock.previousHelperIds ?? []), ...(agentLock.previousHelperIds ?? [])])].slice(-20),
       ...(waitingForAllow ? {waitingForAllow} : {}),
       deliveryErrors: [...this.errors.values()]};
   }
@@ -465,91 +506,102 @@ export class SyncEngine {
         persistedRevoked = saved.revoked;
       } catch (error) {if (!absent(error)) throw error;}
       plan = {...plan, revoked: [...new Map([...persistedRevoked, ...this.meta.revoked, ...plan.revoked].map(entry => [entry.digest, entry])).values()]};
-      await beforeApply?.(plan);
-      this.readCopyRetries.clear();
-      this.meta = {...this.meta, revoked: plan.revoked, pollAfterSeconds: plan.pollAfterSeconds, degraded: plan.degraded};
-      await atomicWrite(join(this.options.paths.data, 'sync-meta.json'), JSON.stringify(this.meta) + '\n');
-      const imports = new ImportEngine({paths: this.options.paths, helperId: this.options.helperId, client: this.options.client,
-        targets: this.options.targets, verifier: this.verifier, timing: this.timing, output: this.options.output});
-      let retryInstructions = false;
-      try {await imports.rememberInstructions(plan.instructions);}
-      catch (error) {this.importRetry(error); retryInstructions = true;}
-      try { await this.holding.reconcile(plan.items, plan.revoked, plan.degraded); }
-      catch (error) { this.holdingFailure(error); }
-      // New revocation evidence takes priority over an interrupted placement.
-      const stuck = await this.recoverPending();
-      const outcomes = new Map<string, boolean>(), visiting = new Set<string>(), written = new Map<string, PlanItem>();
-      let retryUpload: unknown;
-      const apply = async (item: PlanItem): Promise<boolean> => {
-        if (outcomes.has(item.itemId)) return outcomes.get(item.itemId)!;
-        if (stuck.has(entryKey(item))) { outcomes.set(item.itemId, false); return false; }
-        if (visiting.has(item.itemId)) throw new HelperError('DEPENDENCY_CYCLE', 'The plan contains a dependency cycle.');
-        visiting.add(item.itemId);
-        const localChoice = item.kind === 'local_newer' && item.answer === 'keep_local' && item.state === 'kept_local';
-        if ((item.state !== 'approved' && item.state !== 'held' && item.state !== 'forced' && !localChoice) ||
-            (plan.degraded && !(item.state === 'forced' && ['revoked', 'security_fix'].includes(item.reason ?? '')))) { outcomes.set(item.itemId, false); return false; }
-        try {
-          if (item.kind === 'local_newer' && ['keep_local', 'send_proposal', 'publish'].includes(item.answer ?? '')) {
-            const ready = await this.applyLocalChoice(item, plan.instructions);
-            if (ready) this.errors.delete(entryKey(item));
-            outcomes.set(item.itemId, ready); return ready;
-          }
-          if (item.kind !== 'forced_remove') {
-            if (item.missingDependencies.length) throw new HelperError('DEPENDENCY_MISSING', 'The skill has a missing hard dependency.');
-            for (const dependency of plan.items.filter(value => value.dependencyOf === item.itemId)) {
-              if (!await apply(dependency)) throw new HelperError('DEPENDENCY_HELD', 'A hard dependency is not ready.');
+      // Revocation is digest-wide and may invalidate an older claimed envelope
+      // after acceptance advanced. Fence every existing agent destination before
+      // publishing new evidence, plus every destination changed by this plan.
+      const newRevocations = plan.revoked.some(entry => !persistedRevoked.some(saved => saved.digest === entry.digest));
+      const destinations = plan.items.flatMap(item => item.forAgentIds.map(agentId => ({...item, agentId})));
+      await withAgentDestinationLocks(this.options.paths, [...destinations,
+        ...(newRevocations ? (await this.agentLocks.read()).entries : [])], async () => {
+        await beforeApply?.(plan);
+        this.readCopyRetries.clear();
+        this.meta = {...this.meta, revoked: plan.revoked, pollAfterSeconds: plan.pollAfterSeconds, degraded: plan.degraded};
+        await atomicWrite(join(this.options.paths.data, 'sync-meta.json'), JSON.stringify(this.meta) + '\n');
+        const imports = new ImportEngine({paths: this.options.paths, helperId: this.options.helperId, client: this.options.client,
+          targets: this.options.targets, verifier: this.verifier, timing: this.timing, output: this.options.output});
+        let retryInstructions = false;
+        try {await imports.rememberInstructions(plan.instructions);}
+        catch (error) {this.importRetry(error); retryInstructions = true;}
+        try { await this.holding.reconcile(plan.items, plan.revoked, plan.degraded); }
+        catch (error) { this.holdingFailure(error); }
+        // New revocation evidence takes priority over an interrupted placement.
+        const stuck = await this.recoverPending();
+        const outcomes = new Map<string, boolean>(), visiting = new Set<string>(), written = new Map<string, PlanItem>();
+        let retryUpload: unknown;
+        const apply = async (item: PlanItem): Promise<boolean> => {
+          if (outcomes.has(item.itemId)) return outcomes.get(item.itemId)!;
+          if (stuck.has(entryKey(item))) { outcomes.set(item.itemId, false); return false; }
+          if (visiting.has(item.itemId)) throw new HelperError('DEPENDENCY_CYCLE', 'The plan contains a dependency cycle.');
+          visiting.add(item.itemId);
+          const localChoice = item.kind === 'local_newer' && item.answer === 'keep_local' && item.state === 'kept_local';
+          if ((item.state !== 'approved' && item.state !== 'held' && item.state !== 'forced' && !localChoice) ||
+              (plan.degraded && !(item.state === 'forced' && ['revoked', 'security_fix'].includes(item.reason ?? '')))) { outcomes.set(item.itemId, false); return false; }
+          try {
+            if (item.kind === 'local_newer' && ['keep_local', 'send_proposal', 'publish'].includes(item.answer ?? '')) {
+              const ready = await this.applyLocalChoice(item, plan.instructions);
+              if (ready) this.errors.delete(entryKey(item));
+              outcomes.set(item.itemId, ready); return ready;
             }
+            if (item.kind !== 'forced_remove') {
+              if (item.missingDependencies.length) throw new HelperError('DEPENDENCY_MISSING', 'The skill has a missing hard dependency.');
+              for (const dependency of plan.items.filter(value => value.dependencyOf === item.itemId)) {
+                if (!await apply(dependency)) throw new HelperError('DEPENDENCY_HELD', 'A hard dependency is not ready.');
+              }
+            }
+            const key = entryKey(item);
+            const duplicate = item.forAgentIds.length ? undefined : written.get(key);
+            const afterRemoval = duplicate?.kind === 'forced_remove' && duplicate.route === item.route &&
+              (item.kind === 'forced_restore' && item.state === 'forced' ||
+                ['approved', 'held'].includes(item.state) && item.version > duplicate.version);
+            if (duplicate && !afterRemoval) {
+              if (duplicate.route !== item.route || duplicate.digest !== item.digest || duplicate.version !== item.version || duplicate.settingsRevision !== item.settingsRevision) throw new HelperError('PLAN_CONFLICT', 'The plan gives conflicting destinations or versions for one skill.');
+              outcomes.set(item.itemId, true); return true;
+            }
+            const ready = await this.applyItem(item, plan.revoked);
+            if (ready) {
+              if (!item.forAgentIds.length) written.set(key, item);
+              this.errors.delete(key);
+            }
+            outcomes.set(item.itemId, ready); return ready;
+          } catch (error) {
+            this.error(item, error);
+            const code = codeFor(error);
+            const upload = item.kind === 'local_newer' && ['send_proposal', 'publish'].includes(item.answer ?? '');
+            if (code.startsWith('TOKEN_') || (error instanceof ApiError && (error.status === 401 || error.code === 'SCOPE_MISSING'))) throw error;
+            if (!upload && (error instanceof ApiError || code.startsWith('API_'))) throw error;
+            if (upload && (['API_TIMEOUT', 'API_CONNECTION_FAILED', 'API_RESPONSE_INVALID', 'API_FAILED'].includes(code) ||
+                (error instanceof ApiError && (error.status >= 500 || [408, 429].includes(error.status))))) retryUpload ??= error;
+            outcomes.set(item.itemId, false); return false;
           }
-          const key = entryKey(item);
-          const duplicate = item.forAgentIds.length ? undefined : written.get(key);
-          if (duplicate && !(duplicate.kind === 'forced_remove' && item.kind === 'forced_restore' && item.state === 'forced')) {
-            if (duplicate.route !== item.route || duplicate.digest !== item.digest || duplicate.version !== item.version || duplicate.settingsRevision !== item.settingsRevision) throw new HelperError('PLAN_CONFLICT', 'The plan gives conflicting destinations or versions for one skill.');
-            outcomes.set(item.itemId, true); return true;
+          finally {
+            visiting.delete(item.itemId);
+            if (await this.locks.pending(entryKey(item))) stuck.add(entryKey(item));
           }
-          const ready = await this.applyItem(item, plan.revoked);
-          if (ready) {
-            if (!item.forAgentIds.length) written.set(key, item);
-            this.errors.delete(key);
+        };
+        for (const item of plan.items) {
+          await apply(item);
+        }
+        if (!plan.degraded && !retryInstructions) {
+          try {
+            await imports.executeInstructions();
+          } catch (error) {
+            this.importRetry(error);
+            // A local retry may have prevented journaling the click. Fetch its full plan again.
+            retryInstructions = plan.instructions.length > 0;
           }
-          outcomes.set(item.itemId, ready); return ready;
-        } catch (error) {
-          this.error(item, error);
-          const code = codeFor(error);
-          const upload = item.kind === 'local_newer' && ['send_proposal', 'publish'].includes(item.answer ?? '');
-          if (code.startsWith('TOKEN_') || (error instanceof ApiError && (error.status === 401 || error.code === 'SCOPE_MISSING'))) throw error;
-          if (!upload && (error instanceof ApiError || code.startsWith('API_'))) throw error;
-          if (upload && (['API_TIMEOUT', 'API_CONNECTION_FAILED', 'API_RESPONSE_INVALID', 'API_FAILED'].includes(code) ||
-              (error instanceof ApiError && (error.status >= 500 || [408, 429].includes(error.status))))) retryUpload ??= error;
-          outcomes.set(item.itemId, false); return false;
         }
-        finally {
-          visiting.delete(item.itemId);
-          if (await this.locks.pending(entryKey(item))) stuck.add(entryKey(item));
+        // An Allow retry may reuse the already remembered held-plan revision.
+        // Keep fetching its full plan until the tool's refreshed copy is observed.
+        if (this.readCopyRetries.size && this.meta.planRevision === plan.planRevision) {
+          this.meta.planRevision = null;
+          await atomicWrite(join(this.options.paths.data, 'sync-meta.json'), JSON.stringify(this.meta) + '\n');
         }
-      };
-      for (const item of plan.items) {
-        await apply(item);
-      }
-      if (!plan.degraded && !retryInstructions) {
-        try {
-          await imports.executeInstructions();
-        } catch (error) {
-          this.importRetry(error);
-          // A local retry may have prevented journaling the click. Fetch its full plan again.
-          retryInstructions = plan.instructions.length > 0;
+        if (retryUpload === undefined && !this.readCopyRetries.size && !retryInstructions && !(await this.locks.allPending()).length) {
+          this.meta.planRevision = plan.planRevision;
+          await atomicWrite(join(this.options.paths.data, 'sync-meta.json'), JSON.stringify(this.meta) + '\n');
         }
-      }
-      // An Allow retry may reuse the already remembered held-plan revision.
-      // Keep fetching its full plan until the tool's refreshed copy is observed.
-      if (this.readCopyRetries.size && this.meta.planRevision === plan.planRevision) {
-        this.meta.planRevision = null;
-        await atomicWrite(join(this.options.paths.data, 'sync-meta.json'), JSON.stringify(this.meta) + '\n');
-      }
-      if (retryUpload === undefined && !this.readCopyRetries.size && !retryInstructions && !(await this.locks.allPending()).length) {
-        this.meta.planRevision = plan.planRevision;
-        await atomicWrite(join(this.options.paths.data, 'sync-meta.json'), JSON.stringify(this.meta) + '\n');
-      }
-      if (retryUpload !== undefined) throw retryUpload;
+        if (retryUpload !== undefined) throw retryUpload;
+      }, this.timing);
     }, this.timing);
     const duplicatesAfter = JSON.stringify(await this.localCopyQuestions());
     if (duplicatesBefore !== duplicatesAfter || this.duplicateRevision !== duplicatesAfter) this.notifyChange();

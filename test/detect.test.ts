@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -95,7 +95,7 @@ for (const acceptance of [
     assert.equal(cli.syncOnly, acceptance.syncOnly);
     assert.deepEqual(cli.detect.binaries, acceptance.binaries);
     assert.deepEqual(tool.run, {
-      adapter: acceptance.adapter, card: acceptance.card, offered: false, folderOnly: 'none',
+      adapter: acceptance.adapter, card: acceptance.card, offered: false, platforms: {darwin: {accepted: false}, linux: {accepted: false}}, folderOnly: 'none',
       mcpLevel: 'tools-denied', reason: acceptance.reason, checkedAt: '2026-10-21',
     });
   });
@@ -110,7 +110,7 @@ test('detection records matched CLI paths locally and reports no executable loca
     const bin = join(f.home, 'bin', 'codex');
     await executable(bin);
     tool.variants[0].detect.binaries = [bin];
-    const found = await detectTools({home: f.home, env: {}, matrix: f.matrix,
+    const found = await detectTools({platform: 'darwin', home: f.home, env: {}, matrix: f.matrix,
       runner: async () => ({stdout: 'codex-cli 1.2.3\n', stderr: ''})});
     assert.equal(found.length, 1);
     assert.equal(found[0].path, bin);
@@ -120,6 +120,115 @@ test('detection records matched CLI paths locally and reports no executable loca
     assert.equal(Object.hasOwn(report, 'path'), false);
     assert.equal(Object.hasOwn(report, 'realpath'), false);
   } finally { await f.cleanup(); }
+});
+
+test('Linux discovery is static for every unaccepted tool, including sync-only tools', async () => {
+  const { home, matrix, cleanup } = await fixture();
+  try {
+    const expected = [];
+    for (const tool of matrix.tools) {
+      assert.notEqual(tool.run?.platforms?.linux?.accepted, true);
+      for (const variant of tool.variants) {
+        if (!variant.detect.binaries.length) continue;
+        const binary = join(home, 'bin', `${tool.key}-${variant.key}`);
+        await executable(binary);
+        variant.detect.binaries = [binary];
+        variant.models = { args: ['fixture-models'], pattern: '^([a-z0-9-]+)$' };
+        expected.push({ tool: tool.key, variant: variant.key, binary, syncOnly: variant.syncOnly });
+      }
+    }
+    assert(expected.some(found => found.syncOnly));
+    const calls: string[] = [];
+    const found = await detectTools({platform: 'linux', home, matrix, env: {}, runner: async file => {
+      calls.push(file);
+      return {stdout: '1.2.3\n', stderr: ''};
+    }});
+    assert.equal(found.length, expected.length);
+    for (const entry of expected) {
+      const detected = found.find(tool => tool.tool === entry.tool && tool.variant === entry.variant)!;
+      assert.equal(detected.path, entry.binary);
+      assert.equal(detected.realpath, await realpath(entry.binary));
+      assert.match(detected.fingerprint!, /^\d+:\d+:\d+:\d+:\d+$/u);
+      assert.equal(detected.versionVerified, false);
+      assert.equal(detected.version, null);
+      assert.deepEqual(detected.models, []);
+      assert.equal(detected.syncOnly, entry.syncOnly);
+    }
+    assert.deepEqual(calls, [], 'Neither version nor model discovery may dispatch an unaccepted Linux tool.');
+    const {reportedTools} = await import('../src/pairing.js');
+    assert.deepEqual(reportedTools(found), expected.map(entry => ({tool: entry.tool, variant: entry.variant,
+      version: null, models: [], syncOnly: entry.syncOnly})));
+  } finally { await cleanup(); }
+});
+
+test('static Linux discovery records canonical paths and changing file fingerprints without claiming a verified version', async () => {
+  const { home, matrix, cleanup } = await fixture();
+  try {
+    const tool = matrix.tools.find(tool => tool.key === 'codex')!;
+    const variant = tool.variants.find(variant => variant.key === 'cli')!;
+    matrix.tools = [tool]; tool.variants = [variant];
+    const binary = join(home, 'bin/codex'), canonical = join(home, 'installed/codex');
+    await executable(canonical); await mkdir(dirname(binary), {recursive: true}); await symlink(canonical, binary);
+    variant.detect.binaries = ['codex'];
+    const options = {platform: 'linux' as const, home, matrix, env: {PATH: dirname(binary)}, runner: async () => {
+      assert.fail('Static discovery must never dispatch the executable.');
+    }};
+    const [first] = await detectTools(options);
+    const info = await stat(canonical, {bigint: true});
+    assert.equal(first.path, binary); assert.equal(first.realpath, canonical);
+    assert.equal(first.fingerprint, [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':'));
+    await writeFile(canonical, 'changed fixture executable');
+    const [second] = await detectTools(options);
+    assert.notEqual(second.fingerprint, first.fingerprint);
+    assert.equal(second.version, null); assert.equal(second.versionVerified, false);
+  } finally { await cleanup(); }
+});
+
+test('static Linux discovery still rejects a Cursor path aliased to the Grok agent', async () => {
+  const { home, matrix, cleanup } = await fixture();
+  try {
+    const tool = matrix.tools.find(tool => tool.key === 'cursor')!;
+    matrix.tools = [tool]; tool.variants = [tool.variants.find(variant => variant.key === 'cli')!];
+    const grok = join(home, '.grok/bin/agent'), cursor = join(home, '.local/bin/cursor-agent');
+    await executable(grok); await mkdir(dirname(cursor), {recursive: true}); await symlink(grok, cursor);
+    let dispatched = 0;
+    assert.deepEqual(await detectTools({platform: 'linux', home, matrix, env: {}, runner: async () => {
+      dispatched++; return {stdout: '2026.10.14-0f9edde\n', stderr: ''};
+    }}), []);
+    assert.equal(dispatched, 0);
+  } finally { await cleanup(); }
+});
+
+test('Linux discovery requires explicit Linux acceptance and preserves accepted executable version and model probes', async () => {
+  const { home, matrix, cleanup } = await fixture();
+  try {
+    const tool = matrix.tools.find(tool => tool.key === 'deepseek-harness')!;
+    const variant = tool.variants.find(variant => variant.key === 'cli')!;
+    matrix.tools = [tool]; tool.variants = [variant];
+    const binary = join(home, 'bin/dsh'); await executable(binary); variant.detect.binaries = [binary];
+    variant.models = {args: ['fixture-models'], pattern: '^([a-z0-9/-]+)$'};
+    const run = structuredClone(tool.run!);
+    const calls: (readonly string[])[] = [];
+    const runner: Runner = async (_file, args) => {
+      calls.push([...args]);
+      return {stdout: args[0] === '--version' ? '1.2.3\n' : 'fixture/model\n', stderr: ''};
+    };
+    for (const platforms of [undefined, {}, {darwin: {accepted: true}}, {darwin: {accepted: true}, linux: {accepted: false}}]) {
+      tool.run = {...run, offered: true, ...(platforms === undefined ? {} : {platforms})};
+      if (platforms === undefined) delete tool.run.platforms;
+      const [found] = await detectTools({platform: 'linux', home, matrix, env: {}, runner});
+      assert.equal(found.version, null); assert.equal(found.versionVerified, false);
+      assert.deepEqual(calls, []);
+    }
+    tool.run = null;
+    const [withoutRun] = await detectTools({platform: 'linux', home, matrix, env: {}, runner});
+    assert.equal(withoutRun.version, null); assert.equal(withoutRun.versionVerified, false);
+    assert.deepEqual(calls, []);
+    tool.run = {...run, platforms: {darwin: {accepted: false}, linux: {accepted: true}}};
+    assert.deepEqual(await detectTools({platform: 'linux', home, matrix, env: {}, runner}), [{tool: 'deepseek-harness', variant: 'cli',
+      version: '1.2.3', models: ['fixture/model'], path: binary, realpath: binary, syncOnly: false}]);
+    assert.deepEqual(calls, [['--version'], ['fixture-models']]);
+  } finally { await cleanup(); }
 });
 
 test('loader validates paths, dates, regexes, identities, model pairs and route references', () => {
@@ -243,6 +352,7 @@ test('colocated matrix loader works in the repository and a copied exported src/
     await mkdir(shared, { recursive: true });
     await writeFile(join(temp, 'package.json'), '{"type":"module"}');
     await copyFile(fileURLToPath(new URL('../src/shared/tool-matrix.ts', import.meta.url)), join(shared, 'tool-matrix.ts'));
+    await copyFile(fileURLToPath(new URL('../src/shared/tool-capabilities.ts', import.meta.url)), join(shared, 'tool-capabilities.ts'));
     await copyFile(fileURLToPath(new URL('../src/shared/tool-matrix.json', import.meta.url)), join(shared, 'tool-matrix.json'));
     await copyFile(fileURLToPath(new URL('../src/shared/helper-protocol.ts', import.meta.url)), join(shared, 'helper-protocol.ts'));
     await copyFile(fileURLToPath(new URL('../src/shared/skill-limits.ts', import.meta.url)), join(shared, 'skill-limits.ts'));
@@ -285,7 +395,7 @@ test('fixture homes detect every tool, versions, PATH binaries, absolute Grok an
       assert.deepEqual(args, ['--version']);
       return { stdout: tool === 'cursor' ? '2026.10.14-0f9edde' : '1.2.3', stderr: '' };
     };
-    const found = await detectTools({ home, env: { PATH: join(home, 'bin'), SOME_TOKEN: 'never-forward', API_KEY: 'never-forward', SECRET: 'never-forward' }, matrix, runner });
+    const found = await detectTools({ platform: 'darwin', home, env: { PATH: join(home, 'bin'), SOME_TOKEN: 'never-forward', API_KEY: 'never-forward', SECRET: 'never-forward' }, matrix, runner });
     assert.equal(found.length, 16);
     assert.deepEqual(new Set(found.map((tool) => tool.tool)), new Set(matrix.tools.map((tool) => tool.key)));
     for (const tool of found) {
@@ -316,21 +426,21 @@ test('DeepSeek Harness accepts only one bare stdout version line and never probe
         calls.push(file);
         return { stdout, stderr: '' };
       };
-      assert.deepEqual(await detectTools({ home, matrix, runner, env: { PATH: '' } }), detected(stdout.trim()));
+      assert.deepEqual(await detectTools({ platform: 'darwin', home, matrix, runner, env: { PATH: '' } }), detected(stdout.trim()));
       assert.deepEqual(calls, [binary]);
     }
     for (const stdout of ['', 'dsh 0.2.0-rc.2\n', "Dancer's shell version 0.25.10\n", 'v0.2.0-rc.2\n',
       '0.2\n', ' 0.2.0-rc.2\n', '0.2.0-rc.2 \n', 'banner\n0.2.0-rc.2\n', '0.2.0-rc.2\nwarning\n',
       '0.2.0-rc.2\n0.2.0-rc.2\n', '0.2.0-rc.2\n\n', '\n0.2.0-rc.2\n', '0.2.0-rc.2\u0000\n']) {
       const runner: Runner = async () => ({ stdout, stderr: '' });
-      assert.deepEqual(await detectTools({ home, matrix, runner, env: { PATH: '' } }), [], JSON.stringify(stdout));
+      assert.deepEqual(await detectTools({ platform: 'darwin', home, matrix, runner, env: { PATH: '' } }), [], JSON.stringify(stdout));
     }
     for (const output of [{ stdout: '', stderr: '0.2.0-rc.2\n' }, { stdout: '0.2.0-rc.2\n', stderr: 'warning\n' }]) {
       const runner: Runner = async () => output;
-      assert.deepEqual(await detectTools({ home, matrix, runner, env: { PATH: '' } }), []);
+      assert.deepEqual(await detectTools({ platform: 'darwin', home, matrix, runner, env: { PATH: '' } }), []);
     }
     const broken: Runner = async () => { throw new Error('version command failed'); };
-    assert.deepEqual(await detectTools({ home, matrix, runner: broken, env: { PATH: '' } }), []);
+    assert.deepEqual(await detectTools({ platform: 'darwin', home, matrix, runner: broken, env: { PATH: '' } }), []);
   } finally { await cleanup(); }
 });
 
@@ -345,10 +455,10 @@ test('DeepSeek Harness prefers its home binary, falls back to PATH, and detects 
       return { stdout: file === local ? '0.2.0-rc.2\n' : '0.2.0-rc.1\n', stderr: '' };
     };
     const env = { PATH: join(home, 'bin') };
-    assert.equal((await detectTools({ home, matrix, runner, env }))[0].version, '0.2.0-rc.1');
+    assert.equal((await detectTools({ platform: 'darwin', home, matrix, runner, env }))[0].version, '0.2.0-rc.1');
     assert.deepEqual(calls.splice(0), [path]);
     await executable(local);
-    const found = await detectTools({ home, matrix, runner, env });
+    const found = await detectTools({ platform: 'darwin', home, matrix, runner, env });
     assert.equal(found.length, 1);
     assert.equal(found[0].version, '0.2.0-rc.2');
     assert.deepEqual(calls.splice(0), [local]);
@@ -356,12 +466,15 @@ test('DeepSeek Harness prefers its home binary, falls back to PATH, and detects 
       calls.push(file);
       return { stdout: file === local ? 'distributed shell 0.25.10\n' : '0.2.0-rc.2\n', stderr: '' };
     };
-    assert.equal((await detectTools({ home, matrix, runner: wrongLocal, env }))[0].version, '0.2.0-rc.2');
+    assert.equal((await detectTools({ platform: 'darwin', home, matrix, runner: wrongLocal, env }))[0].version, '0.2.0-rc.2');
     assert.deepEqual(calls, [local, path]);
   } finally { await cleanup(); }
 });
 
-test('apps use plutil, IDE installation manifests report versions, and stale settings do not count as CLIs', async () => {
+for (const platform of ['darwin', 'linux'] as const) test(platform === 'darwin'
+  ? 'apps use plutil, IDE installation manifests report versions, and stale settings do not count as CLIs'
+  : 'unaccepted Linux manifest-only discovery ignores macOS apps and reports an unverified IDE version without executing a tool',
+async () => {
   const { home, matrix, cleanup } = await fixture();
   try {
     const codex = matrix.tools.find((tool) => tool.key === 'codex')!;
@@ -375,15 +488,20 @@ test('apps use plutil, IDE installation manifests report versions, and stale set
     await writeFile(manifest, JSON.stringify({ name: 'chatgpt', version: '1.0.0' }));
     await mkdir(join(home, '.claude'), { recursive: true });
     await writeFile(join(home, '.claude/settings.json'), '{}');
+    let commands = 0;
     const runner: Runner = async (file, args) => {
+      commands++;
+      assert.equal(platform, 'darwin', 'Linux app and IDE detection must not invoke plutil or a CLI.');
       assert.equal(file, '/usr/bin/plutil');
       assert.deepEqual(args, ['-convert', 'json', '-o', '-', info]);
       return { stdout: JSON.stringify({ CFBundleIdentifier: 'com.openai.chat', CFBundleShortVersionString: '3.2.1' }), stderr: '' };
     };
-    assert.deepEqual(await detectTools({ home, matrix, runner, env: { PATH: '' } }), [
-      { tool: 'codex', variant: 'desktop', version: '3.2.1', models: [], syncOnly: true },
-      { tool: 'codex', variant: 'ide', version: '1.0.0', models: [], syncOnly: true },
+    assert.deepEqual(await detectTools({ platform, home, matrix, runner, env: { PATH: '' } }), [
+      ...(platform === 'darwin' ? [{ tool: 'codex', variant: 'desktop', version: '3.2.1', models: [], syncOnly: true }] : []),
+      { tool: 'codex', variant: 'ide', version: platform === 'darwin' ? '1.0.0' : null,
+        ...(platform === 'linux' ? {versionVerified: false as const} : {}), models: [], syncOnly: true },
     ]);
+    assert.equal(commands, platform === 'darwin' ? 1 : 0);
     assert.equal(JSON.parse(await readFile(manifest, 'utf8')).version, '1.0.0');
   } finally { await cleanup(); }
 });
@@ -397,12 +515,12 @@ test('Cursor never runs Grok agent directly or through realpath aliases and reje
     await symlink(grokAgent, join(home, 'bin/agent'));
     const calls: string[] = [];
     const runner: Runner = async (file) => { calls.push(file); return { stdout: '2026.10.14-0f9edde', stderr: '' }; };
-    assert.deepEqual(await detectTools({ home, matrix, runner, env: { PATH: `${join(home, '.grok/bin')}:${join(home, 'bin')}` } }), []);
+    assert.deepEqual(await detectTools({ platform: 'darwin', home, matrix, runner, env: { PATH: `${join(home, '.grok/bin')}:${join(home, 'bin')}` } }), []);
     assert.deepEqual(calls, []);
     await executable(join(home, '.local/bin/cursor-agent'));
     const wrongIdentity: Runner = async () => ({ stdout: 'Grok Agent 0.2.20', stderr: '' });
-    assert.deepEqual(await detectTools({ home, matrix, runner: wrongIdentity, env: { PATH: '' } }), []);
-    const found = await detectTools({ home, matrix, runner, env: { PATH: '' } });
+    assert.deepEqual(await detectTools({ platform: 'darwin', home, matrix, runner: wrongIdentity, env: { PATH: '' } }), []);
+    const found = await detectTools({ platform: 'darwin', home, matrix, runner, env: { PATH: '' } });
     assert.equal(found.length, 1);
     assert.equal(found[0].tool, 'cursor');
     assert.deepEqual(calls, [join(home, '.local/bin/cursor-agent')]);
@@ -416,7 +534,7 @@ test('model discovery is unique, bounded at fifty, and command failure keeps the
     await executable(binary);
     const output = ['header with spaces', 'first/model', 'first/model', 'bad\u0000model', ...Array.from({ length: 70 }, (_, index) => `local/model-${index}`)].join('\n');
     const runner: Runner = async (_file, args) => ({ stdout: args[0] === '--version' ? 'Grok CLI 1.0.52' : output, stderr: '' });
-    const found = await detectTools({ home, matrix, runner, env: { PATH: '' } });
+    const found = await detectTools({ platform: 'darwin', home, matrix, runner, env: { PATH: '' } });
     assert.equal(found[0].models.length, 50);
     assert.equal(found[0].models[0], 'first/model');
     assert.equal(new Set(found[0].models).size, 50);
@@ -424,7 +542,7 @@ test('model discovery is unique, bounded at fifty, and command failure keeps the
       if (args[0] !== '--version') throw new Error('not logged in');
       return { stdout: 'Grok CLI 1.0.52', stderr: '' };
     };
-    const failed = await detectTools({ home, matrix, runner: failModels, env: { PATH: '' } });
+    const failed = await detectTools({ platform: 'darwin', home, matrix, runner: failModels, env: { PATH: '' } });
     assert.equal(failed[0].version, '1.0.52');
     assert.deepEqual(failed[0].models, []);
   } finally { await cleanup(); }

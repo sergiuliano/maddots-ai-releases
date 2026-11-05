@@ -1,4 +1,16 @@
 {
+  "$defs": {
+    "AgentName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40,
+      "description": "At most 40 characters, in NFC (MadDots refuses non-NFC with 400 INVALID_REQUEST); no control/format characters, line/paragraph separators, @, leading/trailing/repeated whitespace or case-insensitive all. Blocks bidi overrides, zero-width characters and people-like @ tags.",
+      "examples": [
+        "Brief writer"
+      ],
+      "pattern": "^(?![Aa][Ll][Ll]$)(?!\\s)(?!.*\\s$)(?!.*\\s\\s)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}@]+$"
+    }
+  },
   "x-constants": {
     "limits": {
       "accessBoards": 200,

@@ -13,7 +13,7 @@ const newer: WaitingNotification[] = [{ skillId: 'skill-one', version: 2, digest
 async function fixture(t: { after(fn: () => Promise<void>): void }): Promise<HelperPaths> {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'maddots-notify-'));
   t.after(() => rm(home, { recursive: true, force: true }));
-  const paths = await createPaths(readConfig({}, home));
+  const paths = await createPaths(readConfig({}, home, 'darwin'));
   await ensurePrivateDirectory(paths.data);
   return paths;
 }
@@ -197,7 +197,7 @@ test('reserving shows nothing and a pending dialog leaves the helper write lock 
   assert.equal(calls, 0);
   if (typeof pending === 'string') assert.fail('a new waiting set must reserve a dialog');
   let completed = false;
-  const display = showWaitingDialog(pending, options).then(result => { completed = true; return result; });
+  const display = showWaitingDialog(pending, {...options, platform: 'darwin'}).then(result => { completed = true; return result; });
   try {
     assert.equal(calls, 1);
     let acquired = false;

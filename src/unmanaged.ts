@@ -7,7 +7,7 @@ import { scanSecrets } from './shared/skill-checks/secret-rules.js';
 import { isBackupSkillName, isBackupSkillPath } from './shared/skill-folder-names.js';
 import { HelperError } from './config.js';
 import { safeName } from './lock.js';
-import { assertNoSymlinks, inside, type HelperPaths } from './paths.js';
+import { assertNoSymlinks, inside, protectedHelperPaths, type HelperPaths } from './paths.js';
 import { readSkillTree } from './safe-fs.js';
 import { readStamp } from './stamp.js';
 import { BuildVerifier } from './verify.js';
@@ -27,7 +27,7 @@ const unsafe = () => new HelperError('PATH_UNSAFE', 'The skill folder must be in
 /** Reads may include Claude skills, but never helper, MCP, or credential storage. */
 function allowed(paths: HelperPaths, path: string): boolean {
   const home = resolve(paths.home), absolute = resolve(path);
-  const protectedPaths = [paths.data, '.config/ibl-projects-mcp', '.cache/maddots-mcp', '.ssh', '.aws', '.gnupg',
+  const protectedPaths = [...protectedHelperPaths(paths), '.config/ibl-projects-mcp', '.cache/maddots-mcp', '.ssh', '.aws', '.gnupg',
     '.config/op', 'Library/Keychains', 'Library/Group Containers/2BUA8C4S2C.com.1password', 'Library/LaunchAgents']
     .map(value => resolve(home, value));
   return absolute !== home && inside(home, absolute) && !protectedPaths.some(protectedPath => overlap(protectedPath, absolute));

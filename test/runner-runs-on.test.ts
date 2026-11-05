@@ -1,3 +1,4 @@
+import {directFixtureProcesses} from './native-process-fixture.js';
 import assert from 'node:assert/strict';
 import {readFileSync, statSync} from 'node:fs';
 import {randomUUID} from 'node:crypto';
@@ -17,15 +18,52 @@ import {AdapterRegistry} from '../src/runner/adapters/index.js';
 import {DeviceKeyStore} from '../src/runner/device-key.js';
 import {RunnerProtocolClient} from '../src/runner/protocol-client.js';
 import type {ProcessInspector} from '../src/runner/process.js';
+import {withLinuxOwnerContext} from '../src/runner/linux-lifecycle.js';
+import type {RunnerStorageOwner} from '../src/runner/storage-owner.js';
 import {RunsOnController, parseRunGrants, type RunsOnOptions} from '../src/runner/runs-on.js';
 import {RUN_TEST_PROMPT, recoverTestRuns, runToolTest, type RunTestConnection, type RunTestResult} from '../src/runner/test-run.js';
+
+const actualHostPlatform = process.platform;
+/** These historical fixtures model diagnostic process cleanup, not S3 native
+ * containment admission. Select only that legacy backend while real Linux
+ * lease bindings, migration recognition and /proc identity reads stay native. */
+function legacyDiagnosticProcessBackend(t: TestContext): void {
+  if (actualHostPlatform !== 'linux') return;
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const routes = new Map([
+    [fileURLToPath(new URL('../src/runner/process.ts', import.meta.url)),
+      new Set(['startTool', 'startPreparedTool', 'recoverProcess', 'verifyLegacyProcessAbsence'])],
+    [fileURLToPath(new URL('../src/runner/test-run.ts', import.meta.url)),
+      new Set(['runToolTest', 'recoverTestsUnlocked', 'executeToolTest'])],
+    [fileURLToPath(new URL('../src/runner/signal-gate.ts', import.meta.url)), new Set(['signalIfStillOwned'])],
+  ]);
+  const observed = new Set<string>();
+  function fixturePlatform(): NodeJS.Platform {
+    const previous = Error.prepareStackTrace;
+    let caller: NodeJS.CallSite | undefined;
+    try {
+      Error.prepareStackTrace = (_error, frames) => frames;
+      const trace = new Error(); Error.captureStackTrace(trace, fixturePlatform);
+      caller = (trace.stack as unknown as NodeJS.CallSite[])[0];
+    } finally {Error.prepareStackTrace = previous;}
+    const source = caller?.getFileName(), name = caller?.getFunctionName();
+    const file = source?.startsWith('file:') ? fileURLToPath(source) : source;
+    if (file && name && routes.get(file)?.has(name)) {observed.add(name); return 'darwin';}
+    return actualHostPlatform;
+  }
+  Object.defineProperty(process, 'platform', {configurable: descriptor.configurable, enumerable: descriptor.enumerable, get: fixturePlatform});
+  t.after(() => {
+    Object.defineProperty(process, 'platform', descriptor);
+    assert(observed.size > 0, 'the explicit legacy diagnostic backend must be exercised by this fixture');
+  });
+}
 
 const token = 'mdai_skill_' + 'A'.repeat(43);
 async function activationFixture(t: TestContext) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-runs-on-'));
   t.after(() => rm(root, {recursive: true, force: true}));
   const home = join(root, 'home'); await mkdir(home, {mode: 0o700});
-  const paths = await createPaths(readConfig({}, home)); await ensurePaths(paths);
+  const paths = await createPaths(readConfig({}, home, 'darwin')); await ensurePaths(paths);
   const items = new Map<string, string>(), writes: string[] = [];
   const runner: Runner = async (_binary, args, options) => {
     assert(!args.some(arg => arg.includes(token) || arg.includes('"format"')));
@@ -65,10 +103,13 @@ async function activationFixture(t: TestContext) {
   });
   const keys = new DeviceKeyStore({paths, secrets, helperId, api});
   const connection: RunTestConnection = {aiToolId, tool: 'codex', toolVersion: '1.0.0', bin: '/test/tool', realpath: '/test/tool'};
-  const options: RunsOnOptions = {paths, keys, connection: async id => id === aiToolId ? connection : undefined, now: () => now,
+  const matrix = structuredClone(TOOL_MATRIX);
+  // These historical transport-only callbacks model the ordinary accepted path.
+  matrix.tools.find(tool => tool.key === 'codex')!.run!.platforms!.darwin = {accepted: true};
+  const options: RunsOnOptions = {paths, matrix, keys, connection: async id => id === aiToolId ? connection : undefined, now: () => now,
     sleep: async milliseconds => {sleeps.push(milliseconds); now += milliseconds;},
     test: async (_connection, testOptions) => {tests++; models.push(testOptions.model); return testResult;},
-    protocol: key => new RunnerProtocolClient({endpoint: new URL('https://ai.maddots.app'), token: async () => token,
+    protocol: key => new RunnerProtocolClient({endpoint: new URL('https://ai.maddots.app'), helperId, aiToolId, token: async () => token,
       deviceKey: key, now: () => now, fetcher: async (input, init) => {
         const path = new URL(String(input)).pathname, headers = new Headers(init?.headers);
         const device = registeredKeys.get(headers.get(RUNNER_HEADERS.deviceKey)!);
@@ -171,15 +212,12 @@ test('malformed grants are rejected before touching keys', async t => {
 });
 
 const fakeTool = fileURLToPath(new URL('./fixtures/fake-tool.mjs', import.meta.url));
-const processes: ProcessInspector = {table: async () => [], fencePids: async () => [],
-  identity: async pid => {try {process.kill(pid, 0); return `test-${pid}`;} catch {return null;}},
-  // The echo fixture has no descendants. macOS rejects group signals to an unreaped zombie.
-  signalGroup: (pid, signal) => {try {process.kill(pid, signal);} catch (error) {if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;}}};
+const processes: ProcessInspector = directFixtureProcesses();
 async function toolFixture() {
   const bin = await realpath(process.execPath), seen: {spec?: RunSpec; argv?: string[]} = {};
   const matrix = structuredClone(TOOL_MATRIX);
-  matrix.tools.find(tool => tool.key === 'codex')!.run = {adapter: 'codex', card: 'TLS-26', offered: true,
-    folderOnly: 'os-sandbox', mcpLevel: 'servers-off', reason: null, checkedAt: '2026-10-14'};
+  matrix.tools.find(tool => tool.key === 'codex')!.run = {adapter: 'codex', card: 'TLS-26', offered: true, platforms: {darwin: {accepted: true}, linux: {accepted: true}},
+    folderOnly: actualHostPlatform === 'linux' ? 'none' : 'os-sandbox', mcpLevel: 'servers-off', reason: null, checkedAt: '2026-10-14'};
   const adapter: Adapter = {info: {tool: 'codex', harness: 'codex', card: 'TLS-26', folderOnly: 'os-sandbox',
     mcpLevel: 'servers-off', skillsDir: '{cwd}/.agents/skills', promptVia: 'stdin', runHome: false},
     supports: () => ({ok: true, reason: null}), identity: async () => ({ok: true, version: '1.0.0'}),
@@ -190,12 +228,14 @@ async function toolFixture() {
   return {adapter, registry: new AdapterRegistry([adapter]), matrix, connection, seen, processes};
 }
 
-test('test tool gets exact prompt, restricted offered mode, five minute deadline and disposable cwd', async () => {
+test('test tool gets exact prompt, restricted offered mode, five minute deadline and disposable cwd', async t => {
+  legacyDiagnosticProcessBackend(t);
   const f = await toolFixture();
   const parse = f.adapter.parse; let prompt = '';
   f.adapter.parse = result => {prompt = result.stdout.trim(); return parse(result);};
   assert.deepEqual(await runToolTest({...f, model: 'chosen-model'}), {ok: true, code: null, toolVersion: '1.0.0'});
-  assert(f.seen.spec); assert.equal(f.seen.spec.model, 'chosen-model'); assert.equal(f.seen.spec.access, 'folder_only');
+  assert(f.seen.spec); assert.equal(f.seen.spec.model, 'chosen-model');
+  assert.equal(f.seen.spec.access, actualHostPlatform === 'linux' ? 'full_access' : 'folder_only');
   assert(f.seen.spec.timeoutSeconds >= 269 && f.seen.spec.timeoutSeconds <= 270);
   assert.equal(f.seen.spec.maxTurns, 50); assert.match(f.seen.spec.cwd, /maddots-ai-test-/);
   await assert.rejects(access(f.seen.spec.cwd));
@@ -204,7 +244,8 @@ test('test tool gets exact prompt, restricted offered mode, five minute deadline
   assert.equal(RUN_TEST_PROMPT, 'Reply with exactly MADDOTS-RUNNER-OK and nothing else.');
 });
 
-test('saved tool default omits the model option, while explicit model is passed intact', async () => {
+test('saved tool default omits the model option, while explicit model is passed intact', async t => {
+  legacyDiagnosticProcessBackend(t);
   const f = await toolFixture(); let output = '';
   const parse = f.adapter.parse;
   f.adapter.parse = result => {output = result.stdout; return parse(result);};
@@ -215,7 +256,35 @@ test('saved tool default omits the model option, while explicit model is passed 
   assert.equal((await runToolTest({...f, model: 'named-model'})).ok, false); assert.equal(output.trim(), '-m named-model');
 });
 
-test('unoffered tools never launch, and MCP or parse failures stay failures with removed temporary folders', async () => {
+test('tool diagnostics refuse absent and other-platform acceptance before identity, preflight or test state', async t => {
+  const f = await toolFixture(), run = f.matrix.tools.find(tool => tool.key === 'codex')!.run!;
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'runner-platform-refused-')));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  let identities = 0, preflights = 0;
+  f.adapter.identity = async () => {identities++; return {ok: true, version: 'fixture'};};
+  f.adapter.preflight = async () => {preflights++; return {ok: true, reason: null};};
+  run.offered = true;
+  const otherPlatform = process.platform === 'linux' ? {darwin: {accepted: true}} : {linux: {accepted: true}};
+  const checkRefusals = async () => {
+    for (const platforms of [undefined, {}, otherPlatform]) {
+      run.platforms = platforms;
+      assert.equal((await runToolTest({...f, data: root})).code, 'adapter_refused');
+      assert.equal(f.seen.spec, undefined);
+      await assert.rejects(access(join(root, 'run-homes')));
+      await assert.rejects(access(join(root, 'runner/test-processes')));
+    }
+  };
+  // Isolate platform policy after owner admission. Containment and durable
+  // storage refusal have their own tests and must precede adapter discovery.
+  if (process.platform === 'linux') {
+    const owner = {state: {data: root}, assertGeneration: () => {}};
+    await withLinuxOwnerContext(owner as unknown as RunnerStorageOwner, 1, checkRefusals);
+  } else await checkRefusals();
+  assert.equal(identities, 0); assert.equal(preflights, 0);
+});
+
+test('unoffered tools never launch, and MCP or parse failures stay failures with removed temporary folders', async t => {
+  legacyDiagnosticProcessBackend(t);
   const f = await toolFixture();
   assert.equal((await runToolTest({...f, matrix: TOOL_MATRIX})).code, 'adapter_refused'); assert.equal(f.seen.spec, undefined);
   f.adapter.selfCheck = () => ({mcpServers: ['canary'], browserTools: []});
@@ -243,14 +312,16 @@ test('separate controllers serialize activation and the second process reloads t
   assert.equal((await second.snapshot())[0].state, 'on');
 });
 
-test('only-full-access offered tool tests use full access without changing any agent grant', async () => {
+test('only-full-access offered tool tests use full access without changing any agent grant', async t => {
+  legacyDiagnosticProcessBackend(t);
   const f = await toolFixture(); f.matrix.tools.find(tool => tool.key === 'codex')!.run!.folderOnly = 'none';
   assert.equal((await runToolTest({...f, model: 'fixture'})).ok, true);
   assert.equal(f.seen.spec!.access, 'full_access'); await assert.rejects(access(f.seen.spec!.cwd));
 });
 
 
-test('Claude test plugin has the run-only manifest required by the real adapter', async () => {
+test('Claude test plugin has the run-only manifest required by the real adapter', async t => {
+  legacyDiagnosticProcessBackend(t);
   const f = await toolFixture();
   f.adapter.info = {...f.adapter.info, tool: 'claude-code', harness: 'claude_code', skillsDir: '{runDir}/plugin/skills'};
   f.matrix.tools.find(tool => tool.key === 'claude-code')!.run = {...f.matrix.tools.find(tool => tool.key === 'codex')!.run!, adapter: 'claude-code'};
@@ -298,6 +369,7 @@ async function recoveryFixture(t: TestContext) {
 }
 
 test('test recovery fails closed on denied process inspection and never launches another tool', async t => {
+  legacyDiagnosticProcessBackend(t);
   const saved = await recoveryFixture(t), f = await toolFixture(); let scans = 0;
   const denied: ProcessInspector = {...processes, table: async () => {scans++; throw new Error('inspection denied');}};
   const result = await runToolTest({...f, data: saved.data, processes: denied, model: 'fixture'});
@@ -305,6 +377,81 @@ test('test recovery fails closed on denied process inspection and never launches
   assert(scans > 0); await access(saved.cwd); await access(saved.file);
   assert.equal(await recoverTestRuns({data: saved.data, processes}), true);
   await assert.rejects(access(saved.cwd)); await assert.rejects(access(saved.file));
+});
+
+test('restart recovers a tool-test ledger with saved cleanup obligations after interrupted cleanup', async t => {
+  legacyDiagnosticProcessBackend(t);
+  const saved = await recoveryFixture(t), row = JSON.parse(await readFile(saved.file, 'utf8'));
+  const group = {pgid: 900021, startedAt: 'linux:11111111-2222-4333-8444-555555555555:789', cleanupPending: true};
+  row.pid = group.pgid; row.startedAt = group.startedAt;
+  row.groups = [group]; row.legacyProcessIdentity = true; row.legacyProcessGroups = [group];
+  await writeFile(saved.file, JSON.stringify(row), {mode: 0o600});
+  let live = true, scans = 0, fences = 0, signals = 0;
+  const inspector: ProcessInspector = {
+    identity: async pid => live && pid === group.pgid ? group.startedAt : null,
+    table: async () => {scans++; return live ? [{pid: group.pgid, ppid: 1, pgid: group.pgid, startedAt: group.startedAt}] : [];},
+    fencePids: async fence => {assert.equal(fence, row.fence); fences++; return [];},
+    signalGroup: pid => {
+      assert.equal(pid, group.pgid); signals++;
+      assert.equal(JSON.parse(readFileSync(saved.file, 'utf8')).groups[0].cleanupPending, true,
+        'the cleanup obligation is durable before signalling');
+      throw new Error('simulated interruption after persisting cleanup evidence');
+    },
+  };
+  await assert.rejects(recoverTestRuns({data: saved.data, processes: inspector}), {code: 'RUNNER_TEST_RECOVERY_UNAVAILABLE'});
+  assert.equal(signals, 1, 'saved literal true must pass validation and reach authenticated cleanup');
+  const persisted = JSON.parse(await readFile(saved.file, 'utf8'));
+  assert.equal(persisted.groups[0].cleanupPending, true);
+  assert.deepEqual(persisted.legacyProcessGroups, [group]);
+  await access(saved.cwd);
+  live = false; scans = 0; fences = 0;
+  assert.equal(await recoverTestRuns({data: saved.data, processes: inspector}), true);
+  assert(scans > 0 && fences > 0, 'accepted saved obligations must reach complete process and fence inspection');
+  assert.equal(signals, 1, 'a restarted absence scan must not signal the departed lifetime');
+  await assert.rejects(access(saved.file), {code: 'ENOENT'});
+  await assert.rejects(access(saved.cwd), {code: 'ENOENT'});
+});
+
+test('tool-test recovery rejects malformed cleanup obligations before inspecting processes or removing evidence', async t => {
+  const saved = await recoveryFixture(t), row = JSON.parse(await readFile(saved.file, 'utf8'));
+  const inspections: string[] = [];
+  const inspector: ProcessInspector = {
+    identity: async () => {inspections.push('identity'); return null;},
+    table: async () => {inspections.push('table'); return [];},
+    fencePids: async () => {inspections.push('fence'); return [];},
+    signalGroup: () => {inspections.push('signal');},
+  };
+  for (const field of ['groups', 'legacyProcessGroups']) for (const cleanupPending of [false, null, 0, 1, '', 'true', [], {}]) {
+    const group = {pgid: 900021, startedAt: 'linux:11111111-2222-4333-8444-555555555555:789', cleanupPending};
+    const text = JSON.stringify({...row, groups: [], legacyProcessIdentity: true, [field]: [group]});
+    await writeFile(saved.file, text, {mode: 0o600});
+    await assert.rejects(recoverTestRuns({data: saved.data, processes: inspector}), {code: 'RUNNER_TEST_RECOVERY_UNAVAILABLE'},
+      `${field} rejects cleanupPending=${JSON.stringify(cleanupPending)}`);
+    assert.deepEqual(inspections, [], 'invalid obligations must be rejected by validation before process inspection');
+    assert.equal(await readFile(saved.file, 'utf8'), text, 'invalid evidence remains available for diagnosis');
+    await access(saved.cwd);
+  }
+});
+
+test('Linux legacy test-process identity migration retains its folder and ledger until candidate groups are absent', {skip: process.platform !== 'linux'}, async t => {
+  legacyDiagnosticProcessBackend(t);
+  const saved = await recoveryFixture(t), row = JSON.parse(await readFile(saved.file, 'utf8'));
+  const pid = 900001, member = 900002, signals: string[] = [];
+  const oldIdentity = 'Fri Oct 16 12:00:00 2026';
+  row.pid = pid; row.startedAt = oldIdentity;
+  row.groups = [{pgid: pid, startedAt: oldIdentity, members: [{pid: member, startedAt: oldIdentity}]}];
+  await writeFile(saved.file, JSON.stringify(row), {mode: 0o600});
+  let live = true;
+  const inspector: ProcessInspector = {identity: async () => null, fencePids: async () => [],
+    table: async () => live ? [{pid: member, ppid: 1, pgid: pid, startedAt: 'linux:11111111-2222-4333-8444-555555555555:789'}] : [],
+    signalGroup: (_pid, signal) => {signals.push(signal);}};
+  await assert.rejects(recoverTestRuns({data: saved.data, processes: inspector}), {code: 'RUNNER_TEST_RECOVERY_UNAVAILABLE'});
+  assert.equal(JSON.parse(await readFile(saved.file, 'utf8')).legacyProcessIdentity, true);
+  assert.deepEqual(signals, []);
+  await access(saved.cwd);
+  live = false;
+  assert.equal(await recoverTestRuns({data: saved.data, processes: inspector}), true);
+  await assert.rejects(access(saved.file)); await assert.rejects(access(saved.cwd));
 });
 
 test('startup recovery skips a cooperating live test lease without inspecting or deleting its folder', async t => {
@@ -315,14 +462,41 @@ test('startup recovery skips a cooperating live test lease without inspecting or
   await access(saved.cwd); await access(saved.file);
 });
 
+test('Linux legacy test recovery retains a moved unfenced member across two attempts', {skip: process.platform !== 'linux'}, async t => {
+  legacyDiagnosticProcessBackend(t);
+  const saved = await recoveryFixture(t), row = JSON.parse(await readFile(saved.file, 'utf8'));
+  const pid = 900011, member = 900012, oldIdentity = 'Fri Oct 16 12:00:00 2026';
+  row.pid = pid; row.startedAt = oldIdentity;
+  row.groups = [{pgid: pid, startedAt: oldIdentity, members: [{pid: member, startedAt: oldIdentity}]}];
+  await writeFile(saved.file, JSON.stringify(row), {mode: 0o600});
+  let live = true;
+  const inspector: ProcessInspector = {identity: async () => null, fencePids: async () => [],
+    table: async () => live ? [{pid: member, ppid: 1, pgid: 900099, startedAt: 'linux:11111111-2222-4333-8444-555555555555:789'}] : [],
+    signalGroup: () => assert.fail('A legacy date cannot authorize a signal.')};
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(recoverTestRuns({data: saved.data, processes: inspector}), {code: 'RUNNER_TEST_RECOVERY_UNAVAILABLE'});
+    const persisted = JSON.parse(await readFile(saved.file, 'utf8'));
+    assert.deepEqual(persisted.legacyProcessGroups, row.groups);
+    assert.deepEqual(persisted.groups, [], 'Current groups can be pruned without discarding original candidates.');
+    await access(saved.cwd);
+  }
+  live = false;
+  assert.equal(await recoverTestRuns({data: saved.data, processes: inspector}), true);
+  await assert.rejects(access(saved.file)); await assert.rejects(access(saved.cwd));
+});
+
 test('successful test execution writes spawn recovery metadata and removes its ledger after cleanup', async t => {
+  legacyDiagnosticProcessBackend(t);
   const saved = await recoveryFixture(t); await recoverTestRuns({data: saved.data, processes});
   const f = await toolFixture(), parse = f.adapter.parse;
   f.adapter.parse = result => {
     const file = join(saved.data, 'runner', 'test-processes', f.connection.aiToolId + '.json');
     const ledger = JSON.parse(readFileSync(file, 'utf8'));
     assert.equal(ledger.cwd, f.seen.spec!.cwd); assert.match(ledger.fence, /^[a-f0-9]{32}$/);
-    assert(ledger.pid > 1); assert.match(ledger.startedAt, /^test-/); assert(Array.isArray(ledger.groups));
+    assert(Number.isSafeInteger(ledger.claimedAt));
+    assert(ledger.pid > 1);
+    assert.match(ledger.startedAt, process.platform === 'linux' ? /^linux:[a-f0-9-]{36}:\d+$/ : /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s/);
+    assert(Array.isArray(ledger.groups));
     return parse(result);
   };
   assert.equal((await runToolTest({...f, data: saved.data, model: 'fixture'})).ok, true);
@@ -331,6 +505,7 @@ test('successful test execution writes spawn recovery metadata and removes its l
 
 
 test('recovery retains a private interrupted-write tempfile while recovering the authoritative process row', async t => {
+  legacyDiagnosticProcessBackend(t);
   const saved = await recoveryFixture(t);
   const temporary = join(saved.data, 'runner', 'test-processes', '.' + randomUUID() + '.tmp');
   await writeFile(temporary, '{"interrupted":', {mode: 0o600});
@@ -343,6 +518,7 @@ test('recovery retains a private interrupted-write tempfile while recovering the
 });
 
 test('an interrupted initial ledger write cannot block the next test or acquire process authority', async t => {
+  legacyDiagnosticProcessBackend(t);
   const saved = await recoveryFixture(t), f = await toolFixture();
   const temporary = join(saved.data, 'runner', 'test-processes', '.' + randomUUID() + '.tmp');
   await writeFile(temporary, await readFile(saved.file), {mode: 0o600}); await rm(saved.file);

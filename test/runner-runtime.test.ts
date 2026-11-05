@@ -9,34 +9,55 @@ import {treeDigest} from '../src/shared/build-format.js';
 import {LockStore} from '../src/lock.js';
 import {BuildVerifier, signedBuildString, type SignedBuild} from '../src/verify.js';
 import {TOOL_MATRIX} from '../src/shared/tool-matrix.js';
+import {LINUX_FOLDER_ONLY_REASON} from '../src/shared/tool-capabilities.js';
+import {signedRunnerAuthorizationString, type RunnerAuthorizationFields} from '../src/shared/runner-acceptance.js';
 import {ApiClient} from '../src/api.js';
 import {HelperError, readConfig, type Timing} from '../src/config.js';
 import {atomicWrite, createPaths, ensurePaths, ensurePrivateDirectory} from '../src/paths.js';
 import {RunsRuntime} from '../src/runner/cli-runs.js';
+import {RunnerAcceptanceVerifier} from '../src/runner/acceptance.js';
+import type {ActiveRun} from '../src/runner/state.js';
 import type {RunnerAgent, RunnerHeartbeat} from '../src/runner/protocol-client.js';
 import type {RunsOnSnapshot} from '../src/runner/runs-on.js';
 import type {SecretName, SecretStore} from '../src/secret-store.js';
 import {StateStore} from '../src/state.js';
+import {RELEASE} from '../src/release-identity.js';
 import {TokenManager} from '../src/token.js';
+import {qualifyLinuxFixtureWithoutWorkloads} from './support/linux-native-workloads.js';
+import {initializeCleanRunnerJournal} from './support/runner-journal-fixture.js';
+import {acquireRunnerControllerLease, type RunnerControllerStorage} from '../src/runner/storage-lock.js';
 
-async function fixture(t: TestContext, activation?: RunsOnSnapshot['state']) {
+const platformRestorations = new WeakSet<TestContext>();
+const linuxHostSkip = process.platform !== 'linux' ? 'Linux journal and storage fixtures require a native Linux host.' : false;
+async function fixture(t: TestContext, activation?: RunsOnSnapshot['state'], platform: 'darwin' | 'linux' = 'darwin') {
+  // Legacy numeric recovery and Folder only belong to the macOS pilot.
+  // Explicit Linux scenarios keep its journal and pre-launch admission rules.
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  if (!platformRestorations.has(t)) {
+    platformRestorations.add(t);
+    t.after(() => {Object.defineProperty(process, 'platform', descriptor);});
+  }
+  Object.defineProperty(process, 'platform', {...descriptor, value: platform});
+  if (platform === 'linux') qualifyLinuxFixtureWithoutWorkloads(t);
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-runtime-'));
   const home = join(root, 'home'); await mkdir(home, {mode: 0o700});
-  const paths = await createPaths(readConfig({MADDOTS_AI_HOME: join(root, 'data')}, home));
+  const paths = await createPaths(readConfig({MADDOTS_AI_HOME: join(root, 'data')}, home, platform));
   await ensurePaths(paths); await ensurePrivateDirectory(join(paths.data, 'runner'));
+  await initializeCleanRunnerJournal(paths.data);
   const endpoint = new URL('https://ai.maddots.app'), helperId = randomUUID(), aiToolId = randomUUID();
   const deviceKeyId = randomUUID(), agentId = randomUUID(), token = 'mdai_skill_' + 'R'.repeat(43);
   const jwk = generateKeyPairSync('ed25519').privateKey.export({format: 'jwk'});
   const keyDocument = JSON.stringify({format: 1, keys: {[aiToolId]: {deviceKeyId, d: jwk.d!, x: jwk.x!}}});
   const savedSecrets = new Map<SecretName, string>([['skills-token', token], ['device-key', keyDocument]]);
   const writes: SecretName[] = [], deletions: SecretName[] = [];
-  const secrets: SecretStore = {storage: 'keychain', get: async name => savedSecrets.get(name),
+  const storage = platform === 'linux' ? 'file' : 'keychain';
+  const secrets: SecretStore = {storage, platform, get: async name => savedSecrets.get(name),
     set: async (name, value) => {writes.push(name); savedSecrets.set(name, value);},
     delete: async name => {deletions.push(name); savedSecrets.delete(name);}};
   const bin = await realpath(process.execPath);
   const state = new StateStore(paths, endpoint);
   await state.write({format: 1, endpoint: endpoint.href, helperId, status: 'connected', scopes: ['sync', 'run_claim'],
-    tokenStorage: 'keychain', tools: [{tool: 'codex', variant: 'cli', version: '1.0.0', models: ['test-model'], syncOnly: false, path: bin, realpath: bin}],
+    tokenStorage: storage, tools: [{tool: 'codex', variant: 'cli', version: '1.0.0', models: ['test-model'], syncOnly: false, path: bin, realpath: bin}],
     pendingTools: [], connections: [{id: aiToolId, tool: 'codex', variant: 'cli'}]});
   if (activation) await atomicWrite(join(paths.data, 'runner', 'runs.json'), JSON.stringify({format: 1, tools: [{
     aiToolId, state: activation, failureCode: activation === 'failed' ? 'mcp_started' : null,
@@ -78,7 +99,7 @@ async function fixture(t: TestContext, activation?: RunsOnSnapshot['state']) {
     return Response.json({data: response});
   };
   const matrix = structuredClone(TOOL_MATRIX);
-  Object.assign(matrix.tools.find(tool => tool.key === 'codex')!.run!, {offered: true, folderOnly: 'os-sandbox'});
+  Object.assign(matrix.tools.find(tool => tool.key === 'codex')!.run!, {offered: true, platforms: {darwin: {accepted: true}, linux: {accepted: true}}, folderOnly: 'os-sandbox'});
   const api = new ApiClient(endpoint, fetcher);
   const timing: Timing = {now: () => now, sleep: async () => {throw new Error('Unexpected runtime sleep.');}};
   const runtimeOptions = {paths, helperId, endpoint, secrets, state, api, request: fetcher, timing, matrix,
@@ -95,8 +116,37 @@ async function fixture(t: TestContext, activation?: RunsOnSnapshot['state']) {
     response: (value: RunnerHeartbeat) => {response = value;}, advance: (ms = 15_000) => {now += ms;}};
 }
 
-test('TLS-25 runtime restores an already registered key and sends signed heartbeats without registration or secret writes', async t => {
-  const f = await fixture(t), connections = await f.runtime.connections();
+test('production protocol factories bind signed claims to the configured helper and selected connection', {skip: RELEASE && 'Source-only signing fixture.'}, async t => {
+  const f = await fixture(t), server = generateKeyPairSync('ed25519');
+  const raw = server.publicKey.export({type: 'spki', format: 'der'}).subarray(-32);
+  const key = {keyId: createHash('sha256').update(raw).digest('hex').slice(0, 16), publicKey: raw.toString('base64')};
+  const verifier = new RunnerAcceptanceVerifier({keys: [key]}), verify = verifier.verify.bind(verifier);
+  t.mock.method(RunnerAcceptanceVerifier.prototype, 'verify', verify);
+  const runId = randomUUID(), generation = 'a'.repeat(64), now = f.timing.now();
+  let identity = {helperId: f.helperId, aiToolId: f.aiToolId};
+  const request: typeof fetch = async (_input, init) => {
+    const fields: RunnerAuthorizationFields = {format: 1, keyId: key.keyId, purpose: 'claim', ...identity,
+      runId, generation, deviceKeyId: f.deviceKeyId, requestNonce: new Headers(init?.headers).get(RUNNER_HEADERS.nonce)!,
+      issuedAt: new Date(now).toISOString(), startBy: new Date(now + 30_000).toISOString(), workloadDeadline: new Date(now + 60_000).toISOString(),
+      acceptanceGrant: {scopeId: randomUUID(), scopeVersion: 1, toolKey: 'codex', platform: 'linux', expiresAt: new Date(now + 60_000).toISOString()}};
+    const authorization = {...fields, signature: sign(null, Buffer.from(signedRunnerAuthorizationString(fields)), server.privateKey).toString('base64')};
+    return Response.json({data: {runId, generation, authorization, token: 'pm_run_FIXTURE', expiresAt: fields.workloadDeadline,
+      kind: 'assignment', agentId: f.agentId, cardId: randomUUID(), boardId: randomUUID(), commentId: null,
+      model: 'test-model', provider: null, effort: null, maxRunMinutes: 1, skills: []}});
+  };
+  const runtime = new RunsRuntime({...f.runtimeOptions, request}); t.after(() => runtime.close());
+  const [connection] = await runtime.connections(); assert.ok(connection);
+  const body = {runId, access: 'full_access', toolVersion: '1.0.0'} as const;
+  for (const edit of [{helperId: randomUUID()}, {aiToolId: randomUUID()}]) {
+    identity = {helperId: f.helperId, aiToolId: f.aiToolId, ...edit};
+    await assert.rejects(connection.protocol.claim(body), {code: 'RUN_ACCEPTANCE_INVALID'});
+  }
+  identity = {helperId: f.helperId, aiToolId: f.aiToolId};
+  const result = await connection.protocol.claim(body); assert.ok(Object.hasOwn(result, 'acceptance')); result.api.dispose();
+});
+
+for (const platform of ['darwin', 'linux'] as const) test(`TLS-25 runtime restores an already registered key and sends signed heartbeats without registration or secret writes (${platform})`, {skip: platform === 'linux' && linuxHostSkip}, async t => {
+  const f = await fixture(t, undefined, platform), connections = await f.runtime.connections();
   assert.equal(connections.length, 1); assert.equal(connections[0].deviceKeyId, f.deviceKeyId);
   assert.equal(connections[0].runsOn, true);
   await f.runtime.core.tick(); await f.runtime.catalogSettled();
@@ -105,6 +155,70 @@ test('TLS-25 runtime restores an already registered key and sends signed heartbe
   assert.deepEqual(f.writes, []); assert.deepEqual(f.deletions, []);
   assert.equal(f.savedSecrets.get('device-key'), f.keyDocument);
   assert.equal((await f.runtime.catalog())[0].agentId, f.agentId);
+});
+
+for (const queuedActivation of [false, true]) test(`Linux service preserves a pending bootstrap key during its connection read with queued activation ${queuedActivation}`, {skip: linuxHostSkip}, async t => {
+  const f = await fixture(t, undefined, 'linux');
+  f.savedSecrets.delete('device-key'); f.heartbeatError('RUNS_NOT_ENABLED', 403);
+  assert.deepEqual(await f.runtime.activation.snapshot(), []);
+  const read = f.secrets.get.bind(f.secrets);
+  let registered = false;
+  let bootstrapLease: RunnerControllerStorage | undefined;
+  t.mock.method(f.secrets, 'get', async (name: SecretName) => {
+    if (name === 'device-key' && !registered) {
+      if (queuedActivation) {
+        bootstrapLease = await acquireRunnerControllerLease(f.paths.data, 'activation');
+        await f.runtime.activation.syncGrants([{aiToolId: f.aiToolId, expiresAt: new Date(f.timing.now() + 60_000).toISOString()}]);
+        assert.equal(f.runtime.activation.busy, true);
+      }
+      await atomicWrite(join(f.paths.data, 'runner', 'runs.json'), JSON.stringify({format: 1, tools: [{
+        aiToolId: f.aiToolId, state: 'waiting', failureCode: null, deviceKeyId: f.deviceKeyId,
+        toolVersion: '1.0.0', grantExpiresAt: null, awaitingLocalSetup: true,
+      }]}));
+      f.savedSecrets.set('device-key', f.keyDocument); registered = true;
+    }
+    return read(name);
+  });
+  try {
+    await f.runtime.core.tick();
+    assert.equal(registered, true, 'The service cycle must reach the interleaved registration.');
+    assert.deepEqual(f.calls, []); assert.deepEqual(f.deletions, []);
+    assert.equal(f.savedSecrets.get('device-key'), f.keyDocument);
+  } finally {
+    const closing = f.runtime.activation.close();
+    await bootstrapLease?.release(); await closing;
+  }
+  const [waiting] = await f.runtime.activation.snapshot();
+  assert.equal(waiting.state, 'waiting'); assert.equal(waiting.awaitingLocalSetup, true);
+});
+
+test('TLS-25 Linux diagnostics cannot enter an initialized owner with retained unresolved evidence', {skip: linuxHostSkip}, async t => {
+  const f = await fixture(t, 'on', 'linux'); await f.runtime.core.init();
+  const owner = f.runtime.core['owner']!, generation = f.runtime.core['ownerGeneration'];
+  const runId = randomUUID();
+  // Seed only a synthetic status projection. No containment run or process was
+  // created, and this row must never become authority for a diagnostic.
+  const row: ActiveRun = {runId, agentId: f.agentId, aiToolId: f.aiToolId, pid: 0,
+    startedAt: 'synthetic-unresolved-projection', runDir: join(f.paths.home, '.maddots', 'runs', runId), phase: 'posting'};
+  owner.unrecovered.set(runId, row); await owner.save(generation);
+  const file = join(f.paths.data, 'runner', 'active.json'), evidence = await readFile(file, 'utf8');
+  const diagnostic = t.mock.fn(async () => {});
+  try {
+    await assert.rejects(f.runtime.core.withToolContext(diagnostic), {code: 'RUNNER_STATE_UNAVAILABLE'});
+    assert.equal(diagnostic.mock.callCount(), 0);
+    assert.equal(await readFile(file, 'utf8'), evidence);
+    assert.deepEqual(owner.unrecovered.get(runId), row);
+  } finally {
+    // Teardown owns this synthetic row, with no process or containment object.
+    owner.unrecovered.delete(runId); await owner.save(generation);
+  }
+});
+
+test('TLS-25 Linux diagnostics cannot enter a closed core or reuse its retired generation', {skip: linuxHostSkip}, async t => {
+  const f = await fixture(t, 'on', 'linux'); await f.runtime.core.init(); await f.runtime.core.close();
+  const diagnostic = t.mock.fn(async () => {});
+  await assert.rejects(f.runtime.core.withToolContext(diagnostic), {code: 'RUNNER_STATE_UNAVAILABLE'});
+  assert.equal(diagnostic.mock.callCount(), 0);
 });
 
 test('TLS-25 authenticated status callback forwards grants into activation without persisting them as helper state', async t => {
@@ -212,13 +326,25 @@ test('TLS-25 failed ledger recovery backs off for 60 seconds while signed heartb
   const ledger = join(f.paths.data, 'runner', 'test-processes', f.aiToolId + '.json');
   const saved = JSON.stringify({format: 1, aiToolId: f.aiToolId, cwd, fence: 'c'.repeat(32), pid: 0, startedAt: '', groups: []}) + '\n';
   await ensurePrivateDirectory(join(f.paths.data, 'runner', 'test-processes')); await atomicWrite(ledger, saved);
-  const started = f.timing.now(), inspections: number[] = [], errors: number[] = [], heartbeats: number[] = [];
-  f.runtimeOptions.processes.table = async () => {inspections.push(f.timing.now() - started); throw new Error('inspection denied');};
+  const started = f.timing.now(), cap = 20_000, errors: number[] = [], heartbeats: number[] = [];
+  const inspections: {attempt: number; began: number; ended: number}[] = [];
+  let cleanupNow = started;
+  // Keep the service's existing clock for its backoff and signed heartbeats.
+  // Each failed inspection consumes five seconds of the cleanup clock so its
+  // retry cap is exercised without waiting twenty real seconds per attempt.
+  t.mock.method(Date, 'now', () => cleanupNow);
+  f.runtimeOptions.processes.table = async () => {
+    const began = Date.now(); cleanupNow += 5000;
+    inspections.push({attempt: f.timing.now() - started, began, ended: Date.now()});
+    throw new Error('inspection denied');
+  };
   for (let tick = 0; tick <= 60; tick++) {
     if (tick) f.advance(1000);
+    const began = Date.now();
     try {await f.runtime.init();}
     catch (error) {
       assert.equal((error as HelperError).code, 'RUNNER_TEST_RECOVERY_UNAVAILABLE');
+      assert.equal(Date.now() - began, cap, 'persistent inspection failures use the bounded cleanup attempt');
       errors.push(f.timing.now() - started);
     }
     const before = f.calls.length;
@@ -227,15 +353,52 @@ test('TLS-25 failed ledger recovery backs off for 60 seconds while signed heartb
       assert.equal(call.path, '/api/runner/heartbeat'); heartbeats.push(f.timing.now() - started);
     }
   }
-  assert.deepEqual(errors, [0, 60_000]); assert.deepEqual(inspections, [0, 60_000]);
+  assert.deepEqual(errors, [0, 60_000]);
+  assert.deepEqual([...new Set(inspections.map(inspection => inspection.attempt))], [0, 60_000],
+    'no recovery attempt starts before the 60 second backoff ends');
+  for (const attempt of errors) {
+    const scans = inspections.filter(inspection => inspection.attempt === attempt);
+    assert(scans.length > 1, 'one recovery attempt retries failed inspections');
+    assert(scans.every(scan => scan.ended - scans[0].began <= cap), 'all inspections finish within the cleanup cap');
+  }
   assert.deepEqual(heartbeats, [0, 15_000, 30_000, 45_000, 60_000]);
   assert.equal(await readFile(ledger, 'utf8'), saved);
   assert.equal(await readFile(marker, 'utf8'), 'preserve this test folder');
 });
 
-for (const [code, status] of [['RUNS_NOT_ENABLED', 403], ['DEVICE_KEY_REVOKED', 401], ['SCOPE_MISSING', 403]] as const) {
-  test(`TLS-25 runs reports off durably after heartbeat ${code}, including restart`, async t => {
-    const f = await fixture(t, 'on'); f.heartbeatError(code, status);
+test('TLS-25 Linux numeric diagnostic evidence stays intact without process scans while recovery backs off and signed heartbeats continue', {skip: linuxHostSkip}, async t => {
+  const f = await fixture(t, 'on', 'linux');
+  const cwd = await mkdtemp(join(await realpath(tmpdir()), 'maddots-ai-test-'));
+  t.after(() => rm(cwd, {recursive: true, force: true}));
+  const marker = join(cwd, 'recovery-evidence'); await writeFile(marker, 'retained evidence', {mode: 0o600});
+  const ledger = join(f.paths.data, 'runner', 'test-processes', f.aiToolId + '.json');
+  const saved = JSON.stringify({format: 1, aiToolId: f.aiToolId, cwd, fence: 'd'.repeat(32), pid: 0, startedAt: '', groups: []}) + '\n';
+  await ensurePrivateDirectory(join(f.paths.data, 'runner', 'test-processes')); await atomicWrite(ledger, saved);
+  let inspections = 0;
+  const refuseInspection = async (): Promise<never> => {inspections++; throw new Error('A numeric ledger cannot authorize process-derived retirement.');};
+  f.runtimeOptions.processes.table = refuseInspection;
+  f.runtimeOptions.processes.identity = refuseInspection;
+  f.runtimeOptions.processes.fencePids = refuseInspection;
+  const started = f.timing.now(), failures: number[] = [];
+  for (let tick = 0; tick <= 60; tick++) {
+    if (tick) f.advance(1000);
+    try {await f.runtime.init();}
+    catch (error) {
+      assert.equal((error as HelperError).code, 'RUNNER_TEST_RECOVERY_UNAVAILABLE');
+      failures.push(f.timing.now() - started);
+    }
+    await f.runtime.core.tick(); await f.runtime.catalogSettled();
+  }
+  assert.deepEqual(failures, [0, 60_000]);
+  assert.equal(inspections, 0, 'Legacy numeric evidence must be refused before any process observation.');
+  assert.equal(f.calls.filter(call => call.path === '/api/runner/heartbeat').length, 5);
+  assert.equal(await readFile(ledger, 'utf8'), saved);
+  assert.equal(await readFile(marker, 'utf8'), 'retained evidence');
+});
+
+for (const platform of ['darwin', 'linux'] as const) for (const [code, status] of [['RUNS_NOT_ENABLED', 403], ['DEVICE_KEY_REVOKED', 401], ['SCOPE_MISSING', 403]] as const) {
+  test(`TLS-25 runs reports off durably after heartbeat ${code}, including restart (${platform})`, {skip: platform === 'linux' && linuxHostSkip}, async t => {
+    const f = await fixture(t, 'on', platform); f.heartbeatError(code, status);
     await f.runtime.core.tick();
     assert.equal(f.savedSecrets.has('device-key'), false);
     assert.deepEqual(await f.runtime.connections(), []);
@@ -289,7 +452,7 @@ async function fullSetup(f: Awaited<ReturnType<typeof fixture>>, handle: string)
 }
 for (const scenario of ['duplicate workspaces', 'renamed agent', 'reused handle'] as const) {
   test(`TLS-25 access lowers by selected agent identity with ${scenario}, without confirmation`, async t => {
-    const f = await fixture(t, 'on'), other = {...f.agent, agentId: randomUUID()};
+    const f = await fixture(t, 'on', 'darwin'), other = {...f.agent, agentId: randomUUID()};
     await catalogAgents(f, scenario === 'duplicate workspaces' ? [f.agent, other] : [f.agent]);
     await fullSetup(f, f.agent.handle);
     let selected = f.agent;
@@ -307,8 +470,19 @@ for (const scenario of ['duplicate workspaces', 'renamed agent', 'reused handle'
   });
 }
 
-test('TLS-25 catalog contention never delays or drops heartbeat Stop and write failures preserve the answer', async t => {
-  const f = await fixture(t, 'on'), runId = randomUUID(), stopped: string[] = [];
+test('TLS-25 Linux Codex access refuses Folder only and preserves confirmed Full access', {skip: linuxHostSkip}, async t => {
+  const f = await fixture(t, 'on', 'linux');
+  await catalogAgents(f, [f.agent]); await fullSetup(f, f.agent.handle);
+  const saved = await readFile(f.runtime.local.file, 'utf8'), output = [...f.output];
+  assert.equal((await f.runtime.local.read())[f.agentId].access, 'full_access');
+  await assert.rejects(f.runtime.command(['agent', 'access', f.agent.handle, 'folder-only'], {...f.io, isTTY: false}),
+    {code: 'ACCESS_UNAVAILABLE', message: LINUX_FOLDER_ONLY_REASON});
+  assert.equal(await readFile(f.runtime.local.file, 'utf8'), saved);
+  assert.deepEqual(f.output, output, 'Refused access must not report that local setup was saved.');
+});
+
+for (const platform of ['darwin', 'linux'] as const) test(`TLS-25 catalog contention never delays or drops heartbeat Stop and write failures preserve the answer (${platform})`, {skip: platform === 'linux' && linuxHostSkip}, async t => {
+  const f = await fixture(t, 'on', platform), runId = randomUUID(), stopped: string[] = [];
   await writeFile(f.paths.lock, String(process.pid), {mode: 0o600, flag: 'wx'});
   f.response({heartbeatSeconds: 15, agents: [f.agent], claimable: [], stop: [{runId, reason: 'stop_requested'}]});
   let slept = 0;
@@ -326,7 +500,7 @@ test('TLS-25 catalog contention never delays or drops heartbeat Stop and write f
 
 for (const reason of ['setup', 'access', 'missing digest', 'missing accepted build', 'ready', 'paused'] as const) {
   test(`TLS-25 production notification counts ${reason} and reserves only actionable agents`, async t => {
-    const f = await fixture(t, 'on');
+    const f = await fixture(t, 'on', 'darwin');
     if (reason !== 'setup' && reason !== 'paused') {
       await catalogAgents(f, [f.agent]);
       const answers = ['', ''];
@@ -355,7 +529,7 @@ for (const reason of ['setup', 'access', 'missing digest', 'missing accepted bui
 
 
 test('TLS-25 production notification counts a claimable accepted code build still waiting for exact Allow', async t => {
-  const f = await fixture(t, 'on'); await catalogAgents(f, [f.agent]);
+  const f = await fixture(t, 'on', 'darwin'); await catalogAgents(f, [f.agent]);
   const answers = ['', ''];
   await f.runtime.command(['agent', 'setup', f.agent.handle], {...f.io, prompt: async () => answers.shift()!});
   const signer = generateKeyPairSync('ed25519'), publicKey = signer.publicKey.export({type: 'spki', format: 'der'}).subarray(-32);
@@ -386,7 +560,7 @@ test('TLS-25 production notification counts a claimable accepted code build stil
 
 
 test('TLS-25 exact agent-id selector lowers only the chosen duplicate handle without confirmation', async t => {
-  const f = await fixture(t, 'on'), other = {...f.agent, agentId: randomUUID()};
+  const f = await fixture(t, 'on', 'darwin'), other = {...f.agent, agentId: randomUUID()};
   await catalogAgents(f, [f.agent, other]); await fullSetup(f, f.agent.handle);
   await f.runtime.command(['agent', 'access', other.agentId, 'folder-only'], {...f.io, isTTY: false});
   const rows = await f.runtime.local.read();

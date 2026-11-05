@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -8,11 +8,12 @@ import { atomicWrite, createPaths, ensurePaths, readPrivateFile, withWriteLock }
 import { FILE_STORAGE_WARNING, FileSecretStore, KeychainSecretStore } from '../src/secret-store.js';
 import { StateStore } from '../src/state.js';
 import { TOOL_MATRIX } from '../src/shared/tool-matrix.js';
+import {createGitDirectory} from './git-fixture.js';
 
 async function fixture() {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-storage-'));
   const home = join(root, 'home'); await mkdir(home, { mode: 0o700 });
-  const config = readConfig({}, home), paths = await createPaths(config); await ensurePaths(paths);
+  const config = readConfig({}, home, 'darwin'), paths = await createPaths(config); await ensurePaths(paths);
   return { root, home, paths, config, close: () => rm(root, { recursive: true, force: true }) };
 }
 test('endpoint defaults to production and refuses credentials, paths, and unsafe HTTP', () => {
@@ -31,13 +32,92 @@ test('data, holding and backups are private, outside skill routes and Git trees,
     const unsafe = [join(f.home, '.config/ibl-projects-mcp'), join(f.home, '.cache/maddots-mcp'), join(f.home, '.codex-other/skills'),
       ...Object.values(TOOL_MATRIX.routes).filter(route => route.kind !== 'zip').map(route => route.path.replace(/^~/, f.home))];
     for (const path of unsafe) await assert.rejects(createPaths(readConfig({ MADDOTS_AI_HOME: join(path, 'private-data') }, f.home)), /outside|tool home/);
-    const work = join(f.root, 'work'); await mkdir(join(work, '.git'), { recursive: true });
+    const work = join(f.root, 'work'); await createGitDirectory(join(work, '.git'));
     await assert.rejects(createPaths(readConfig({ MADDOTS_AI_HOME: join(work, 'private-data') }, f.home)), /Git work tree/);
     const agents = join(f.home, '.agents'); await mkdir(agents, { mode: 0o700 });
     const privateData = join(f.home, 'private-data'); await mkdir(privateData, { mode: 0o700 });
     await symlink(privateData, join(agents, 'skills'));
     await assert.rejects(createPaths(readConfig({ MADDOTS_AI_HOME: privateData }, f.home)), /physical targets/);
   } finally { await f.close(); }
+});
+test('r19 incomplete Git markers allow data paths and receive no writes', async () => {
+  const f = await fixture();
+  try {
+    for (const kind of ['empty', 'HEAD', 'objects', 'refs', 'HEAD-objects', 'HEAD-refs', 'objects-refs', 'invalid-HEAD', 'missing-common', 'partial-common', 'gitfile']) {
+      const work = join(f.root, kind), git = join(work, '.git'), data = join(work, 'nested/data');
+      await mkdir(work);
+      if (kind === 'gitfile') await writeFile(git, 'gitdir: missing-git\n');
+      else {
+        await mkdir(git);
+        if (kind.includes('HEAD')) await writeFile(join(git, 'HEAD'), kind === 'invalid-HEAD' ? 'invalid\n' : 'ref: refs/heads/fixture\n');
+        if (kind.includes('objects') || kind === 'invalid-HEAD') await mkdir(join(git, 'objects'));
+        if (kind.includes('refs') || kind === 'invalid-HEAD') await mkdir(join(git, 'refs'));
+        if (kind.endsWith('common')) {
+          await writeFile(join(git, 'HEAD'), 'ref: refs/heads/fixture\n');
+          await writeFile(join(git, 'commondir'), '../common\n');
+          if (kind === 'partial-common') await mkdir(join(work, 'common'));
+        }
+      }
+      const before = await readdir(work, {recursive: true});
+      assert.equal((await createPaths(readConfig({MADDOTS_AI_HOME: data}, f.home))).data, data, kind);
+      assert.deepEqual(await readdir(work, {recursive: true}), before, `${kind}: recognition writes nothing`);
+      await assert.rejects(lstat(data), {code: 'ENOENT'});
+    }
+  } finally {await f.close();}
+});
+test('r19 data paths reject actual repositories, including worktrees and valid ancestors behind empty markers', async () => {
+  const f = await fixture();
+  try {
+    for (const kind of ['symbolic', 'sha1', 'sha256', 'symlink-HEAD', 'worktree', 'nested']) {
+      const work = join(f.root, kind), git = join(work, '.git');
+      await mkdir(work);
+      if (kind === 'worktree') {
+        const common = join(f.root, 'common'), gitDir = join(common, 'worktrees', 'fixture');
+        await createGitDirectory(common); await createGitDirectory(gitDir);
+        await writeFile(git, `gitdir: ${gitDir}\n`); await writeFile(join(gitDir, 'commondir'), '../..\n');
+      } else {
+        await createGitDirectory(git);
+        if (kind === 'symlink-HEAD') {await rm(join(git, 'HEAD')); await symlink('refs/heads/fixture', join(git, 'HEAD'));}
+        if (kind === 'sha1' || kind === 'sha256') await writeFile(join(git, 'HEAD'), `${'a'.repeat(kind === 'sha1' ? 40 : 64)}\n`);
+        if (kind === 'nested') await mkdir(join(work, 'nested/.git'), {recursive: true});
+      }
+      const before = await readdir(work, {recursive: true});
+      await assert.rejects(createPaths(readConfig({MADDOTS_AI_HOME: join(work, 'nested/data')}, f.home)), /Git work tree/, kind);
+      assert.deepEqual(await readdir(work, {recursive: true}), before, `${kind}: rejection writes nothing`);
+    }
+  } finally {await f.close();}
+});
+test('r19 repository symlinks do not bypass data-folder safety', async () => {
+  const f = await fixture();
+  try {
+    for (const kind of ['marker', 'gitdir', 'objects', 'refs', 'commondir']) {
+      const work = join(f.root, kind), git = join(work, '.git'), target = join(work, 'actual');
+      await mkdir(work); await mkdir(target);
+      if (kind === 'marker') await symlink(target, git);
+      else if (kind === 'gitdir') {
+        await symlink(target, join(work, 'linked'));
+        await writeFile(git, 'gitdir: linked\n');
+      } else {
+        await createGitDirectory(git);
+        if (kind === 'commondir') {await symlink(target, join(work, 'linked')); await writeFile(join(git, 'commondir'), '../linked\n');}
+        else {await rm(join(git, kind), {recursive: true}); await symlink(target, join(git, kind));}
+      }
+      await assert.rejects(createPaths(readConfig({MADDOTS_AI_HOME: join(work, 'data')}, f.home)), {code: 'PATH_UNSAFE'}, kind);
+      assert.deepEqual(await readdir(target), []);
+    }
+  } finally {await f.close();}
+});
+test('r19 unreadable repository metadata cannot be treated as an empty marker', {skip: process.getuid?.() === 0}, async () => {
+  const f = await fixture();
+  try {
+    for (const kind of ['marker', 'HEAD', 'objects', 'refs']) {
+      const work = join(f.root, kind), git = join(work, '.git'); await createGitDirectory(git);
+      const unreadable = kind === 'marker' ? git : join(git, kind);
+      await chmod(unreadable, 0o000);
+      try {await assert.rejects(createPaths(readConfig({MADDOTS_AI_HOME: join(work, 'data')}, f.home)), {code: 'EACCES'}, kind);}
+      finally {await chmod(unreadable, kind === 'HEAD' ? 0o600 : 0o700);}
+    }
+  } finally {await f.close();}
 });
 test('data and token files refuse symlink components and unsafe permissions', async () => {
   const f = await fixture();

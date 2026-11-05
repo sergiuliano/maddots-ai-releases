@@ -15,6 +15,7 @@ export interface PlanItem {
   dependencyIds?: string[]; outsideWorkspaceDependencies?: boolean;
   linkedHomes?: {home: string; folderName: string}[];
   linkedReplacementBlocked?: boolean;
+  bindingIssue?: 'approval_required' | 'unavailable';
   restartHints: {tool: string; reload: 'live' | 'command' | 'restart'; command: string | null}[];
 }
 export type SyncInstruction =
@@ -24,10 +25,12 @@ export type SyncPlan = {planRevision: string; degraded: boolean; pollAfterSecond
   revoked: {skillId: string; digest: string}[]; instructions: SyncInstruction[]};
 export type ManagedInventory = {skillId: string; target: BuildTarget; name: string; version: number; settingsRevision: number;
   digest: string; localDigest: string | null; state: 'ok' | 'edited' | 'missing' | 'held'; linkedHomes?: {home: string; folderName: string}[]};
+export type AgentManagedInventory = ManagedInventory & {agentId: string};
 export type DeliveryError = {skillId: string; target: BuildTarget; name: string; code: string};
 export type SyncInventory = {
-  helperVersion: string; computerName: string; os: HelperOS; tokenStorage: 'keychain' | 'file'; tools: ReportedTool[];
-  managed: ManagedInventory[]; duplicates: {tool: string; home: string; folderName: string; skillId: string | null}[];
+  helperVersion: string; computerName: string; os: HelperOS; tokenStorage: 'keychain' | 'file' | 'secret-service'; tools: ReportedTool[];
+  previousHelperIds?: string[];
+  managed: ManagedInventory[]; agentManaged?: AgentManagedInventory[]; duplicates: {tool: string; home: string; folderName: string; skillId: string | null}[];
   unmanaged: {home: string; folderName: string; link: {targetName: string; targetHome: string | null} | null; hasScripts: boolean;
     physicalSourceId?: string;
     canonicalConflict?: {skillId: string; target: BuildTarget; name: string}}[];
@@ -37,6 +40,8 @@ export type SyncInventory = {
 };
 export type SyncAnswersRequest = {helperId: string; answers: {itemId: string; answer: SyncAnswer}[]};
 export type SyncQuestionGroup = {helperId: string; computerName: string; items: PlanItem[]; waitingCount: number;
+  /** Approved code skill/version groups still needing a current local Allow receipt, including builds not yet reported in holding. */
+  pendingAllowCount?: number;
   duplicates: SyncInventory['duplicates']; agents: {id: string; name: string}[]; restartHints: PlanItem['restartHints']; initialPlanReady?: boolean; allowSupported?: boolean};
 export type SyncQuestionsResponse = {helpers: SyncQuestionGroup[]};
 export type AllowReportsRequest = {holdingCount: number; reports: {skillId: string; version: number; digest: string; tools: string[]; allowedAt: string}[]};
@@ -56,6 +61,7 @@ const folderRef = object({home, folderName: name});
 const managed = object({skillId: key, target, name, version: integer(1), settingsRevision: integer(), digest,
   localDigest: nullable(digest), state: choice(['ok', 'edited', 'missing', 'held']), linkedHomes: array(folderRef)},
 ['skillId', 'target', 'name', 'version', 'settingsRevision', 'digest', 'localDigest', 'state']);
+const agentManaged = object({...managed.properties, agentId: key}, [...managed.required, 'agentId']);
 const item = object({itemId: digest, kind: choice(['install', 'update', 'local_newer', 'forced_remove', 'forced_restore']),
   skillId: key, name, sourceName: name, level: choice(['global', 'workspace', 'board']), workspaceId: key,
   workspaceIds: array(key), boardIds: array(key), target, route: key, fromVersion: nullable(integer(1)), version: integer(1),
@@ -65,6 +71,7 @@ const item = object({itemId: digest, kind: choice(['install', 'update', 'local_n
   dependencyIds: array(digest), outsideWorkspaceDependencies: {type: 'boolean'},
   linkedHomes: array(folderRef),
   linkedReplacementBlocked: {type: 'boolean'},
+  bindingIssue: choice(['approval_required', 'unavailable']),
   restartHints: array(object({tool: key, reload: choice(['live', 'command', 'restart']), command: nullable(string(2048))}), 40)},
 ['itemId', 'kind', 'skillId', 'name', 'sourceName', 'level', 'workspaceId', 'workspaceIds', 'boardIds', 'target', 'route', 'fromVersion', 'version',
   'settingsRevision', 'digest', 'hasCode', 'draft', 'dependencyOf', 'missingDependencies', 'forAgentIds', 'state', 'answer', 'reason', 'restartHints']);
@@ -77,7 +84,9 @@ const instruction = {anyOf: [
 export const SYNC_SCHEMAS = {
   empty: object({}), item, managed,
   inventory: object({helperVersion: string(), computerName: {type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9 ._-]+$'},
-    os: choice(['macos', 'linux', 'windows']), tokenStorage: choice(['keychain', 'file']), tools: array(HELPER_SCHEMAS.reportedTool, 40), managed: array(managed),
+    previousHelperIds: {...array(key, 20), uniqueItems: true},
+    os: choice(['macos', 'linux', 'windows']), tokenStorage: choice(['keychain', 'file', 'secret-service']), tools: array(HELPER_SCHEMAS.reportedTool, 40), managed: array(managed),
+    agentManaged: array(agentManaged),
     duplicates: array(object({tool: key, home, folderName: name, skillId: nullable(key)})),
     unmanaged: array(object({home, folderName: name, link: nullable(object({targetName: name, targetHome: nullable(home)})), hasScripts: {type: 'boolean'},
       physicalSourceId: {type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'},
@@ -94,7 +103,7 @@ export const SYNC_SCHEMAS = {
   updateAllQuery: object({workspaceId: key}, []),
   plan: object({planRevision: string(200), degraded: {type: 'boolean'}, pollAfterSeconds: {type: 'integer', minimum: 1, maximum: 86400},
     items: array(item), revoked: array(object({skillId: key, digest})), instructions: array(instruction)}),
-  questions: object({helpers: array(object({helperId: key, computerName: string(80), items: array(item), waitingCount: integer(), initialPlanReady: {type: 'boolean'}, allowSupported: {type: 'boolean'},
+  questions: object({helpers: array(object({helperId: key, computerName: string(80), items: array(item), waitingCount: integer(), pendingAllowCount: integer(), initialPlanReady: {type: 'boolean'}, allowSupported: {type: 'boolean'},
     duplicates: array(object({tool: key, home, folderName: name, skillId: nullable(key)})), agents: array(object({id: key, name: string(200)})),
     restartHints: array(object({tool: key, reload: choice(['live', 'command', 'restart']), command: nullable(string(2048))}), 40)}))}),
   answered: object({ok: {type: 'boolean', const: true}, answered: integer()}),

@@ -3,10 +3,11 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { runCli, computerName } from '../src/cli.js';
+import { runCli, computerName, validateCliLaunch } from '../src/cli.js';
 import { CommandError, readConfig, type Runner, type Timing } from '../src/config.js';
 import { atomicWrite, createPaths, ensurePaths } from '../src/paths.js';
 import { StateStore } from '../src/state.js';
+import { VERSION } from '../src/release-identity.js';
 import { RunnerState } from '../src/runner/state.js';
 
 test('CLI pairing stores only stdin secrets, installs the service, and uninstall preserves skills and backups', async () => {
@@ -51,7 +52,7 @@ test('CLI pairing stores only stdin secrets, installs the service, and uninstall
     else throw new Error('Unexpected helper route');
     return new Response(JSON.stringify({ data: body }), { status: 200 });
   };
-  const options = { home, env: { PATH: join(root, 'empty-bin') }, runner, request, timing, output: (line: string) => output.push(line) };
+  const options = { platform: 'darwin' as const, home, env: { PATH: join(root, 'empty-bin') }, runner, request, timing, output: (line: string) => output.push(line) };
   try {
     await runCli(['connect'], options);
     assert.ok(loaded);
@@ -80,9 +81,9 @@ test('CLI pairing stores only stdin secrets, installs the service, and uninstall
     assert.ok(output.some(line => line.includes('npm uninstall -g maddots-ai')));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
-test('CLI parses future commands and refuses a relative file flag before asking for confirmation', async () => {
+test('current helper CLI parses future commands and refuses a relative file flag before asking for confirmation', async () => {
   const output: string[] = [];
-  await runCli(['--version'], { output: line => output.push(line) }); assert.deepEqual(output, ['0.1.5']);
+  await runCli(['--version'], { output: line => output.push(line) }); assert.deepEqual(output, [VERSION]);
   await assert.rejects(runCli(['allow'], {isTTY: false}), {code: 'ALLOW_TTY_REQUIRED'});
   await assert.rejects(runCli(['allow', '--all'], {isTTY: false}), {code: 'ALLOW_TTY_REQUIRED'});
   await assert.rejects(runCli(['allow', '--yes'], {isTTY: true}), {code: 'USAGE'});
@@ -94,7 +95,7 @@ test('CLI parses future commands and refuses a relative file flag before asking 
 test('CLI status shows persisted Claude waiting commands from a separate process', async () => {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-cli-status-'));
   const home = join(root, 'home'); await mkdir(home, { mode: 0o700 });
-  const env = { PATH: join(root, 'empty-bin') }, config = readConfig(env, home);
+  const env = { PATH: join(root, 'empty-bin') }, config = readConfig(env, home, 'darwin');
   const output: string[] = [];
   try {
     const paths = await createPaths(config); await ensurePaths(paths);
@@ -108,7 +109,7 @@ test('CLI status shows persisted Claude waiting commands from a separate process
       format: 1, code: 'CLAUDE_CLI_MISSING', workspaceIds: ['workspaceA'],
     }));
     await runCli(['status'], {
-      home, env, output: line => output.push(line),
+      platform: 'darwin', home, env, output: line => output.push(line),
       runner: async () => { throw new Error('Status must not run external commands.'); },
       request: async () => { throw new Error('Unconnected status must not make requests.'); },
     });
@@ -122,8 +123,8 @@ test('CLI status shows persisted Claude waiting commands from a separate process
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 test('computer name uses scutil and falls back to a bounded safe hostname', async () => {
-  assert.equal(await computerName(async () => ({ stdout: 'Office-Mac\n', stderr: '' })), 'Office-Mac');
-  const fallback = await computerName(async () => { throw new CommandError(1); });
+  assert.equal(await computerName(async () => ({ stdout: 'Office-Mac\n', stderr: '' }), {}, 'darwin'), 'Office-Mac');
+  const fallback = await computerName(async () => { throw new CommandError(1); }, {}, 'darwin');
   assert.match(fallback, /^[A-Za-z0-9 ._-]{1,64}$/);
 });
 
@@ -131,7 +132,7 @@ for (const evidence of ['none', 'active-run', 'live-test', 'invalid-ledger', 'or
   test(`uninstall stops the service before home cleanup and preserves unverified evidence: ${evidence}`, async () => {
     const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-uninstall-homes-'));
     const home = join(root, 'home'); await mkdir(home, {mode: 0o700});
-    const env = {PATH: join(root, 'empty-bin')}, paths = await createPaths(readConfig(env, home));
+    const env = {PATH: join(root, 'empty-bin')}, paths = await createPaths(readConfig(env, home, 'darwin'));
     await ensurePaths(paths);
     const runId = '11111111-1111-1111-1111-111111111111', fence = 'a'.repeat(32);
     const savedHome = join(paths.data, 'run-homes', evidence === 'live-test' || evidence === 'orphan-test' ? `test-${fence}` : runId);
@@ -161,7 +162,7 @@ for (const evidence of ['none', 'active-run', 'live-test', 'invalid-ledger', 'or
       return {stdout: '', stderr: ''};
     };
     try {
-      await runCli(['uninstall'], {home, env, runner, output: line => output.push(line),
+      await runCli(['uninstall'], {platform: 'darwin', home, env, runner, output: line => output.push(line),
         request: async () => {assert.fail('An unpaired uninstall must not contact a server.');}});
       assert.equal(stopped, true);
       if (evidence === 'none') {
@@ -175,17 +176,24 @@ for (const evidence of ['none', 'active-run', 'live-test', 'invalid-ledger', 'or
   });
 }
 
-for (const platform of ['linux', 'win32']) test(`runs and agent refuse ${platform} before configuration, credentials or process work`, async t => {
+for (const platform of ['win32']) test(`runs and agent refuse ${platform} before configuration, credentials or process work`, async t => {
   const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
   Object.defineProperty(process, 'platform', {...descriptor, value: platform});
   t.after(() => Object.defineProperty(process, 'platform', descriptor));
   for (const argv of [['runs'], ['runs', 'test', 'codex'], ['runs', 'test', 'codex', '--model', 'fixture'],
     ['agent', 'setup'], ['agent', 'setup', 'fixture'], ['agent', 'access', 'fixture', 'full']]) {
-    await assert.rejects(runCli(argv, {
-      home: 'invalid relative home', env: {MADDOTS_AI_URL: 'invalid'},
-      runner: async () => {assert.fail('Unsupported runs must not invoke commands.');},
-      request: async () => {assert.fail('Unsupported runs must not make requests.');},
-      confirm: async () => {assert.fail('Unsupported runs must not prompt.');},
-    }), {code: 'RUNS_PLATFORM_UNSUPPORTED', message: /macOS.*TLS-35/});
+    for (const selectedPlatform of [undefined, platform as NodeJS.Platform]) {
+      const options = {
+        platform: selectedPlatform,
+        home: 'invalid relative home', env: {MADDOTS_AI_URL: 'invalid'},
+        runner: async () => {assert.fail('Unsupported runs must not invoke commands.');},
+        request: async () => {assert.fail('Unsupported runs must not make requests.');},
+        confirm: async () => {assert.fail('Unsupported runs must not prompt.');},
+        inspectRunProcesses: async () => {assert.fail('Unsupported runs must not inspect processes.');},
+      };
+      const refusal = {code: 'RUNS_PLATFORM_UNSUPPORTED', message: 'Agent runs are unsupported on this platform.'};
+      assert.throws(() => validateCliLaunch(argv, options), refusal);
+      await assert.rejects(runCli(argv, options), refusal);
+    }
   }
 });

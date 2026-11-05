@@ -25,7 +25,10 @@ export type ToolVariant = {
 export type ToolRun = {
   adapter: string;
   card: string;
+  /** Legacy server metadata. Helpers use only the current platform's acceptance. */
   offered: boolean;
+  /** Each platform is accepted separately. Missing acceptance always refuses runs. */
+  platforms?: Partial<Record<'darwin' | 'linux', { accepted: boolean }>>;
   folderOnly: 'os-sandbox' | 'no-shell' | 'none';
   mcpLevel: 'servers-off' | 'tools-denied';
   reason: string | null;
@@ -149,11 +152,20 @@ export function validateToolMatrix(value: unknown): ToolMatrix {
     else if (reload.command !== null) invalid(`${path}.reload.command`);
     string(tool.deliveryCard, `${path}.deliveryCard`);
     if (tool.run !== null) {
-      const run = object(tool.run, `${path}.run`, ['adapter', 'card', 'offered', 'folderOnly', 'mcpLevel', 'reason', 'checkedAt']);
+      const run = object(tool.run, `${path}.run`, ['adapter', 'card', 'offered', 'folderOnly', 'mcpLevel', 'reason', 'checkedAt',
+        ...(typeof tool.run === 'object' && Object.hasOwn(tool.run, 'platforms') ? ['platforms'] : [])]);
       string(run.adapter, `${path}.run.adapter`);
       if (!/^[a-z][a-z0-9-]{0,39}$/u.test(run.adapter)) invalid(`${path}.run.adapter`);
       string(run.card, `${path}.run.card`);
       if (typeof run.offered !== 'boolean') invalid(`${path}.run.offered`);
+      if (Object.hasOwn(run, 'platforms')) {
+        if (!run.platforms || typeof run.platforms !== 'object' || Array.isArray(run.platforms)) invalid(`${path}.run.platforms`);
+        for (const [platform, value] of Object.entries(run.platforms)) {
+          if (!['darwin', 'linux'].includes(platform)) invalid(`${path}.run.platforms.${platform}`);
+          const acceptance = object(value, `${path}.run.platforms.${platform}`, ['accepted']);
+          if (typeof acceptance.accepted !== 'boolean') invalid(`${path}.run.platforms.${platform}.accepted`);
+        }
+      }
       choice(run.folderOnly, `${path}.run.folderOnly`, ['os-sandbox', 'no-shell', 'none']);
       choice(run.mcpLevel, `${path}.run.mcpLevel`, ['servers-off', 'tools-denied']);
       if (run.reason !== null) string(run.reason, `${path}.run.reason`);
@@ -194,7 +206,8 @@ export function validateToolMatrix(value: unknown): ToolMatrix {
       const cli = (tool.variants as ToolVariant[]).find((variant) => variant.key === 'cli' && variant.detect.binaries.length > 0);
       // Keep the refusal reason visible for a CLI reviewed as skills sync only.
       // Such an entry can never advertise runs, even if offered is edited alone.
-      if (!cli || (cli.syncOnly && (run.offered || run.folderOnly !== 'none' || !run.reason?.trim()))) invalid(`${path}.run`);
+      const accepted = Object.values(run.platforms ?? {}).some(platform => platform.accepted);
+      if (!cli || (cli.syncOnly && (run.offered || accepted || run.folderOnly !== 'none' || !run.reason?.trim()))) invalid(`${path}.run`);
     }
   });
   if (!toolKeys.size) invalid('tools');
@@ -207,3 +220,5 @@ export function loadToolMatrix(source: string | URL = new URL('./tool-matrix.jso
 }
 
 export const TOOL_MATRIX = loadToolMatrix();
+
+export { isLinuxAcceptanceCandidate, toolRunCapability } from './tool-capabilities.js';

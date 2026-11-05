@@ -8,10 +8,11 @@ import { treeDigest } from '../src/shared/build-format.js';
 import { TOOL_MATRIX } from '../src/shared/tool-matrix.js';
 import { ApiError, type ApiClient } from '../src/api.js';
 import { listBackups, restoreBackup } from '../src/backups.js';
-import { runCli } from '../src/cli.js';
+import { runCli as platformRunCli, type CliOptions } from '../src/cli.js';
 import { readConfig } from '../src/config.js';
 import { AgentsFolderDeliveryTarget, agentsFolderReloadHints } from '../src/delivery/agents-folder.js';
 import type { DeliveryTarget } from '../src/delivery/index.js';
+import { detectTools } from '../src/detect.js';
 import { duplicateQuestions, grokDuplicateWarning, scanDuplicates } from '../src/duplicates.js';
 import { atomicWrite, createPaths, ensurePaths } from '../src/paths.js';
 import { RELEASE } from '../src/release-identity.js';
@@ -19,6 +20,9 @@ import { durableRename } from '../src/safe-fs.js';
 import { makeStamp, readStamp } from '../src/stamp.js';
 import { SyncEngine, type SyncOptions, type SyncPlan } from '../src/sync.js';
 import { BuildVerifier, signedBuildString, type PlanItem, type SignedBuild } from '../src/verify.js';
+
+// Keep these existing desktop integration fixtures on their original platform.
+const runCli = (argv: string[], options: CliOptions = {}) => platformRunCli(argv, {platform: 'darwin', ...options});
 
 const sharedTools = TOOL_MATRIX.tools.filter(tool => tool.route === 'agents-folder');
 const tools = sharedTools.map(tool => ({tool: tool.key, variant: tool.variants[0].key, version: null, models: [], syncOnly: tool.variants[0].syncOnly}));
@@ -29,10 +33,10 @@ const renderedText = `---\n${JSON.stringify({name: 'example', description: 'A sa
 }})}\n---\nFixture skill.\n`;
 const missing = async (path: string) => assert.rejects(lstat(path), {code: 'ENOENT'});
 
-async function fixture() {
+async function fixture(platform: 'darwin' | 'linux' = 'darwin') {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-agents-folder-'));
   const home = join(root, 'home'); await mkdir(home, {mode: 0o700});
-  const paths = await createPaths(readConfig({}, home)); await ensurePaths(paths);
+  const paths = await createPaths(readConfig({}, home, platform)); await ensurePaths(paths);
   const route = join(home, TOOL_MATRIX.routes['agents-folder'].path.slice(2));
   const signer = generateKeyPairSync('ed25519');
   const publicKey = signer.publicKey.export({type: 'spki', format: 'der'}).subarray(-32);
@@ -118,6 +122,35 @@ test('TLS-15 delivers byte-for-byte TLS-06 JSON-line renderer output', async () 
     assert.equal(await readFile(join(f.route, 'example/SKILL.md'), 'utf8'), renderedText);
     assert.equal((await engine.locks.read()).entries.length, 1);
     assert.deepEqual((await engine.inventory()).deliveryErrors, []);
+  } finally {await f.close();}
+});
+
+test('Linux static discovery keeps sync-only folder delivery working with an unverified version', async () => {
+  const f = await fixture('linux');
+  try {
+    const matrix = structuredClone(TOOL_MATRIX), grok = matrix.tools.find(tool => tool.key === 'grok')!;
+    matrix.tools = [grok]; grok.variants = [grok.variants.find(variant => variant.key === 'cli')!];
+    const binary = join(f.home, '.grok/bin/grok');
+    await mkdir(dirname(binary), {recursive: true});
+    await writeFile(binary, 'fixture executable', {mode: 0o700});
+    let dispatched = 0;
+    const detected = await detectTools({platform: 'linux', home: f.home, env: {}, matrix, runner: async () => {
+      dispatched++;
+      throw new Error('Unaccepted discovery must remain static.');
+    }});
+    assert.equal(detected.length, 1);
+    assert.equal(detected[0].syncOnly, true);
+    assert.equal(detected[0].version, null);
+    assert.equal(detected[0].versionVerified, false);
+    f.options.tools = detected;
+    const engine = f.engine(), build = f.build();
+    await engine.reconcile(); await engine.applyPlan(f.plan([f.item(build)]));
+    const inventory = await engine.inventory();
+    assert.deepEqual(inventory.tools, [{tool: 'grok', variant: 'cli', version: null, models: [], syncOnly: true}]);
+    assert.deepEqual(inventory.deliveryErrors, []);
+    assert.equal((await engine.locks.read()).entries.length, 1);
+    assert.equal(await readFile(join(f.route, 'example/SKILL.md'), 'utf8'), skillText());
+    assert.equal(dispatched, 0);
   } finally {await f.close();}
 });
 

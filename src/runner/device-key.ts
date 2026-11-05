@@ -2,7 +2,7 @@ import {createPrivateKey, generateKeyPairSync, sign, type KeyObject} from 'node:
 import {ApiClient, isObject, isSkillsToken} from '../api.js';
 import {HelperError} from '../config.js';
 import {withWriteLock, type HelperPaths} from '../paths.js';
-import type {SecretStore} from '../secret-store.js';
+import {requireCredentialCapability, type SecretStore} from '../secret-store.js';
 import {canonicalBase64url, deviceKeyFingerprint, deviceKeyProof} from '../shared/runner-protocol.js';
 
 export type RunnerDeviceKey = {deviceKeyId: string; privateKey: KeyObject};
@@ -17,7 +17,7 @@ function privateKey(key: StoredKey): KeyObject {
 export class DeviceKeyStore {
   constructor(private readonly options: {paths: HelperPaths; secrets: SecretStore; helperId: string; api: ApiClient}) {}
   private async read(): Promise<KeyDocument> {
-    if (this.options.secrets.storage !== 'keychain') throw new HelperError('FILE_RUNS_REFUSED', 'Agent runs require Keychain storage.');
+    requireCredentialCapability(this.options.secrets, 'deviceKeys', this.options.paths.platform ?? this.options.secrets.platform);
     const text = await this.options.secrets.get('device-key');
     if (text === undefined) return {format: 1, keys: {}};
     try {
@@ -59,16 +59,16 @@ export class DeviceKeyStore {
     });
   }
   /** Retry only persisted key material. This path cannot mint a key without a grant. */
-  async registerExisting(aiToolId: string): Promise<RunnerDeviceKey | undefined> {
+  async registerExisting(aiToolId: string, revalidate = false): Promise<RunnerDeviceKey | undefined> {
     if (!uuid.test(aiToolId)) throw new HelperError('DEVICE_KEY_INVALID', 'The tool connection id is invalid.');
     return withWriteLock(this.options.paths, async () => {
       const document = await this.read(), key = document.keys[aiToolId];
-      return key ? this.register(document, aiToolId, key) : undefined;
+      return key ? this.register(document, aiToolId, key, revalidate) : undefined;
     });
   }
-  private async register(document: KeyDocument, aiToolId: string, key: StoredKey): Promise<RunnerDeviceKey> {
+  private async register(document: KeyDocument, aiToolId: string, key: StoredKey, revalidate = false): Promise<RunnerDeviceKey> {
     const signingKey = privateKey(key);
-    if (key.deviceKeyId === null) {
+    if (key.deviceKeyId === null || revalidate) {
       const token = await this.options.secrets.get('skills-token');
       if (!isSkillsToken(token)) throw new HelperError('TOKEN_REQUIRED', 'Connect this computer before enabling runs.');
       const result = await this.options.api.request<{deviceKeyId: string; fingerprint: string}>('/api/helper/runs/device-key', {token, body: {

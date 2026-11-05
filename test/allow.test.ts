@@ -14,7 +14,7 @@ import { TOOL_MATRIX } from '../src/shared/tool-matrix.js';
 import { allowedBuild, runAllow, type AllowOptions } from '../src/allow.js';
 import { ApiError, type ApiClient, type ApiRequestOptions } from '../src/api.js';
 import { listBackups } from '../src/backups.js';
-import { runCli, type CliOptions } from '../src/cli.js';
+import { runCli as platformRunCli, type CliOptions } from '../src/cli.js';
 import { HelperError, readConfig } from '../src/config.js';
 import { FolderDeliveryTarget } from '../src/delivery/index.js';
 import { HoldingStore } from '../src/holding.js';
@@ -25,6 +25,9 @@ import { FileSecretStore } from '../src/secret-store.js';
 import { StateStore } from '../src/state.js';
 import { SyncEngine, type SyncInventory, type SyncPlan } from '../src/sync.js';
 import { BuildVerifier, signedBuildString, type PlanItem, type SignedBuild } from '../src/verify.js';
+
+// Keep these existing desktop integration fixtures on their original platform.
+const runCli = (argv: string[], options: CliOptions = {}) => platformRunCli(argv, {platform: 'darwin', ...options});
 
 type InputFile = { path: string; content: string | Buffer; mode?: BuildFileMode };
 const code = (text = 'printf first-script') => [
@@ -38,7 +41,7 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
   t.after(() => rm(root, { recursive: true, force: true }));
   const home = join(root, 'home');
   await mkdir(home, { mode: 0o700 });
-  const paths = await createPaths(readConfig({ MADDOTS_AI_HOME: join(root, 'private-data') }, home));
+  const paths = await createPaths(readConfig({ MADDOTS_AI_HOME: join(root, 'private-data') }, home, 'darwin'));
   await ensurePaths(paths);
   const routes = { 'agents-folder': join(home, '.agents/skills'), 'continue-folder': join(home, '.continue/skills') };
   for (const route of Object.values(routes)) await mkdir(route, { recursive: true });
@@ -1151,6 +1154,7 @@ test('a pending service dialog leaves the lock free and cannot overlap a later e
   assert.equal(notification.notifiedSets.length, 1);
 });
 
+// The explicit Darwin seam uses a portable sleep child instead of osascript.
 for (const ending of ['pointer', 'prepared', 'fatal', 'SIGTERM'] as const) {
   test(`service ${ending} cancels the real pending dialog child, exits promptly and shows the set after restart`, { timeout: 15_000 }, async t => {
     const f = await fixture(t), build = f.build(), plan = f.plan([f.item(build)]);
@@ -1164,8 +1168,9 @@ for (const ending of ['pointer', 'prepared', 'fatal', 'SIGTERM'] as const) {
     };
     const program = `
       import assert from 'node:assert/strict';
+      import { execFile } from 'node:child_process';
       import { runCli } from ${JSON.stringify(modules.cli)};
-      import { HelperError, runCommand } from ${JSON.stringify(modules.config)};
+      import { HelperError } from ${JSON.stringify(modules.config)};
       import { BuildVerifier } from ${JSON.stringify(modules.verify)};
       const ending = ${JSON.stringify(ending)};
       const state = ${JSON.stringify(state)};
@@ -1173,6 +1178,8 @@ for (const ending of ['pointer', 'prepared', 'fatal', 'SIGTERM'] as const) {
       const stop = new AbortController();
       process.once('SIGTERM', () => stop.abort());
       let opened = false;
+      let markStarted, failStart, dialogExit, dialogSignal;
+      const dialogStarted = new Promise((resolve, reject) => { markStarted = resolve; failStart = reject; });
       const request = async input => {
         const path = new URL(String(input)).pathname;
         let data;
@@ -1186,16 +1193,30 @@ for (const ending of ['pointer', 'prepared', 'fatal', 'SIGTERM'] as const) {
       const runner = (file, _args, options) => {
         if (file === '/usr/sbin/scutil') return Promise.resolve({ stdout: 'Shutdown-Test-Mac', stderr: '' });
         assert.equal(file, '/usr/bin/osascript');
-        opened = true;
-        process.stdout.write('dialog-opened\\n');
-        return runCommand('/bin/sleep', ['6'], options);
+        assert.ok(options?.signal);
+        dialogSignal = options.signal;
+        return new Promise((resolve, reject) => {
+          const child = execFile('/bin/sleep', ['6'], { signal: options.signal, encoding: 'utf8' }, (error, stdout, stderr) => {
+            if (error) reject(error);
+            else resolve({ stdout, stderr });
+          });
+          dialogExit = new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal })));
+          child.once('spawn', () => {
+            opened = true;
+            process.stdout.write('dialog-opened\\n');
+            markStarted();
+          });
+          child.once('error', error => { if (!opened) failStart(error); });
+        });
       };
       await runCli(['service'], {
+        platform: 'darwin',
         home: ${JSON.stringify(f.home)},
         env: { MADDOTS_AI_HOME: ${JSON.stringify(f.paths.data)}, PATH: ${JSON.stringify(join(f.root, 'empty-bin'))}, MADDOTS_AI_AUTO_UPDATE: ending === 'prepared' ? '1' : '0' },
         request, runner, signal: stop.signal, output() {},
         verifier: new BuildVerifier({ keys: [{ keyId: ${JSON.stringify(f.keyId)}, publicKey: ${JSON.stringify(f.publicKey.toString('base64'))} }], env: {} }),
         timing: { now: () => ${f.timing.now()}, sleep: async () => {
+          await dialogStarted;
           assert.ok(opened);
           if (ending === 'SIGTERM') { process.kill(process.pid, 'SIGTERM'); await new Promise(resolve => setImmediate(resolve)); }
           else throw new Error('Unexpected service sleep');
@@ -1204,11 +1225,12 @@ for (const ending of ['pointer', 'prepared', 'fatal', 'SIGTERM'] as const) {
         runtime: ${JSON.stringify(cli.options.runtime)},
         updates: {
           select: async () => {
+            await dialogStarted;
             assert.ok(opened);
             if (ending === 'fatal') throw new Error('Fatal service failure');
             return { root: ending === 'pointer' ? '/selected-new-helper' : ${JSON.stringify(f.root)} };
           },
-          check: async () => { assert.ok(opened); return { status: 'prepared', version: '0.2.0' }; },
+          check: async () => { await dialogStarted; assert.ok(opened); return { status: 'prepared', version: '0.2.0' }; },
         },
       }).then(() => {
         assert.equal(ending, 'SIGTERM'); process.stdout.write('loop-ended:SIGTERM\\n');
@@ -1218,6 +1240,10 @@ for (const ending of ['pointer', 'prepared', 'fatal', 'SIGTERM'] as const) {
         process.stdout.write('loop-ended:' + ending + '\\n');
         process.exitCode = 1;
       });
+      assert.ok(opened);
+      assert.equal(dialogSignal.aborted, true);
+      assert.deepEqual(await dialogExit, { code: null, signal: 'SIGTERM' });
+      process.stdout.write('dialog-cancelled\\n');
     `;
     const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', program], { stdio: ['ignore', 'pipe', 'pipe'] });
     t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
@@ -1234,7 +1260,7 @@ for (const ending of ['pointer', 'prepared', 'fatal', 'SIGTERM'] as const) {
     });
     const elapsed = Date.now() - loopEndedAt;
     assert.equal(exitCode, ending === 'SIGTERM' ? 0 : 1, stderr);
-    assert.match(stdout, /dialog-opened\nloop-ended:/u, stderr);
+    assert.equal(stdout, 'dialog-opened\nloop-ended:' + ending + '\ndialog-cancelled\n', stderr);
     assert.ok(loopEndedAt && elapsed < 2_000, `Service took ${elapsed} ms after its loop ended to exit with a six-second dialog child.`);
     assert.equal(await f.engine.holding.count(), 1);
     assert.deepEqual((await f.engine.locks.read()).entries, []);

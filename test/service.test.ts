@@ -10,7 +10,7 @@ import { installService, removeService, runService, SERVICE_INTERVAL_MS, SERVICE
 async function fixture(t: { after(fn: () => Promise<void>): void }): Promise<HelperPaths> {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'maddots-launchd-'));
   t.after(() => rm(home, { recursive: true, force: true }));
-  return createPaths(readConfig({}, home));
+  return createPaths(readConfig({}, home, 'darwin'));
 }
 
 function fakeLaunchctl() {

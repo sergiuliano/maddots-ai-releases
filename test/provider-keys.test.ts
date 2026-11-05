@@ -111,20 +111,39 @@ test('provider read, write and delete failures never expose command output or ke
   await assert.rejects(new KeychainProviderKeyStore(fake.runner, {}).get('deepseek'), {code: 'SECRET_STORE_FAILED'});
 });
 
-test('keys set refuses argv values and nonterminal stdin before prompting or external work', async () => {
+test('key commands refuse argv values before platform checks, prompting or external work', async () => {
   const options = {
     env: {MADDOTS_AI_URL: 'invalid'}, home: 'invalid relative home', isTTY: false,
     readKey: async () => {assert.fail('Refused input must not prompt.');},
     runner: async () => {assert.fail('Refused input must not invoke commands.');},
   };
-  for (const argv of [['keys', 'set', 'deepseek', sentinel], ['keys', 'set', 'deepseek', '--key', sentinel],
+  for (const platform of ['darwin', 'linux'] as const) for (const argv of [
+    ['keys', 'set', 'deepseek', sentinel], ['keys', 'set', 'deepseek', '--key', sentinel],
     ['keys', 'status', sentinel], ['keys', 'delete', 'deepseek', sentinel], ['keys', 'set', 'other']]) {
-    await assert.rejects(runCli(argv, options), error => {
+    await assert.rejects(runCli(argv, {...options, platform}), error => {
       assert.equal((error as {code: string}).code, 'USAGE');
       assert.ok(!String(error).includes(sentinel)); return true;
     });
   }
-  await assert.rejects(runCli(['keys', 'set', 'deepseek'], options), {code: 'PROVIDER_KEY_TTY_REQUIRED'});
+});
+
+test('keys set refuses nonterminal stdin on macOS before prompting or external work', async () => {
+  await assert.rejects(runCli(['keys', 'set', 'deepseek'], {
+    platform: 'darwin', env: {MADDOTS_AI_URL: 'invalid'}, home: 'invalid relative home', isTTY: false,
+    readKey: async () => {assert.fail('Refused input must not prompt.');},
+    runner: async () => {assert.fail('Refused input must not invoke commands.');},
+  }), {code: 'PROVIDER_KEY_TTY_REQUIRED'});
+});
+
+test('Linux refuses provider key commands before path, prompt, command or network work', async () => {
+  for (const argv of [['keys', 'set', 'deepseek'], ['keys', 'status'], ['keys', 'delete', 'deepseek']]) {
+    await assert.rejects(runCli(argv, {
+      platform: 'linux', env: {MADDOTS_AI_URL: 'invalid'}, home: 'invalid relative home', isTTY: true,
+      readKey: async () => {assert.fail('Unsupported provider keys must not prompt.');},
+      runner: async () => {assert.fail('Unsupported provider keys must not invoke commands.');},
+      request: async () => {assert.fail('Unsupported provider keys must not contact the server.');},
+    }), {code: 'PROVIDER_KEYS_UNSUPPORTED', message: 'DeepSeek provider keys are available only on macOS.'});
+  }
 });
 
 test('keys set rejects unsafe prompted values without echoing them or invoking Keychain', async () => {
@@ -133,7 +152,7 @@ test('keys set rejects unsafe prompted values without echoing them or invoking K
   try {
     for (const suffix of ['"', '\\', ' ', '\n', '\t', '\0', '\x7f']) {
       const invalid = sentinel + suffix;
-      await assert.rejects(runCli(['keys', 'set', 'deepseek'], {home: root, env: {}, isTTY: true, runner: fake.runner,
+      await assert.rejects(runCli(['keys', 'set', 'deepseek'], {platform: 'darwin', home: root, env: {}, isTTY: true, runner: fake.runner,
         readKey: async () => invalid, output: line => output.push(line)}), error => {
         assert.equal((error as {code: string}).code, 'PROVIDER_KEY_INVALID');
         assert.match(String(error), /20 to 200 letters, digits, hyphens/);
@@ -149,14 +168,14 @@ test('key commands work without pairing, reveal status only, and never persist a
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-provider-keys-'));
   const home = join(root, 'home'); await mkdir(home, {mode: 0o700});
   const fake = fakeKeychain(), output: string[] = [], env = {PATH: join(root, 'empty-bin')};
-  const options = {home, env, runner: fake.runner, isTTY: true, readKey: async () => sentinel, output: (line: string) => output.push(line),
+  const options = {platform: 'darwin' as const, home, env, runner: fake.runner, isTTY: true, readKey: async () => sentinel, output: (line: string) => output.push(line),
     request: async () => {assert.fail('Key commands never contact the server.');}};
   try {
     await runCli(['keys', 'status'], options);
     await runCli(['keys', 'set', 'deepseek'], options);
     await runCli(['keys', 'status'], options);
     assert.deepEqual(output, ['deepseek: not set', 'deepseek: set', 'deepseek: set']);
-    const paths = await createPaths(readConfig(env, home));
+    const paths = await createPaths(readConfig(env, home, 'darwin'));
     for (const entry of await readdir(paths.data, {recursive: true, withFileTypes: true})) {
       if (entry.isFile()) assert.ok(!(await readFile(join(entry.parentPath, entry.name), 'utf8')).includes(sentinel));
     }

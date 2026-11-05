@@ -3,12 +3,16 @@ import type { DetectedTool } from './detect.js';
 import type { Connection } from './pairing.js';
 import { HelperError } from './config.js';
 import { atomicWrite, readPrivateFile, type HelperPaths } from './paths.js';
+import type { SecretStorage } from './secret-store.js';
+import { helperPlatform } from './platform.js';
+import { isAbsolute } from 'node:path';
 
 export type HelperState = {
   format: 1; endpoint: string; status: 'unpaired' | 'connected' | 'renew_required' | 'pair_again';
   helperId?: string; account?: { id: string; name: string }; scopes: Scope[];
   issuedAt?: string; renewBy?: string; idleLapseAt?: string; tools: DetectedTool[]; pendingTools: DetectedTool[];
-  tokenStorage: 'keychain' | 'file'; tokenFile?: string; lastDetectionAt?: string; lastRenewDialogAt?: string; lastRenewCheckAt?: string;
+  tokenStorage: SecretStorage; tokenFile?: string; credentialBackendSelected?: boolean; secretServiceBinary?: string;
+  lastDetectionAt?: string; lastRenewDialogAt?: string; lastRenewCheckAt?: string;
   connections?: Connection[]; proposedTools?: { tool: string; variant: string }[];
 };
 export class StateStore {
@@ -17,13 +21,17 @@ export class StateStore {
     let content: string;
     try { content = await readPrivateFile(this.paths.state); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { format: 1, endpoint: this.endpoint.href, status: 'unpaired', scopes: [], tools: [], pendingTools: [], tokenStorage: 'keychain' };
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { format: 1, endpoint: this.endpoint.href, status: 'unpaired', scopes: [], tools: [], pendingTools: [], tokenStorage: helperPlatform(this.paths.platform) === 'linux' ? 'file' : 'keychain' };
       throw error;
     }
     try {
       const state = JSON.parse(content) as HelperState;
       if (state.format !== 1 || state.endpoint !== this.endpoint.href || !['unpaired', 'connected', 'renew_required', 'pair_again'].includes(state.status) ||
-          !['keychain', 'file'].includes(state.tokenStorage) || !Array.isArray(state.scopes) || !Array.isArray(state.tools) || !Array.isArray(state.pendingTools) ||
+          !['keychain', 'file', 'secret-service'].includes(state.tokenStorage) ||
+          state.credentialBackendSelected !== undefined && typeof state.credentialBackendSelected !== 'boolean' ||
+          state.secretServiceBinary !== undefined && (typeof state.secretServiceBinary !== 'string' || !isAbsolute(state.secretServiceBinary) ||
+            state.secretServiceBinary.length > 4096 || /[\p{Cc}\p{Cf}]/u.test(state.secretServiceBinary)) ||
+          !Array.isArray(state.scopes) || !Array.isArray(state.tools) || !Array.isArray(state.pendingTools) ||
           state.scopes.some(scope => !['sync', 'import_upload', 'proposal_upload', 'run_claim'].includes(scope)) ||
           /mdai_skill_[A-Za-z0-9_-]{43}/.test(content)) throw new Error();
       return state;

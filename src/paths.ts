@@ -1,13 +1,19 @@
 import { constants } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readdir, realpath, rename, unlink } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { lstat, mkdir, open, readdir, readlink, realpath, rename, unlink } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { TOOL_MATRIX } from './shared/tool-matrix.js';
-import { HelperError, clock, type HelperConfig, type Timing } from './config.js';
+import { HelperError, type HelperConfig } from './config.js';
+import {findGitRepository, GitRepositoryError} from './git-repository.js';
+import { helperPlatform, type HelperPlatform } from './platform.js';
+import { assertLockUpgradeReady } from './write-lock-upgrade.js';
 
 export type HelperPaths = {
   home: string; data: string; logs: string; holding: string; backups: string;
   state: string; lock: string; servicePlist: string; routes: string[];
+  platform?: HelperPlatform; config?: string; stateDir?: string; runtime?: string;
+  serviceUnit?: string; serviceHeartbeat?: string; credentialFile?: string;
+  linuxStorage?: {roots: string[]; states: string[]};
 };
 const owner = () => process.getuid?.();
 export function inside(parent: string, child: string): boolean {
@@ -71,6 +77,18 @@ async function existingGlobPaths(pattern: string): Promise<string[]> {
 }
 
 export async function createPaths(config: HelperConfig): Promise<HelperPaths> {
+  return checkedPaths(config, false);
+}
+
+/** Recovery alone can inspect the fixed user-unit mask. All other paths and
+ * ordinary writer entrypoints retain the no-symlink boundary. Live recovery
+ * separately verifies both masks, their parents and the systemd unit state. */
+export async function createRecoveryPaths(config: HelperConfig): Promise<HelperPaths> {
+  return checkedPaths(config, true);
+}
+
+async function checkedPaths(config: HelperConfig, recovery: boolean): Promise<HelperPaths> {
+  const platform = helperPlatform(config.platform ?? 'darwin');
   const home = await realpath(config.home);
   const requested = config.dataDir;
   const anchor = inside(config.home, requested) ? home : await canonicalParent(requested);
@@ -100,13 +118,103 @@ export async function createPaths(config: HelperConfig): Promise<HelperPaths> {
       }
     }
   }
-  for (let ancestor = data; ; ancestor = dirname(ancestor)) {
-    try { await lstat(join(ancestor, '.git')); throw new HelperError('PATH_UNSAFE', 'The data folder cannot be inside a Git work tree.'); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-    if (ancestor === dirname(ancestor)) break;
+  try {
+    if (await findGitRepository(data)) throw new HelperError('PATH_UNSAFE', 'The data folder cannot be inside a Git work tree.');
+  } catch (error) {
+    if (error instanceof GitRepositoryError) throw new HelperError('PATH_UNSAFE', 'The data folder cannot use symlink or unsafe Git path components.');
+    throw error;
   }
-  return { home, data, logs: join(data, 'logs'), holding: join(data, 'holding'), backups: join(data, 'backups'),
-    state: join(data, 'state.json'), lock: join(data, '.lock'), servicePlist: join(home, 'Library/LaunchAgents/app.maddots.ai.helper.plist'), routes: prohibited };
+  const paths: HelperPaths = { home, data, logs: join(data, 'logs'), holding: join(data, 'holding'), backups: join(data, 'backups'),
+    state: join(data, 'state.json'), lock: join(data, '.lock'), servicePlist: join(home, 'Library/LaunchAgents/app.maddots.ai.helper.plist'), routes: prohibited, platform };
+  if (platform === 'darwin') return paths;
+
+  // Resolve a home alias once, then reject linked components in every private
+  // XDG boundary, including overrides outside HOME.
+  const privatePath = async (requested: string, serviceMask = false): Promise<string> => {
+    if (!isAbsolute(requested)) throw new HelperError('CONFIG_INVALID', 'XDG helper paths must be absolute.');
+    const path = inside(config.home, requested) ? resolve(home, relative(config.home, requested)) : resolve(requested);
+    const anchor = inside(config.home, requested) ? home : await canonicalParent(requested);
+    if (recovery && serviceMask && path === join(home, '.config/systemd/user/app.maddots.ai.helper.service')) {
+      await assertNoSymlinks(dirname(path), anchor);
+      try {
+        const before = await lstat(path, {bigint: true});
+        if (before.isSymbolicLink()) {
+          if (before.uid !== BigInt(owner()!) || before.nlink !== 1n || await readlink(path) !== '/dev/null') {
+            throw new HelperError('PATH_UNSAFE', 'Recovery accepts only the owned user-unit mask pointing directly to /dev/null.');
+          }
+          const after = await lstat(path, {bigint: true});
+          if (!after.isSymbolicLink() || after.uid !== before.uid || after.nlink !== before.nlink ||
+              after.dev !== before.dev || after.ino !== before.ino || after.ctimeNs !== before.ctimeNs || await readlink(path) !== '/dev/null') {
+            throw new HelperError('PATH_UNSAFE', 'The recovery user-unit mask changed during inspection.');
+          }
+          await assertNoSymlinks(dirname(path), anchor);
+          return path;
+        }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    }
+    await assertNoSymlinks(path, anchor);
+    return path;
+  };
+  const configHome = config.env.XDG_CONFIG_HOME || join(config.home, '.config');
+  const stateHome = config.env.XDG_STATE_HOME || join(config.home, '.local/state');
+  const configDir = await privatePath(join(configHome, 'maddots-ai'));
+  const stateDir = await privatePath(join(stateHome, 'maddots-ai'));
+  const runtime = await privatePath(config.env.XDG_RUNTIME_DIR ? join(config.env.XDG_RUNTIME_DIR, 'mdai') : join(stateDir, 'runtime'));
+  const serviceUnit = await privatePath(join(configHome, 'systemd/user/app.maddots.ai.helper.service'), true);
+  if (overlaps(configDir, data) || overlaps(stateDir, data) || overlaps(runtime, data) || overlaps(configDir, stateDir) || overlaps(configDir, runtime)) {
+    throw new HelperError('PATH_UNSAFE', 'Helper credential, data, state and runtime folders must keep their private boundaries separate.');
+  }
+  if ([data, configDir, stateDir, runtime].some(root => overlaps(root, serviceUnit))) {
+    throw new HelperError('PATH_UNSAFE', 'The helper service unit must be outside its credential, data, state and runtime folders.');
+  }
+  // Linux private storage must be outside the whole vendor home, not just its
+  // skills route. Check physical aliases as well as not-yet-created glob homes.
+  const homes = TOOL_MATRIX.tools.flatMap(tool => tool.homes.map(entry => expand(entry.glob, home, data)));
+  for (const path of [data, configDir, stateDir, runtime, serviceUnit]) {
+    if (path === home || path === sep || prohibited.some(route => overlaps(route, path))) {
+      throw new HelperError('PATH_UNSAFE', 'Private helper paths must be outside tool folders and maddots-mcp storage.');
+    }
+    for (const pattern of homes) {
+      const prefix = pattern.split('*')[0];
+      if (pattern.includes('*') ? path.startsWith(prefix) || prefix.startsWith(path + sep) : overlaps(pattern, path)) {
+        throw new HelperError('PATH_UNSAFE', 'Private helper paths must be outside every tool home.');
+      }
+      for (const toolHome of pattern.includes('*') ? await existingGlobPaths(pattern) : [pattern]) {
+        if (overlaps(await physicalPath(toolHome), path)) throw new HelperError('PATH_UNSAFE', 'Private helper paths must be outside the physical targets of tool homes.');
+      }
+    }
+    try {
+      // Repository discovery takes a directory. The unit may already exist as
+      // a regular file when the service restarts or the user checks status.
+      if (await findGitRepository(path === serviceUnit ? dirname(path) : path)) throw new HelperError('PATH_UNSAFE', 'Private helper paths cannot be inside a Git work tree.');
+    } catch (error) {
+      if (error instanceof GitRepositoryError) throw new HelperError('PATH_UNSAFE', 'Private helper paths cannot use symlink or unsafe Git path components.');
+      throw error;
+    }
+  }
+  // Preserve configured and default candidates even when today's overrides
+  // hide them. In particular MADDOTS_AI_HOME must not erase XDG_DATA_HOME.
+  // These are inspection boundaries, not directories to create. Historical
+  // arbitrary overrides cannot be reconstructed without a coordinator record.
+  const canonical = (path: string) => inside(config.home, path) ? resolve(home, relative(config.home, path)) : resolve(path);
+  const dataRoots = [...new Set([data, canonical(join(config.env.XDG_DATA_HOME || join(config.home, '.local/share'), 'maddots-ai')),
+    join(home, '.local/share/maddots-ai'), join(home, 'Library/Application Support/maddots-ai')])];
+  const stateRoots = [...new Set([stateDir, join(home, '.local/state/maddots-ai')])];
+  const linuxStorage = {
+    roots: [...new Set([...dataRoots, configDir, join(home, '.config/maddots-ai'), ...stateRoots,
+      ...stateRoots.map(root => join(root, 'runtime')), runtime, `/run/user/${owner()}/mdai`])].sort(),
+    states: [...new Set([...dataRoots, ...stateRoots].map(root => join(root, 'state.json')))].sort(),
+  };
+  return {...paths, config: configDir, stateDir, runtime, serviceUnit, servicePlist: serviceUnit, linuxStorage,
+    serviceHeartbeat: join(stateDir, 'service-heartbeat.json'), state: join(stateDir, 'state.json')};
+}
+
+/** Private helper boundaries shared by import and local-folder validation. */
+export function protectedHelperPaths(paths: HelperPaths): string[] {
+  if (paths.platform !== 'linux') return [paths.data, dirname(paths.servicePlist)];
+  return [...new Set([paths.data, paths.logs, paths.backups, paths.config ?? join(paths.home, '.config/maddots-ai'),
+    paths.stateDir ?? dirname(paths.state), paths.runtime ?? join(paths.stateDir ?? dirname(paths.state), 'runtime'),
+    dirname(paths.serviceUnit ?? paths.servicePlist), ...(paths.credentialFile ? [dirname(paths.credentialFile)] : [])])];
 }
 
 export async function ensurePrivateDirectory(path: string): Promise<void> {
@@ -119,17 +227,20 @@ export async function ensurePrivateDirectory(path: string): Promise<void> {
   }
 }
 export async function ensurePaths(paths: HelperPaths): Promise<void> {
-  for (const path of [paths.data, paths.logs, paths.holding, paths.backups, ...['staging', 'cache/builds', 'exports/claude-desktop', 'updates'].map(name => join(paths.data, name))]) {
+  await assertLockUpgradeReady(paths);
+  for (const path of [paths.data, ...(paths.platform === 'linux' ? [paths.config, paths.stateDir, paths.runtime].filter((path): path is string => !!path) : []),
+    paths.logs, paths.holding, paths.backups, ...['staging', 'cache/builds', 'exports/claude-desktop', 'updates'].map(name => join(paths.data, name))]) {
     await ensurePrivateDirectory(path);
   }
 }
 
-export async function readPrivateFile(path: string, limit = 1024 * 1024): Promise<string> {
+type PrivateFileOptions = {singleLink?: boolean};
+export async function readPrivateFile(path: string, limit = 1024 * 1024, options: PrivateFileOptions = {}): Promise<string> {
   await assertNoSymlinks(path);
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const info = await file.stat();
-    if (!info.isFile() || info.uid !== owner() || (info.mode & 0o777) !== 0o600 || info.size > limit) {
+    if (!info.isFile() || info.uid !== owner() || (options.singleLink && info.nlink !== 1) || (info.mode & 0o777) !== 0o600 || info.size > limit) {
       throw new HelperError('FILE_UNSAFE', 'The helper file must be private, regular, and owned by this user.');
     }
     const buffer = Buffer.alloc(limit + 1);
@@ -139,12 +250,14 @@ export async function readPrivateFile(path: string, limit = 1024 * 1024): Promis
   } finally { await file.close(); }
 }
 
-export async function atomicWrite(path: string, content: string): Promise<void> {
+export async function atomicWrite(path: string, content: string,
+  options: PrivateFileOptions & {namedTemporary?: boolean} = {}): Promise<void> {
   const directory = dirname(path);
   await assertNoSymlinks(path);
-  try { await readPrivateFile(path, 4 * 1024 * 1024); }
+  try { await readPrivateFile(path, 4 * 1024 * 1024, options); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  const temporary = join(directory, `.${randomUUID()}.tmp`);
+  // Opt in only for publications sharing a directory with the Linux journal.
+  const temporary = join(directory, `.${options.namedTemporary ? basename(path) + '.' : ''}${randomUUID()}.tmp`);
   const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
   try {
     await file.writeFile(content); await file.sync(); await file.close();
@@ -155,42 +268,15 @@ export async function atomicWrite(path: string, content: string): Promise<void> 
   } finally { await file.close().catch(() => {}); await unlink(temporary).catch(() => {}); }
 }
 
-function processAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
-}
-export async function withWriteLock<T>(paths: HelperPaths, action: () => Promise<T>, timing: Timing = clock, alive: (pid: number) => boolean = processAlive): Promise<T> {
-  await ensurePrivateDirectory(paths.data);
-  const deadline = timing.now() + 10_000;
-  let file;
-  while (!file) {
-    await assertNoSymlinks(paths.lock);
-    try { file = await open(paths.lock, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      try {
-        const previous = await lstat(paths.lock);
-        const text = await readPrivateFile(paths.lock, 32);
-        if (!text && timing.now() < deadline) { await timing.sleep(50); continue; }
-        const pid = Number(text);
-        if (!/^\d+$/.test(text) || !Number.isSafeInteger(pid) || pid <= 0) throw new HelperError('LOCK_UNSAFE', 'The helper lock is invalid. Inspect the private .lock file before reconnecting.');
-        if (!alive(pid)) {
-          const latest = await lstat(paths.lock);
-          if (previous.dev === latest.dev && previous.ino === latest.ino) await unlink(paths.lock);
-          continue;
-        }
-      } catch (inspection) { if ((inspection as NodeJS.ErrnoException).code === 'ENOENT') continue; throw inspection; }
-      if (timing.now() >= deadline) throw new HelperError('HELPER_BUSY', 'Another helper command is writing. Try again shortly.');
-      await timing.sleep(50);
-    }
-  }
-  try { await file.writeFile(String(process.pid)); await file.sync(); return await action(); }
-  finally { await file.close(); await unlink(paths.lock); }
-}
+export { withWriteLock } from './write-lock.js';
 
 export async function assertSecretPath(path: string, paths: HelperPaths): Promise<void> {
-  if (!isAbsolute(path) || paths.routes.some(route => overlaps(route, resolve(path))) || inside(paths.data, resolve(path)) || inside(dirname(paths.servicePlist), resolve(path)) || resolve(path) === join(paths.home, '.claude.json')) {
-    throw new HelperError('FILE_UNSAFE', 'The token file must be an absolute path outside tool folders, helper data, and LaunchAgents.');
+  const absolute = resolve(path), credentialDir = paths.config ?? join(paths.home, '.config/maddots-ai');
+  const defaultCredential = paths.platform === 'linux' && absolute === join(credentialDir, 'credentials.json');
+  const selectedCredential = paths.platform === 'linux' && absolute === paths.credentialFile;
+  if (!isAbsolute(path) || paths.routes.some(route => overlaps(route, absolute)) || protectedHelperPaths(paths).some(root =>
+    inside(root, absolute) && !(defaultCredential && root === credentialDir) && !(selectedCredential && root === dirname(paths.credentialFile!))) || absolute === join(paths.home, '.claude.json')) {
+    throw new HelperError('FILE_UNSAFE', paths.platform === 'linux' ? 'The token file must be an absolute path outside tool folders and helper credential, data, state, runtime and service storage.' : 'The token file must be an absolute path outside tool folders, helper data, and LaunchAgents.');
   }
   for (const tool of TOOL_MATRIX.tools) {
     for (const entry of tool.homes) {
@@ -207,4 +293,12 @@ export async function assertSecretPath(path: string, paths: HelperPaths): Promis
     }
   }
   await assertNoSymlinks(path);
+  if (paths.platform === 'linux') {
+    try {
+      if (await findGitRepository(dirname(path))) throw new HelperError('FILE_UNSAFE', 'The credential file cannot be inside a Git work tree.');
+    } catch (error) {
+      if (error instanceof GitRepositoryError) throw new HelperError('FILE_UNSAFE', 'The credential file cannot use unsafe Git path components.');
+      throw error;
+    }
+  }
 }

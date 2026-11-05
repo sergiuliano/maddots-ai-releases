@@ -3,13 +3,15 @@ import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, mkdtemp, open, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { TOOL_MATRIX, type ToolMatrix } from '../shared/tool-matrix.js';
+import { TOOL_MATRIX, toolRunCapability, type ToolMatrix } from '../shared/tool-matrix.js';
+import { LINUX_FOLDER_ONLY_REASON, isLinuxAcceptanceCandidate } from '../shared/tool-capabilities.js';
 import { HelperError, cleanEnvironment, clock, endpointUrl, runCommand } from '../config.js';
 import { type NotifyOptions } from '../notify.js';
-import { assertNoSymlinks, atomicWrite, ensurePrivateDirectory, inside, readPrivateFile, withWriteLock, type HelperPaths } from '../paths.js';
+import { assertNoSymlinks, atomicWrite, ensurePrivateDirectory, inside, protectedHelperPaths, readPrivateFile, withWriteLock, type HelperPaths } from '../paths.js';
 import type { Access, Adapter } from './adapter.js';
 import { startTool, type ProcessInspector, type StartToolOptions } from './process.js';
 import type { LocalAgent } from './runner.js';
+import {currentLinuxToolLifecycle, withLinuxRunContext} from './linux-lifecycle.js';
 
 export const FULL_ACCESS_WARNING = "Full access: the run can reach everything your user account can reach: other folders, keys (including saved MadDots tokens such as maddots-mcp's), the network. It follows the card's instructions, so anyone who can edit an assigned card can steer it. The folder is where it works, not a wall.";
 export const AGENT_DIALOG_INTERVAL_MS = 4 * 60 * 60 * 1000;
@@ -52,9 +54,13 @@ export async function validateAgentFolder(paths: HelperPaths, path: string): Pro
   if (!isAbsolute(path) || /[\p{Cc}\p{Cf}]/u.test(path)) return fail('FOLDER_UNSAFE', 'Choose an absolute path to an existing folder owned by you.');
   const folder = await realpath(path), home = await realpath(paths.home), info = await lstat(folder);
   if (!info.isDirectory() || info.uid !== process.getuid?.() || folder === sep || folder === home) return fail('FOLDER_UNSAFE', 'Choose an existing folder owned by you, other than HOME or the filesystem root.');
-  const exclusions = [paths.data, paths.backups, join(home, '.maddots-ai'), join(home, 'Library'), ...paths.routes];
+  const exclusions = [paths.data, paths.backups, join(home, '.maddots-ai'),
+    ...(paths.platform === 'linux' ? protectedHelperPaths(paths) : [join(home, 'Library')]), ...paths.routes];
   for (const excluded of exclusions) {
-    if (inside(resolve(excluded), folder) || inside(await physicalPath(excluded), folder)) return fail('FOLDER_UNSAFE', 'The working folder must be outside helper data, tool delivery folders, backups and Library.');
+    const physical = await physicalPath(excluded);
+    if (inside(resolve(excluded), folder) || inside(physical, folder) || paths.platform === 'linux' && (inside(folder, resolve(excluded)) || inside(folder, physical))) {
+      return fail('FOLDER_UNSAFE', paths.platform === 'linux' ? 'The working folder must be outside helper credential, data, state, runtime, service and tool delivery folders.' : 'The working folder must be outside helper data, tool delivery folders, backups and Library.');
+    }
   }
   await assertNoSymlinks(folder);
   const after = await lstat(folder);
@@ -89,7 +95,7 @@ export class LocalAgents {
       if (JSON.stringify(current[agentId] ?? null) !== JSON.stringify(expected ?? null)) fail('AGENT_SETTINGS_CHANGED', 'Local agent settings changed while you were confirming them. Run the command again.');
       const rows = { ...current, [agentId]: row };
       if (!validRows(rows)) fail();
-      await atomicWrite(this.file, JSON.stringify(rows) + '\n');
+      await atomicWrite(this.file, JSON.stringify(rows) + '\n', {namedTemporary: process.platform === 'linux'});
     });
   }
   private async finishSetup(agentId: string, expected: LocalAgentRecord): Promise<LocalAgentRecord> {
@@ -98,7 +104,7 @@ export class LocalAgents {
       if (!current || current.aiToolId !== expected.aiToolId || current.folder !== expected.folder) return fail('AGENT_SETTINGS_CHANGED', 'The agent binding changed during setup. Run setup for its current folder.');
       // A concurrent access reduction remains authoritative when trust finishes.
       const row = {...current, setupDone: true}; rows[agentId] = row;
-      await atomicWrite(this.file, JSON.stringify(rows) + '\n'); return row;
+      await atomicWrite(this.file, JSON.stringify(rows) + '\n', {namedTemporary: process.platform === 'linux'}); return row;
     });
   }
   /** The runner receives only locally confirmed, successfully set up agents. */
@@ -116,33 +122,41 @@ export class LocalAgents {
   async setup(agent: AgentIdentity, options: AgentSetupOptions): Promise<LocalAgentRecord> {
     terminal(options);
     if (!uuid(agent.agentId) || !uuid(agent.aiToolId) || !handleValid(agent.handle)) return fail('AGENT_SETUP_INVALID', 'The agent identity is invalid.');
-    const matrixRun = (options.matrix ?? TOOL_MATRIX).tools.find(tool => tool.run?.adapter === options.adapter.info.tool)?.run;
-    if (!matrixRun) return fail('AGENT_SETUP_INVALID', 'The tool has no runner access configuration.');
+    const definition = (options.matrix ?? TOOL_MATRIX).tools.find(tool => tool.run?.adapter === options.adapter.info.tool);
+    const matrixRun = toolRunCapability(definition, process.platform);
+    const definitionOnly = process.platform === 'linux' && isLinuxAcceptanceCandidate(definition) && matrixRun?.offered === false;
+    if (!matrixRun || !matrixRun.offered && !definitionOnly) return fail('AGENT_SETUP_INVALID', 'The tool has no accepted runner access configuration for this platform.');
     const rows = await this.read(), previous = rows[agent.agentId];
     const defaultFolder = join(this.paths.home, 'MadDots Agents', `${agent.handle}-${agent.agentId.slice(0, 8)}`);
     const typed = await options.prompt(`Working folder [${defaultFolder}]: `);
     let folderCreated = false;
     if (!typed) {
-      await ensurePrivateDirectory(join(this.paths.home, 'MadDots Agents'));
-      try { await mkdir(defaultFolder, { mode: 0o700 }); folderCreated = true; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-      await ensurePrivateDirectory(defaultFolder);
+      await withWriteLock(this.paths, async () => {
+        await ensurePrivateDirectory(join(this.paths.home, 'MadDots Agents'));
+        try { await mkdir(defaultFolder, { mode: 0o700 }); folderCreated = true; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+        await ensurePrivateDirectory(defaultFolder);
+      });
     }
     const expanded = typed === '~' ? this.paths.home : typed.startsWith('~/') ? join(this.paths.home, typed.slice(2)) : typed;
     const folder = await validateAgentFolder(this.paths, expanded || defaultFolder);
     const sameBinding = previous?.aiToolId === agent.aiToolId && previous.folder === folder;
     const defaultFull = sameBinding && previous.access === 'full_access';
-    const answer = await options.prompt(defaultFull ? 'Access [full], or type folder-only: ' : matrixRun.folderOnly === 'none' ? 'This tool requires Full access. Type full to choose it: ' : 'Access [folder-only], or type full: ');
+    const answer = await options.prompt(matrixRun.folderOnly === 'none'
+      ? defaultFull ? 'Access [full]: ' : 'This tool requires Full access. Type full to choose it: '
+      : defaultFull ? 'Access [full], or type folder-only: ' : 'Access [folder-only], or type full: ');
     let access: Access = 'folder_only';
     if (answer === 'full') { await fullAccess(options); access = 'full_access'; }
     else if (answer === '' && defaultFull) access = 'full_access';
-    else if (answer !== '' && answer !== 'folder-only' || matrixRun.folderOnly === 'none') return fail('ACCESS_NOT_CONFIRMED', 'The selected access is unavailable or was not confirmed.');
+    else if (answer !== '' && answer !== 'folder-only' || matrixRun.folderOnly === 'none') return fail('ACCESS_NOT_CONFIRMED',
+      process.platform === 'linux' && isLinuxAcceptanceCandidate(definition) ? LINUX_FOLDER_ONLY_REASON : 'The selected access is unavailable or was not confirmed.');
     const setupAlreadyDone = Object.values(rows).some(row => row.aiToolId === agent.aiToolId && row.folder === folder && row.setupDone);
     let row: LocalAgentRecord = { aiToolId: agent.aiToolId, handle: agent.handle, folder,
       folderCreated: folderCreated || !!(previous?.folder === folder && previous.folderCreated), access,
       accessConfirmedAt: sameBinding && previous.access === access && answer !== 'full' ? previous.accessConfirmedAt : confirmationTime(options), setupDone: !options.adapter.agentSetup || setupAlreadyDone };
     await this.update(agent.agentId, row, previous);
     if (!row.setupDone) {
+      if (definitionOnly) return fail('AGENT_SETUP_AUTHORIZATION_REQUIRED', 'The local definition is saved. Executable tool setup requires separate scoped authorization.');
       const argv = options.adapter.agentSetup!(options.bin, folder);
       options.output('One-time tool setup: ' + argv.map(argument => JSON.stringify(argument)).join(' '));
       if (await options.prompt('Type yes to run this one-time setup: ') !== 'yes') return fail('SETUP_NOT_CONFIRMED', 'One-time tool setup was not confirmed.');
@@ -163,8 +177,10 @@ export class LocalAgents {
     if (!old || old.aiToolId !== agent.aiToolId) return fail('AGENT_NOT_FOUND', 'Run agent setup for the current tool before changing access.');
     const access: Access = requested === 'full' ? 'full_access' : 'folder_only';
     if (access === 'folder_only' && options.adapter) {
-      const run = (options.matrix ?? TOOL_MATRIX).tools.find(tool => tool.run?.adapter === options.adapter!.info.tool)?.run;
-      if (!run || run.folderOnly === 'none') return fail('ACCESS_UNAVAILABLE', 'This tool does not offer Folder only.');
+      const definition = (options.matrix ?? TOOL_MATRIX).tools.find(tool => tool.run?.adapter === options.adapter!.info.tool);
+      const run = toolRunCapability(definition, process.platform);
+      if (!run?.offered || run.folderOnly === 'none') return fail('ACCESS_UNAVAILABLE',
+        process.platform === 'linux' && isLinuxAcceptanceCandidate(definition) ? LINUX_FOLDER_ONLY_REASON : 'This tool does not offer Folder only on this platform.');
     }
     if (access === 'full_access' && old.access !== access) await fullAccess(options);
     const row = { ...old, handle: handleValid(agent.handle) ? agent.handle : old.handle, access, accessConfirmedAt: access === old.access ? old.accessConfirmedAt : confirmationTime(options) };
@@ -183,7 +199,12 @@ export class LocalAgents {
         skillsDir: folder, model: options.model, provider: options.provider ?? null, effort: options.effort ?? null, access,
         maxTurns: 1, timeoutSeconds: 270, runHome: null}, claimedAt: now, expiresAt: now + 600_000, maxRunMinutes: 5,
         matrix: options.matrix, processes: options.processes, now: options.now };
-      const running = await (options.startTool ?? startTool)(input), result = await running.finished;
+      const execute = async () => {
+        if (process.platform === 'linux') input.linuxLifecycle = currentLinuxToolLifecycle(randomUUID());
+        const running = await (options.startTool ?? startTool)(input);
+        return running.finished;
+      };
+      const result = await (process.platform === 'linux' ? withLinuxRunContext(this.paths.data, execute) : execute());
       if (!result.ok || result.stopped) return fail('AGENT_SETUP_FAILED', 'The one-time tool setup failed.');
     } finally { await rm(directory, { recursive: true, force: true }); }
   }
@@ -236,7 +257,8 @@ export async function reserveAgentSetupDialog(paths: HelperPaths, waiting: reado
   const now = (options.timing ?? clock).now();
   if (!Number.isSafeInteger(now) || now < 0) return fail('NOTIFY_INVALID');
   if (state.lastDialogAt !== undefined && now - state.lastDialogAt < AGENT_DIALOG_INTERVAL_MS) return 'throttled';
-  const command = await writeLauncher(paths, options);
+  const command = (options.platform ?? paths.platform ?? process.platform) === 'linux'
+    ? 'maddots-ai agent setup' : await writeLauncher(paths, options);
   const text = JSON.stringify({format: 1, notifiedAgents: [...new Set([...state.notifiedAgents, ...agents])], lastDialogAt: now}) + '\n';
   if (Buffer.byteLength(text) > 1024 * 1024) return fail('NOTIFY_STATE_INVALID');
   await atomicWrite(path, text);
@@ -245,6 +267,10 @@ export async function reserveAgentSetupDialog(paths: HelperPaths, waiting: reado
 export async function showAgentSetupDialog(dialog: PendingAgentDialog, options: NotifyOptions = {}): Promise<'later' | 'opened'> {
   const runner = options.runner ?? runCommand, env = cleanEnvironment(options.env ?? process.env);
   if (!Number.isSafeInteger(dialog.count) || dialog.count < 1) return fail('NOTIFY_INVALID');
+  if ((options.platform ?? process.platform) === 'linux') {
+    (options.output ?? (line => process.stdout.write(line + '\n')))(`${dialog.count} agents need setup or Allow on this computer. Run maddots-ai agent setup in an interactive terminal.`);
+    return 'later';
+  }
   const seconds = AGENT_DIALOG_INTERVAL_MS / 1000 - 60;
   const result = await runner('/usr/bin/osascript', ['-e', `display dialog "${dialog.count} agents need setup or Allow on this computer" buttons {"Later", "Set up"} default button "Later" with title "MadDots AI" giving up after ${seconds}`], {env, timeout: (seconds + 60) * 1000, signal: options.signal});
   if (result.stdout.trim() !== 'button returned:Set up, gave up:false') return 'later';

@@ -49,6 +49,7 @@ if (mode === 'echo') {
   if (mode === 'detached-exit') detach();
   else {
     process.on('SIGTERM', detach);
+    if (args[1]) writeFileSync(args[1], 'ready');
     console.log('ready');
     setInterval(() => undefined, 1000);
   }
@@ -78,12 +79,15 @@ if (mode === 'echo') {
   else { process.on('SIGTERM', detach); console.log('ready'); setInterval(() => undefined, 1000); }
 } else if (mode === 'tracked-group-exit') {
   // Observe the leader first. Its environment-cleared child is born only
-  // immediately before exit, between ancestry scans, in that observed group.
-  const script = `const {spawn}=require('node:child_process'); const {writeFileSync}=require('node:fs');
+  // immediately before exit. An optional release file keeps the leader alive
+  // until the test has persisted the child's lifetime in that observed group.
+  const script = `const {spawn}=require('node:child_process'); const {existsSync,writeFileSync}=require('node:fs');
     setTimeout(() => { const child=spawn('/bin/sleep',['120'],{stdio:'ignore',env:{}}); child.unref();
-      writeFileSync(process.argv[2],String(child.pid)); process.exit(0); },650);
+      writeFileSync(process.argv[2],String(child.pid));
+      if(process.argv[3]) setInterval(() => {if(existsSync(process.argv[3])) process.exit(0);},10);
+      else process.exit(0); },650);
     writeFileSync(process.argv[1],String(process.pid));`;
-  const child = spawn(process.execPath, ['-e', script, args[0], args[1]], { detached: true, stdio: 'ignore', env: {} });
+  const child = spawn(process.execPath, ['-e', script, args[0], args[1], ...(args[2] ? [args[2]] : [])], { detached: true, stdio: 'ignore', env: {} });
   child.once('exit', () => setTimeout(() => process.exit(0), 50));
 } else if (mode === 'dump' || mode === 'dump-env-argv') {
   console.log(JSON.stringify({ env: process.env, argv: process.argv.slice(2) }));

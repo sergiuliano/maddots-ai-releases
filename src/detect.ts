@@ -2,7 +2,11 @@ import { constants } from 'node:fs';
 import { access, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { TOOL_MATRIX, validateToolMatrix, type ToolMatrix, type ToolVariant } from './shared/tool-matrix.js';
-import { cleanEnvironment, runCommand, type Runner } from './config.js';
+import {cleanEnvironment, HelperError, runCommand, type Runner} from './config.js';
+import {guardToolRunner, runToolCommand, toolCommandPolicy} from './tool-command.js';
+
+import { helperPlatform } from './platform.js';
+import {assertLinuxToolClosure, linuxToolClosure} from './linux-tool-closures.js';
 
 export type DetectedTool = {
   tool: string;
@@ -13,8 +17,11 @@ export type DetectedTool = {
   /** CLI locations stay on this computer; reportedTools removes them from every request. */
   path?: string;
   realpath?: string;
+  /** Static Linux discovery records the file, without verifying executable identity or version. */
+  fingerprint?: string;
+  versionVerified?: false;
 };
-export type DetectionOptions = { home: string; env?: NodeJS.ProcessEnv; runner?: Runner; matrix?: ToolMatrix };
+export type DetectionOptions = { home: string; env?: NodeJS.ProcessEnv; runner?: Runner; matrix?: ToolMatrix; platform?: NodeJS.Platform };
 
 const MAX_OUTPUT = 1024 * 1024;
 const MAX_PATHS = 256;
@@ -46,6 +53,15 @@ async function binaryPaths(candidates: string[], home: string, env: NodeJS.Proce
     }
   }
   return [...paths].slice(0, MAX_PATHS);
+}
+
+async function staticBinary(binary: string): Promise<{ path: string; realpath: string; fingerprint: string }> {
+  const canonical = await realpath(binary);
+  const info = await stat(canonical, { bigint: true });
+  if (!info.isFile()) throw new Error('DETECTION_BINARY_INVALID');
+  await access(canonical, constants.X_OK);
+  if (await realpath(binary) !== canonical) throw new Error('DETECTION_BINARY_CHANGED');
+  return { path: binary, realpath: canonical, fingerprint: [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':') };
 }
 
 async function cursorClash(path: string, home: string): Promise<boolean> {
@@ -123,21 +139,37 @@ async function configuredVersion(path: string): Promise<{ version: string | null
   } catch { return null; }
 }
 
-/** Detection is read-only; installed CLIs are executed directly after version confirmation. */
+/** Unaccepted Linux tools are inventoried statically. Accepted tools and macOS retain executable probes. */
 export async function detectTools(options: DetectionOptions): Promise<DetectedTool[]> {
   if (!isAbsolute(options.home)) throw new Error('DETECTION_HOME_INVALID');
+  const platform = helperPlatform(options.platform);
   const home = resolve(options.home);
-  const env = cleanEnvironment({ ...(options.env ?? process.env), HOME: home });
-  const runner = options.runner ?? runCommand;
+  const source = options.env ?? process.env;
+  // Discovery needs the host PATH and HOME, but executable Linux probes must
+  // not inherit the dedicated controller's storage/runtime configuration.
+  const env = cleanEnvironment(platform === 'linux' ? Object.fromEntries(
+    ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_TIME', 'TZ', 'TERM', 'NO_COLOR', 'CI'].map(name => [name, source[name]])) : source);
+  env.HOME = home;
+  const runner = options.runner ?? runToolCommand;
   const matrix = options.matrix ? validateToolMatrix(options.matrix) : TOOL_MATRIX;
   const found: DetectedTool[] = [];
   for (const tool of matrix.tools) {
+    const staticOnly = !toolCommandPolicy(tool, platform).allowed;
+    const execute = guardToolRunner(tool.key, runner, {platform, matrix});
     for (const variant of tool.variants) {
-      let detected: { version: string | null; models: string[]; path?: string; realpath?: string } | null = null;
-      for (const binary of await binaryPaths(variant.detect.binaries, home, env)) {
+      let detected: Omit<DetectedTool, 'tool' | 'variant' | 'syncOnly'> | null = null;
+      // Static inventory reports candidates; closure trust is required before probing or execution.
+      const closure = !staticOnly && platform === 'linux' && variant.key === 'cli' ? linuxToolClosure(tool.key) : undefined;
+      const candidates = closure ? [closure.entrypoint] : variant.detect.binaries;
+      for (const binary of await binaryPaths(candidates, home, env)) {
         if (tool.key === 'cursor' && await cursorClash(binary, home)) continue;
         try {
-          const output = await runner(binary, variant.detect.versionArgs, { timeout: 10_000, env });
+          if (closure) await assertLinuxToolClosure(tool.key, binary);
+          if (staticOnly) {
+            detected = { ...await staticBinary(binary), version: null, versionVerified: false, models: [] };
+            break;
+          }
+          const output = await execute(binary, variant.detect.versionArgs, { timeout: 10_000, env });
           if (output.stdout.length + output.stderr.length > MAX_OUTPUT) continue;
           // dsh shares its name with a distributed shell. Accept exactly the
           // bare stdout version, with at most one terminal line ending.
@@ -147,15 +179,19 @@ export async function detectTools(options: DetectionOptions): Promise<DetectedTo
           const match = new RegExp(variant.detect.versionPattern, bareVersion ? 'u' : 'imu').exec(text);
           if (bareVersion && match?.[0] !== text) continue;
           const confirmedVersion = version(match?.[1] ?? match?.[0]);
-          if (!confirmedVersion) continue;
-          detected = { version: confirmedVersion, models: await modelsFor(binary, variant, runner, env), path: binary, realpath: await realpath(binary) };
+          if (!confirmedVersion || closure && confirmedVersion !== closure.version) continue;
+          detected = { version: confirmedVersion, models: await modelsFor(binary, variant, execute, env), path: binary, realpath: await realpath(binary) };
           break;
-        } catch { /* An absent, incompatible, or broken variant is not installed. */ }
+        } catch (error) {
+          if (!staticOnly && platform === 'linux' && error instanceof HelperError &&
+            /^(?:LINUX_(?:CONTAINMENT|WORKSPACE)_UNAVAILABLE|RUNNER_(?:STATE|JOURNAL)_UNAVAILABLE)$/u.test(error.code)) throw error;
+          /* An absent, incompatible, or broken variant is not installed. */
+        }
       }
-      if (!detected) {
+      if (!detected && platform === 'darwin') {
         for (const template of variant.detect.apps) {
           for (const path of await matchingPaths(template, home)) {
-            const app = await appVersion(path, runner, env);
+            const app = await appVersion(path, options.runner ?? runCommand, env);
             if (app) { detected = { version: app.version, models: [] }; break; }
           }
           if (detected) break;
@@ -165,7 +201,10 @@ export async function detectTools(options: DetectionOptions): Promise<DetectedTo
         for (const template of variant.detect.configPaths) {
           for (const path of await matchingPaths(template, home)) {
             const config = await configuredVersion(path);
-            if (config) { detected = { version: config.version, models: [] }; break; }
+            if (config) {
+              detected = staticOnly ? { version: null, versionVerified: false, models: [] } : { version: config.version, models: [] };
+              break;
+            }
           }
           if (detected) break;
         }

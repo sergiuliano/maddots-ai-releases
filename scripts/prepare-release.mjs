@@ -7,14 +7,17 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
-import { allowedRuntimePath, checkManifest, cleanEnvironment, modules, runtimeFiles } from './check-package.mjs';
+import { allowedRuntimePath, checkManifest, cleanEnvironment, linuxTrustedRuntime, modules, runtimeFiles } from './check-package.mjs';
 
 export async function prepareRelease(args = process.argv.slice(2), dependencies = {}) {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-  assert.ok(args.length === 0 || (args.length === 2 && args[0] === '--output' && args[1]), 'Usage: prepare-release.mjs [--output DIRECTORY]');
-  const output = resolve(args[1] || join(root, 'release'));
+  const attestOnly = args[0] === '--attest-only';
+  const outputArgs = attestOnly ? args.slice(1) : args;
+  assert.ok(outputArgs.length === 0 || (outputArgs.length === 2 && outputArgs[0] === '--output' && outputArgs[1] && !outputArgs[1].startsWith('--')),
+    'Usage: prepare-release.mjs [--attest-only] [--output DIRECTORY]');
+  const output = resolve(outputArgs[1] || join(root, 'release'));
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
-  checkManifest(pkg);
+  checkManifest(pkg, { attestOnly });
   const lock = JSON.parse(await readFile(join(root, 'package-lock.json'), 'utf8'));
   assert.equal(lock.lockfileVersion, 3, 'A reviewed npm v3 lockfile is required.');
   assert.equal(lock.name, pkg.name); assert.equal(lock.version, pkg.version);
@@ -36,6 +39,7 @@ export async function prepareRelease(args = process.argv.slice(2), dependencies 
   try {
     const compiled = await runtimeFiles(root);
     for (const module of modules) assert.ok(compiled.includes(`dist/${module}.js`), 'Missing helper module: ' + module);
+    for (const path of linuxTrustedRuntime) assert.ok(compiled.includes(path), 'Missing trusted Linux runtime: ' + path);
     assert.ok(compiled.includes('dist/shared/tool-matrix.json'), 'Missing tool matrix.');
     for (const path of ['LICENSE', ...compiled]) {
       assert.ok((await lstat(join(root, path))).isFile(), 'Runtime entries must be regular files.');

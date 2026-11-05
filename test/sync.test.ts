@@ -76,6 +76,62 @@ async function fixture(externalData = false) {
 }
 const missing = async (path: string) => assert.rejects(lstat(path), {code: 'ENOENT'});
 
+test('agent run-copy inventory requires its own acceptance after an identical tool skills install', async () => {
+  const f = await fixture();
+  try {
+    const engine = f.engine(), build = f.build(); await engine.reconcile();
+    await engine.applyPlan(f.plan([f.item(build)]));
+    const toolReport = await engine.inventory();
+    assert.equal(toolReport.managed[0].state, 'ok');
+    assert.deepEqual((await engine.agentLocks.read()).entries, []);
+    await assert.rejects(engine.verifiedBuild(build.digest, 'agent-one'), {code: 'BUILD_NOT_ACCEPTED'});
+    assert.deepEqual(toolReport.agentManaged, [], 'A tool install is not an agent run-copy receipt.');
+
+    await engine.applyPlan(f.plan([f.item(build, {forAgentIds: ['agent-one']})]));
+    const agentReport = await engine.inventory();
+    assert.deepEqual(agentReport.managed, toolReport.managed);
+    assert.deepEqual(agentReport.agentManaged, [{...toolReport.managed[0], agentId: 'agent-one'}]);
+    assert.equal((await engine.verifiedBuild(build.digest, 'agent-one')).build.version, 1);
+  } finally {await f.close();}
+});
+
+test('agent run-copy inventory verifies exact signed versions, payload integrity, missing caches and removal', async () => {
+  const f = await fixture();
+  try {
+    const engine = f.engine(), v1 = f.build(); await engine.reconcile();
+    await engine.applyPlan(f.plan([f.item(v1)]));
+    await engine.applyPlan(f.plan([f.item(v1, {forAgentIds: ['agent-two']})]));
+    const v2 = f.build(2, 0, 'Version 1');
+    await engine.applyPlan(f.plan([f.item(v2, {forAgentIds: ['agent-one']})]));
+    const receipt = async (agentId: string) => (await engine.inventory()).agentManaged!.find(entry => entry.agentId === agentId)!;
+    assert.equal((await receipt('agent-one')).version, 2); assert.equal((await receipt('agent-two')).version, 1);
+    assert.equal((await receipt('agent-one')).state, 'ok'); assert.equal((await receipt('agent-two')).state, 'ok');
+    const variant = join(f.paths.data, 'cache/builds', v2.digest + '-' + createHash('sha256').update(v2.signature).digest('hex') + '.json');
+    // Identical payloads are not interchangeable signed version receipts.
+    await atomicWrite(variant, JSON.stringify(v1));
+    assert.equal((await receipt('agent-one')).state, 'edited'); assert.equal((await receipt('agent-one')).localDigest, null);
+    assert.equal((await receipt('agent-two')).state, 'ok');
+    const bad = structuredClone(v2); bad.files[0].content = Buffer.from('Private corrupted agent payload').toString('base64');
+    await atomicWrite(variant, JSON.stringify(bad));
+    const edited = await engine.inventory();
+    assert.equal(edited.agentManaged!.find(entry => entry.agentId === 'agent-one')!.state, 'edited');
+    assert.equal(edited.managed[0].state, 'ok');
+    assert.ok(!JSON.stringify(edited).includes('Private corrupted agent payload')); assert.ok(!JSON.stringify(edited).includes(f.home));
+    await rm(variant);
+    assert.equal((await receipt('agent-one')).state, 'missing'); assert.equal((await receipt('agent-one')).localDigest, null);
+    assert.equal((await engine.inventory()).managed[0].state, 'ok');
+    await atomicWrite(variant, JSON.stringify(v2));
+    assert.equal((await receipt('agent-one')).state, 'ok');
+    const restarted = f.engine(); await restarted.reconcile();
+    assert.deepEqual((await restarted.inventory()).agentManaged, (await engine.inventory()).agentManaged);
+    await engine.applyPlan(f.plan([f.item(v2, {kind: 'forced_remove', state: 'forced', reason: 'archived', forAgentIds: ['agent-one']})]));
+    assert.deepEqual((await engine.inventory()).agentManaged!.map(entry => entry.agentId), ['agent-two']);
+    await assert.rejects(engine.verifiedBuild(v2.digest, 'agent-one'), {code: 'BUILD_NOT_ACCEPTED'});
+    await engine.applyPlan(f.plan([], {revoked: [{skillId: v1.skillId, digest: v1.digest}]}));
+    assert.equal((await receipt('agent-two')).state, 'edited');
+  } finally {await f.close();}
+});
+
 test('TLS-19 inventory detects payload edits by digest and sends only bounded metadata', async () => {
   const f = await fixture();
   try {
@@ -708,6 +764,18 @@ test('degraded security fix removes and restores exactly previous in one plan; l
     const backups = await listBackups(f.paths); assert.equal(backups.length, 2);
     assert.ok((await Promise.all(backups.map(b => readFile(join(f.paths.backups, b.id, b.route, b.folderName, 'SKILL.md'), 'utf8')))).includes('Local edits'));
     await engine.applyPlan(f.plan([restore])); assert.equal((await listBackups(f.paths)).length, 2);
+  } finally {await f.close();}
+});
+test('a security removal can be followed by an already approved healthy replacement in the same plan', async () => {
+  const f = await fixture();
+  try {
+    const engine = f.engine(); await engine.reconcile(); const v1 = f.build(), v2 = f.build(2), v3 = f.build(3);
+    await engine.applyPlan(f.plan([f.item(v1)])); await engine.applyPlan(f.plan([f.item(v2, {kind: 'update'})]));
+    await engine.applyPlan(f.plan([f.item(v2, {kind: 'forced_remove', state: 'forced', reason: 'security_fix'}),
+      f.item(v3, {kind: 'update'})], {revoked: [{skillId: v2.skillId, digest: v2.digest}]}));
+    assert.equal(await readFile(join(f.route, 'example/SKILL.md'), 'utf8'), 'Version 3');
+    assert.deepEqual((await engine.inventory()).deliveryErrors, []);
+    assert.equal((await engine.locks.read()).entries[0].version, 3);
   } finally {await f.close();}
 });
 test('forced effects cannot install or restore arbitrary content; removal keeps downgrade floor', async () => {

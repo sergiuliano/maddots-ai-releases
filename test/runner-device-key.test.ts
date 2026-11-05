@@ -20,12 +20,12 @@ async function fixture(t: TestContext, register?: (publicKey: string) => Promise
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-device-key-'));
   t.after(() => rm(root, {recursive: true, force: true}));
   const home = join(root, 'home'); await mkdir(home, {mode: 0o700});
-  const paths = await createPaths(readConfig({}, home)); await ensurePaths(paths);
+  const paths = await createPaths(readConfig({}, home, 'darwin')); await ensurePaths(paths);
   const stored = new Map<SecretName, string>([['skills-token', 'mdai_skill_' + 'A'.repeat(43)]]);
   let writes = 0, deletions = 0, ignoreDelete = false;
   const locked = async () => {assert.equal((await lstat(paths.lock)).isFile(), true);};
   const secrets: SecretStore = {
-    storage: 'keychain',
+    storage: 'keychain', platform: 'darwin',
     get: async name => {await locked(); return stored.get(name);},
     set: async (name, value) => {await locked(); stored.set(name, value); writes++;},
     delete: async name => {await locked(); if (!ignoreDelete) stored.delete(name); deletions++;},

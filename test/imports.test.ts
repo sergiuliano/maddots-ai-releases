@@ -19,6 +19,7 @@ import { FileSecretStore } from '../src/secret-store.js';
 import { StateStore } from '../src/state.js';
 import { SyncEngine, type SyncPlan } from '../src/sync.js';
 import { BuildVerifier, signedBuildString, type PlanItem, type SignedBuild } from '../src/verify.js';
+import {createGitDirectory} from './git-fixture.js';
 
 async function fixture() {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-imports-')), home = join(root, 'home');
@@ -563,7 +564,7 @@ test('replacement of a selected repository link preserves the target inode and u
   const f = await fixture();
   try {
     const repo = join(f.home, 'Projects/georanker'), original = join(repo, 'skills/ai-discovery');
-    await mkdir(join(repo, '.git'), {recursive: true}); await mkdir(original, {recursive: true});
+    await createGitDirectory(join(repo, '.git')); await mkdir(original, {recursive: true});
     await writeFile(join(original, 'SKILL.md'), 'Repository original\n'); const inode = (await lstat(original)).ino;
     await symlink(original, f.original('ai-discovery')); await symlink(original, f.original('ai-discovery', '.codex-work'));
     await f.skill('unticked'); const session = f.session(['ai-discovery']); f.setSessions([session]); await f.engine().poll();

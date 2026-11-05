@@ -6,6 +6,7 @@ import type { DetectedTool } from '../detect.js';
 import { assertNoSymlinks, type HelperPaths } from '../paths.js';
 import { assertRouteRoot, readSkillTree, type SafeBuildFile } from '../safe-fs.js';
 import type { PlanItem, SignedBuild } from '../verify.js';
+import { assertLockUpgradeReady } from '../write-lock-upgrade.js';
 import { FolderDeliveryTarget } from './index.js';
 
 /** Read the canonical name emitted by the renderer without a YAML dependency. */
@@ -41,6 +42,7 @@ export class AgentsFolderDeliveryTarget extends FolderDeliveryTarget {
     super(paths, 'agents-folder', join(paths.home, route.path.slice(2)));
   }
   async root(): Promise<string> {
+    if (process.platform === 'linux') await assertLockUpgradeReady(this.paths);
     const root = await super.root();
     await assertNoSymlinks(root, this.paths.home);
     await mkdir(root, {recursive: true, mode: 0o700});

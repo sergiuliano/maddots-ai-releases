@@ -18,7 +18,7 @@ import { readStamp } from '../src/stamp.js';
 import type { SyncOptions, SyncPlan } from '../src/sync.js';
 import { BuildVerifier, signedBuildString, type PlanItem, type SignedBuild } from '../src/verify.js';
 
-async function fixture(readCopy = false, cli = true) {
+async function fixture(readCopy = false, cli = true, platform: NodeJS.Platform = 'darwin') {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-claude-'));
   const home = join(root, 'home'); await mkdir(home, {mode: 0o700});
   const paths = await createPaths(readConfig({}, home)); await ensurePaths(paths);
@@ -40,7 +40,7 @@ async function fixture(readCopy = false, cli = true) {
     if (args[1] === 'marketplace' && args[2] === 'add') marketplaceList = JSON.stringify([{name: 'maddots-ai', source: 'directory', path: args[3]}]);
     return {stdout: '', stderr: ''};
   };
-  const adapterOptions = {paths, helperId: 'helper-test', matrix, runner,
+  const adapterOptions = {paths, helperId: 'helper-test', matrix, runner, platform,
     env: {PATH: join(home, 'bin'), TEST_TOKEN: 'redacted', TEST_KEY: 'redacted', TEST_SECRET: 'redacted'},
     workspaceSlugs: {workspaceA: 'alpha', workspaceB: 'beta'}};
   let plugin = new ClaudePluginDeliveryTarget(adapterOptions);
@@ -81,6 +81,77 @@ async function fixture(readCopy = false, cli = true) {
 }
 const missing = async (path: string) => assert.rejects(lstat(path), {code: 'ENOENT'});
 const pluginCommands = (calls: Awaited<ReturnType<typeof fixture>>['calls']) => calls.filter(call => call.args[0] === 'plugin' && !call.args.includes('list'));
+
+test('plugin plan admission refuses before publishing waiting state or probing the CLI', async () => {
+  const f = await fixture();
+  try {
+    const retained = join(f.root, 'retained-guard');
+    await writeFile(retained, 'retained guard evidence', {mode: 0o600});
+    await symlink(retained, f.paths.lock + '.guard');
+    const before = await lstat(retained), engine = f.engine();
+    await assert.rejects(engine.applyPlan(f.plan([f.item(f.build())])), {code: 'PATH_UNSAFE'});
+    await missing(join(f.paths.data, 'claude-plugin-waiting.json'));
+    await missing(join(f.paths.data, 'claude-plugin-registration.json'));
+    assert.deepEqual(f.calls, [], 'admission refusal precedes the CLI readiness probe');
+    assert.equal(await readFile(retained, 'utf8'), 'retained guard evidence');
+    assert.equal((await lstat(retained)).ino, before.ino);
+  } finally {await f.close();}
+});
+
+for (const readCopy of [false, true]) for (const cli of [false, true]) test(`unaccepted Linux syncs plugin sources without executing ${cli ? 'an installed' : 'a missing'} CLI${readCopy ? ' with a read-copy route' : ''}`, async () => {
+  const f = await fixture(readCopy, cli, 'linux');
+  try {
+    const engine = f.engine(), first = f.build();
+    assert.equal(f.matrix.tools.find(tool => tool.key === 'claude-code')!.run!.platforms!.linux!.accepted, false);
+    await assert.rejects(f.plugin().requireCli(), {code: 'TOOL_PLATFORM_NOT_ACCEPTED'});
+    await engine.reconcile();
+    await engine.applyPlan(f.plan([f.item(first)]));
+    const source = f.plugin().folderFor(first), root = await f.plugin().root();
+    assert.match(await readFile(join(source, 'SKILL.md'), 'utf8'), /Version 1/u);
+    assert.equal((await readStamp(source, f.verifier, ['helper-test'])).digest, first.digest);
+    assert.equal((await engine.locks.read()).entries[0].digest, first.digest);
+    assert.equal((await f.json(join(root, 'maddots-alpha/.claude-plugin/plugin.json'))).version, '1.0.1');
+    assert.equal((await f.json(join(root, '.claude-plugin/marketplace.json'))).plugins[0].name, 'maddots-alpha');
+    const updated = f.build(2), plan = f.plan([f.item(updated, {kind: 'update'})]);
+    await engine.applyPlan(plan);
+    await engine.applyPlan(plan);
+    await engine.reconcile();
+    assert.match(await readFile(join(source, 'SKILL.md'), 'utf8'), /Version 2/u);
+    assert.equal((await f.json(join(root, 'maddots-alpha/.claude-plugin/plugin.json'))).version, '1.0.2');
+    const state = await f.json(join(f.paths.data, 'claude-plugin-registration.json'));
+    assert.equal(state.marketplaceAdded, false);
+    assert.equal(state.plugins[0].installed, 0);
+    const restarted = f.restart(); await restarted.reconcile();
+    for (let repeat = 0; repeat < 2; repeat++) {
+      const inventory = await restarted.inventory();
+      assert.equal(inventory.managed.length, 1);
+      assert.equal(inventory.managed[0].state, 'ok');
+      assert.deepEqual(inventory.unmanaged, []);
+      assert.deepEqual(inventory.deliveryErrors.map(error => error.code), ['TOOL_PLATFORM_NOT_ACCEPTED']);
+      const status = await new ClaudePluginDeliveryTarget(f.adapterOptions).statusLines();
+      assert.match(status.join('\n'), /registration is skipped:.*not accepted for Linux/u);
+      assert.match(status.join('\n'), /registration becomes available after Linux acceptance/u);
+      assert.equal(status.join('\n').includes('claude plugin '), false);
+      await assert.rejects(f.plugin().requireCli(), {code: 'TOOL_PLATFORM_NOT_ACCEPTED'});
+    }
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.matrix.tools.find(tool => tool.key === 'claude-code')!.run!.platforms!.linux!.accepted, false);
+  } finally { await f.close(); }
+});
+
+test('Linux refusal precedes cached CLI reuse when platform acceptance is withdrawn', async () => {
+  const f = await fixture(false, true, 'linux');
+  try {
+    const acceptance = f.matrix.tools.find(tool => tool.key === 'claude-code')!.run!.platforms!.linux!;
+    acceptance.accepted = true;
+    assert.equal(await f.plugin().requireCli(), f.binary);
+    assert.equal(f.calls.length, 1);
+    acceptance.accepted = false;
+    await assert.rejects(f.plugin().requireCli(), {code: 'TOOL_PLATFORM_NOT_ACCEPTED'});
+    await assert.rejects(f.plugin().requireCli(), {code: 'TOOL_PLATFORM_NOT_ACCEPTED'});
+    assert.equal(f.calls.length, 1);
+  } finally { await f.close(); }
+});
 
 test('one plugin per workspace namespaces multiple skills, with a single marketplace and TLS-13 stamps/lock', async () => {
   const f = await fixture();

@@ -7,6 +7,7 @@ import { backupUnmanaged, finishUnmanagedBackup, listBackups, readBackupManifest
 import { readConfig } from '../src/config.js';
 import { atomicWrite, createPaths, ensurePaths } from '../src/paths.js';
 import { atomicSymlink, preserveSymlink } from '../src/safe-fs.js';
+import {createGitDirectory} from './git-fixture.js';
 
 async function fixture(outer = false) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-import-backups-'));
@@ -33,7 +34,7 @@ const saved = (paths: {backups: string}, backup: BackupManifest) => join(paths.b
 async function gitWorktreeFixture() {
   const f = await fixture();
   const repo = join(f.home, 'Projects/georanker'), source = join(repo, 'skills/ai-discovery');
-  await mkdir(join(repo, '.git'), {recursive: true});
+  await createGitDirectory(join(repo, '.git'));
   await mkdir(source, {recursive: true});
   await writeFile(join(source, 'SKILL.md'), 'Repository original');
   const ref = {home: '.codex', folderName: 'ai-discovery'};

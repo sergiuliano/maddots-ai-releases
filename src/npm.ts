@@ -1,23 +1,25 @@
 // npm discovery is independent of Node's prefix, including managed launchers.
-import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
 import { access, open, realpath } from 'node:fs/promises';
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
-import { promisify } from 'node:util';
 import { HelperError, cleanEnvironment } from './config.js';
+import {runToolCommand} from './tool-command.js';
 import { assertNoSymlinks } from './paths.js';
 
 export const PACKAGE_TIMEOUT_MS = 120_000;
 export interface NpmCommand { command: string; args: string[] }
 export interface PackageRunOptions { cwd: string; env: NodeJS.ProcessEnv; timeout: number; signal?: AbortSignal; input?: string }
 export type PackageRunner = (file: string, args: readonly string[], options: PackageRunOptions) => Promise<{ stdout: string; stderr: string }>;
-const execute = promisify(execFile);
+const execute = runToolCommand;
 export const runPackageCommand: PackageRunner = async (file, args, options) => {
   try {
     const output = await execute(file, [...args], { cwd: options.cwd, env: cleanEnvironment(options.env), timeout: options.timeout,
       maxBuffer: 4 * 1024 * 1024, signal: options.signal, encoding: 'utf8' });
     return { stdout: output.stdout, stderr: output.stderr };
-  } catch { throw new HelperError('PACKAGE_COMMAND_FAILED', 'The package command failed or timed out.'); }
+  } catch (error) {
+    if (error instanceof HelperError && ['LINUX_CONTAINMENT_UNAVAILABLE', 'TOOL_PLATFORM_NOT_ACCEPTED'].includes(error.code)) throw error;
+    throw new HelperError('PACKAGE_COMMAND_FAILED', 'The package command failed or timed out.');
+  }
 };
 
 export function installEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

@@ -8,6 +8,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { createRunFolder, recoverStagedFiles, reserveRunFolder, runFolderAvailable } from '../src/runner/run-folder.js';
+import {acquireRunnerStorageLock} from '../src/runner/storage-lock.js';
+import { processStartIdentity } from '../src/runner/process.js';
+import {createGitDirectory} from './git-fixture.js';
 
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-run-folder-'));
@@ -36,12 +39,14 @@ test('TLS-21 folder excludes plain Git, worktree common Git and nested cwd exact
     const f = await fixture(t); let cwd = f.cwd, common = join(cwd, '.git');
     if (kind === 'worktree') {
       common = join(f.root, 'common'); const gitDir = join(common, 'worktrees', 'test');
-      await mkdir(gitDir, {recursive: true}); await writeFile(join(cwd, '.git'), `gitdir: ${gitDir}\n`); await writeFile(join(gitDir, 'commondir'), '../..\n');
-    } else await mkdir(common);
+      await createGitDirectory(common); await createGitDirectory(gitDir); await writeFile(join(cwd, '.git'), `gitdir: ${gitDir}\n`); await writeFile(join(gitDir, 'commondir'), '../..\n');
+    } else await createGitDirectory(common);
     if (kind === 'nested') { cwd = join(cwd, 'packages', 'app'); await mkdir(cwd, {recursive: true}); }
+    const storage = process.platform === 'linux' ? await acquireRunnerStorageLock(f.dataDir) : undefined;
+    t.after(() => storage?.release());
     await withoutChildProcesses(async () => {
       assert.equal(await runFolderAvailable(cwd), true);
-      const first = await createRunFolder({cwd, dataDir: f.dataDir, runId: 'run-first'});
+      const first = await createRunFolder({cwd, dataDir: f.dataDir, runId: 'run-first', storage});
       assert.equal(first.runDir, join(cwd, '.maddots', 'runs', 'run-first'));
       assert.deepEqual(await readdir(first.outDir), []);
       assert.equal(await readFile(join(cwd, '.maddots', '.gitignore'), 'utf8'), '*\n');
@@ -49,13 +54,60 @@ test('TLS-21 folder excludes plain Git, worktree common Git and nested cwd exact
       await first.stageProjectFile({path: 'tool/config', content: 'config', kind: 'config'});
       await first.backupStaged(f.dataDir);
       await first.release();
-      const second = await createRunFolder({cwd, dataDir: f.dataDir, runId: 'run-second'});
+      const second = await createRunFolder({cwd, dataDir: f.dataDir, runId: 'run-second', storage});
       await second.stageProjectFile({path: 'tool/other', content: 'leftover', kind: 'config'}); await second.release();
-      await recoverStagedFiles({cwd, dataDir: f.dataDir});
+      await recoverStagedFiles({cwd, dataDir: f.dataDir, storage});
       assert.equal(await readFile(join(common, 'info', 'exclude'), 'utf8'), kind === 'nested' ? '/packages/app/.maddots/\n' : '/.maddots/\n');
     });
   }
   assert.doesNotMatch(await readFile(new URL('../src/runner/run-folder.ts', import.meta.url), 'utf8'), /child_process|worker_threads|process\.binding/);
+});
+test('r18 incomplete ancestor Git markers receive no writes from a non-repository project', async t => {
+  for (const kind of ['empty', 'HEAD', 'objects', 'refs', 'HEAD-objects', 'HEAD-refs', 'objects-refs', 'invalid-HEAD', 'missing-common', 'partial-common', 'gitfile']) {
+    const f = await fixture(t), git = join(f.root, '.git');
+    if (kind === 'gitfile') await writeFile(git, 'gitdir: missing-git\n');
+    else {
+      await mkdir(git);
+      if (kind.includes('HEAD')) await writeFile(join(git, 'HEAD'), kind === 'invalid-HEAD' ? 'invalid\n' : 'ref: refs/heads/fixture\n');
+      if (kind.includes('objects') || kind === 'invalid-HEAD') await mkdir(join(git, 'objects'));
+      if (kind.includes('refs') || kind === 'invalid-HEAD') await mkdir(join(git, 'refs'));
+      if (kind.endsWith('common')) {
+        await writeFile(join(git, 'HEAD'), 'ref: refs/heads/fixture\n');
+        await writeFile(join(git, 'commondir'), '../common\n');
+        if (kind === 'partial-common') await mkdir(join(f.root, 'common'));
+      }
+    }
+    const before = kind === 'gitfile' ? await readFile(git, 'utf8') : await readdir(git);
+    const siblings = await readdir(f.root);
+    const run = await createRunFolder({cwd: f.cwd, dataDir: f.dataDir, runId: `invalid-${kind}`});
+    await run.stageProjectFile({path: 'tool/config', content: 'staged', kind: 'config'});
+    assert.equal(JSON.parse(await readFile(join(f.dataDir, 'runner/staged', `${run.runId}.json`), 'utf8')).git, null, kind);
+    await run.backupStaged(f.dataDir); await run.release(); await recoverStagedFiles(f);
+    assert.deepEqual(kind === 'gitfile' ? await readFile(git, 'utf8') : await readdir(git), before, kind);
+    assert.deepEqual(await readdir(f.root), siblings, 'no sibling or ancestor repository was created');
+    await assert.rejects(lstat(join(git, 'info')), error => ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code!), kind);
+    await assert.rejects(lstat(join(f.root, 'missing-git')), {code: 'ENOENT'});
+  }
+});
+test('r18 invalid nested Git directories do not hide a valid ancestor repository', async t => {
+  for (const kind of ['empty', 'partial']) {
+    const f = await fixture(t), common = join(f.root, '.git'), nested = join(f.cwd, '.git');
+    await createGitDirectory(common); await mkdir(nested);
+    if (kind === 'partial') await writeFile(join(nested, 'HEAD'), 'ref: refs/heads/fixture\n');
+    const before = await readdir(nested);
+    const run = await createRunFolder({cwd: f.cwd, dataDir: f.dataDir, runId: kind}); await run.release();
+    assert.equal(await readFile(join(common, 'info/exclude'), 'utf8'), '/project/.maddots/\n');
+    assert.deepEqual(await readdir(nested), before);
+  }
+});
+test('r18 Git recognition accepts symbolic, detached SHA-1/SHA-256 and legacy symlink HEADs', async t => {
+  for (const kind of ['symbolic', 'sha1', 'sha256', 'symlink']) {
+    const f = await fixture(t), git = join(f.cwd, '.git'); await createGitDirectory(git);
+    if (kind === 'symlink') { await rm(join(git, 'HEAD')); await symlink('refs/heads/fixture', join(git, 'HEAD')); }
+    else if (kind !== 'symbolic') await writeFile(join(git, 'HEAD'), `${'a'.repeat(kind === 'sha1' ? 40 : 64)}\n`);
+    const run = await createRunFolder({cwd: f.cwd, dataDir: f.dataDir, runId: kind}); await run.release();
+    assert.equal(await readFile(join(git, 'info/exclude'), 'utf8'), '/.maddots/\n');
+  }
 });
 test('TLS-21 O_EXCL lock serializes concurrent creation, preserves live locks and reclaims gone pid', async t => {
   const f = await fixture(t);
@@ -84,7 +136,7 @@ test('TLS-21 claim reservations leave no run folder and allow the same run to be
   await run.release();
 });
 test('TLS-21 staging refuses conflicts and backs up files with only owned exclude lines removed', async t => {
-  const f = await fixture(t); const git = join(f.cwd, '.git'); await mkdir(join(git, 'info'), {recursive: true});
+  const f = await fixture(t); const git = join(f.cwd, '.git'); await createGitDirectory(git); await mkdir(join(git, 'info'), {recursive: true});
   const exclude = join(git, 'info', 'exclude');
   await writeFile(exclude, '# user rule\n/preserved.txt\n/preserved.txt.extra\n');
   await writeFile(join(f.cwd, 'existing.txt'), 'owner');
@@ -105,7 +157,7 @@ test('TLS-21 startup recovery preserves modified staged files and refuses a conf
   await run.stageProjectFile({path: 'tool/config', content: 'original', kind: 'config'});
   await writeFile(join(f.cwd, 'tool/config'), 'tool changed it'); await run.release();
   const backup = join(f.dataDir, 'backups/run-stage/leftover/tool/config');
-  await mkdir(dirname(backup), {recursive: true}); await writeFile(backup, 'earlier backup');
+  await mkdir(dirname(backup), {recursive: true, mode: 0o700}); await writeFile(backup, 'earlier backup');
   await assert.rejects(recoverStagedFiles(f), {code: 'folder_unavailable'});
   assert.equal(await readFile(backup, 'utf8'), 'earlier backup');
   assert.equal(await readFile(join(f.cwd, 'tool/config'), 'utf8'), 'tool changed it');
@@ -126,7 +178,7 @@ test('TLS-21 refuses symlink ancestors and escaping stage paths, and ignores too
 
 async function worktree(root: string, common: string, name: string): Promise<string> {
   const cwd = join(root, name), gitDir = join(common, 'worktrees', name);
-  await mkdir(cwd, {recursive: true}); await mkdir(gitDir, {recursive: true});
+  await mkdir(cwd, {recursive: true}); await createGitDirectory(common); await createGitDirectory(gitDir);
   await writeFile(join(cwd, '.git'), `gitdir: ${gitDir}\n`);
   await writeFile(join(gitDir, 'commondir'), '../..\n');
   return cwd;
@@ -141,10 +193,34 @@ async function childJob(t: TestContext, source: string, values: unknown[]) {
   return {child, completion};
 }
 
+test('r18 exclusion append never recreates a repository removed or invalidated after discovery', async t => {
+  for (const kind of ['removed', 'invalidated']) {
+    const f = await fixture(t), git = join(f.cwd, '.git'); await createGitDirectory(git);
+    await rm(join(git, 'info'), {recursive: true});
+    const job = await childJob(t, `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs/promises';
+      import {join} from 'node:path';
+      import {syncBuiltinESMExports} from 'node:module';
+      const [cwd,dataDir,git,kind] = JSON.parse(process.argv[1]);
+      const link = fs.link;
+      fs.link = async function(source,destination) {
+        await link(source,destination);
+        if (String(destination).endsWith('.lock')) await fs.rm(kind === 'removed' ? git : join(git,'HEAD'), {recursive:true});
+      };
+      syncBuiltinESMExports();
+      const {createRunFolder} = await import(${JSON.stringify(folderModule)});
+      await assert.rejects(createRunFolder({cwd,dataDir,runId:'gone'}), {code:'folder_unavailable'});
+      await assert.rejects(fs.lstat(kind === 'removed' ? git : join(git,'info')), {code:'ENOENT'});
+    `, [f.cwd, f.dataDir, git, kind]);
+    await job.completion;
+  }
+});
+
 test('TLS21-R4 concurrent nested folders and worktrees serialize exclusions across helper processes in one data root', async t => {
   for (const kind of ['nested', 'worktree']) {
     const f = await fixture(t), common = join(f.cwd, '.git');
-    await mkdir(join(common, 'info'), {recursive: true});
+    await createGitDirectory(common); await mkdir(join(common, 'info'), {recursive: true});
     const exclude = join(common, 'info/exclude'); await writeFile(exclude, '# owner line\n');
     const workers = await Promise.all(Array.from({length: 8}, async (_, index) => {
       const cwd = kind === 'nested' ? join(f.cwd, `sub-${index}`) : await worktree(f.root, common, `wt-${index}`);
@@ -187,7 +263,7 @@ test('TLS21-R4 concurrent nested folders and worktrees serialize exclusions acro
 
 test('TLS21-R5 durable worktree consumers retain helper exclusions until the last recovery and preserve user exclusions', async t => {
   const f = await fixture(t), common = join(f.root, 'common');
-  await mkdir(join(common, 'info'), {recursive: true});
+  await createGitDirectory(common); await mkdir(join(common, 'info'), {recursive: true});
   const exclude = join(common, 'info/exclude'); await writeFile(exclude, '# user\n/user/config\n');
   const a = await worktree(f.root, common, 'a'), b = await worktree(f.root, common, 'b');
   const first = await createRunFolder({cwd: a, dataDir: f.dataDir, runId: 'consumer-a'});
@@ -211,7 +287,7 @@ test('TLS21-R5 durable worktree consumers retain helper exclusions until the las
 test('correctness/TLS21-5 tool-written journals cannot move user files or remove parent/common Git exclusions', async t => {
   for (const mode of ['live', 'restart']) for (const kind of ['nested', 'worktree']) {
     const f = await fixture(t), common = join(f.cwd, '.git');
-    await mkdir(join(common, 'info'), {recursive: true});
+    await createGitDirectory(common); await mkdir(join(common, 'info'), {recursive: true});
     const cwd = kind === 'nested' ? join(f.cwd, 'sub') : await worktree(f.root, common, 'wt');
     await mkdir(cwd, {recursive: true}); const userPath = join(cwd, '.env'), exclude = join(common, 'info/exclude');
     const userLine = kind === 'nested' ? '/sub/.env' : '/.env';
@@ -239,6 +315,7 @@ test('TLS21-R5 newly reserved run.lock records its owner process start identity'
     import {syncBuiltinESMExports} from 'node:module';
     import {readFile} from 'node:fs/promises';
     import {join} from 'node:path';
+    Object.defineProperty(process, 'platform', {value: 'darwin'});
     const processStart = 'Fri Oct 16 12:00:00 2026';
     let probes = 0;
     cp.execFile = Object.assign(function() {}, {[promisify.custom]: async (command,argv,options) => {
@@ -262,6 +339,29 @@ test('TLS21-R5 newly reserved run.lock records its owner process start identity'
   await job.completion;
 });
 
+test('Linux folder locks persist kernel identities and preserve live legacy date owners conservatively', {skip: process.platform !== 'linux'}, async t => {
+  const f = await fixture(t), lock = join(f.cwd, '.maddots/run.lock');
+  const reservation = await reserveRunFolder({...f, runId: 'linux-owner'});
+  const own = JSON.parse(await readFile(lock, 'utf8'));
+  assert.match(own.processStart, /^linux:[a-f0-9-]{36}:[0-9]+$/u);
+  assert.equal(own.processStart, await processStartIdentity(process.pid));
+  await reservation.release();
+  const child = spawn('/bin/sleep', ['120'], {stdio: 'ignore'});
+  try {
+    await once(child, 'spawn');
+    const identity = await processStartIdentity(child.pid!);
+    assert(identity?.startsWith('linux:'));
+    for (const processStart of [identity, 'Fri Oct 16 12:00:00 2026']) {
+      await writeFile(lock, JSON.stringify({pid: child.pid, runId: 'live', processStart}));
+      assert.equal(await runFolderAvailable(f.cwd), false);
+    }
+    await writeFile(lock, JSON.stringify({pid: child.pid, runId: 'prior-boot', processStart: 'linux:00000000-0000-0000-0000-000000000000:1'}));
+    assert.equal(await runFolderAvailable(f.cwd), true, 'a different kernel lifetime proves the saved lock owner exited');
+  } finally {
+    const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited;
+  }
+});
+
 test('TLS21-F7/TLS21-10 reclaims reused PIDs and unheld current-process locks but preserves live owners', async t => {
   const f = await fixture(t);
   const job = await childJob(t, `
@@ -271,8 +371,19 @@ test('TLS21-F7/TLS21-10 reclaims reused PIDs and unheld current-process locks bu
     import {syncBuiltinESMExports} from 'node:module';
     import {mkdir,writeFile,lstat} from 'node:fs/promises';
     import {join} from 'node:path';
+    Object.defineProperty(process, 'platform', {value: 'darwin'});
     const started = 'Wed Oct 14 12:00:00 2026';
-    let psFails = false;
+    let psFails = false, signalProbeDenied = false;
+    const kill = process.kill;
+    // PID 1's real signal permissions differ between hosts. This Darwin model
+    // already supplies its start time, so supply the matching liveness result.
+    process.kill = (pid, signal) => {
+      if (pid === 1 && signal === 0) {
+        if (signalProbeDenied) throw Object.assign(new Error('signal probe denied'), {code:'EPERM'});
+        return true;
+      }
+      return kill(pid, signal);
+    };
     cp.execFile = Object.assign(function() {}, {[promisify.custom]: async (command,argv,options) => {
       assert.equal(command,'/bin/ps'); assert.equal(options.env.LC_ALL,'C');
       if (psFails) throw new Error('ps unavailable');
@@ -291,6 +402,10 @@ test('TLS21-F7/TLS21-10 reclaims reused PIDs and unheld current-process locks bu
     ]) {
       await writeFile(lock,JSON.stringify(value)); assert.equal(await runFolderAvailable(cwd),true,JSON.stringify(value));
     }
+    signalProbeDenied = true;
+    await writeFile(lock,JSON.stringify({pid:1,runId:'unverified',processStart:'Thu Jan  1 00:00:00 1970'}));
+    assert.equal(await runFolderAvailable(cwd),false,'a denied liveness probe cannot prove a stale owner');
+    signalProbeDenied = false;
     for (const value of [
       {pid:process.ppid,runId:'live',startedAt:'2026-10-14T12:00:00.000Z',processStart:started},
       {pid:process.ppid,runId:'live',startedAt:'2026-10-14T12:00:00.000Z'},
@@ -315,7 +430,7 @@ test('TLS-21 refuses a tool-writable data root and hardlinked Git exclusion targ
   const f = await fixture(t), nestedData = join(f.cwd, 'data'); await mkdir(nestedData);
   await assert.rejects(createRunFolder({cwd: f.cwd, dataDir: nestedData, runId: 'unsafe-data'}), {code: 'folder_unavailable'});
   const userFile = join(f.root, 'user-file'); await writeFile(userFile, 'untouched');
-  await mkdir(join(f.cwd, '.git/info'), {recursive: true}); await link(userFile, join(f.cwd, '.git/info/exclude'));
+  await createGitDirectory(join(f.cwd, '.git')); await mkdir(join(f.cwd, '.git/info'), {recursive: true}); await link(userFile, join(f.cwd, '.git/info/exclude'));
   await assert.rejects(createRunFolder({cwd: f.cwd, dataDir: f.dataDir, runId: 'unsafe-exclude'}), {code: 'folder_unavailable'});
   assert.equal(await readFile(userFile, 'utf8'), 'untouched');
 });
@@ -323,7 +438,7 @@ test('TLS-21 refuses a tool-writable data root and hardlinked Git exclusion targ
 test('correctness/TLS21-5 live and startup cleanup use recorded Git locations despite a planted .git redirect', async t => {
   for (const mode of ['live', 'restart']) for (const kind of ['nested', 'worktree']) {
     const f = await fixture(t), common = join(f.cwd, '.git');
-    await mkdir(join(common, 'info'), {recursive: true});
+    await createGitDirectory(common); await mkdir(join(common, 'info'), {recursive: true});
     const cwd = kind === 'nested' ? join(f.cwd, 'sub') : await worktree(f.root, common, 'worktree');
     await mkdir(cwd, {recursive: true});
     const target = join(f.root, 'unrelated-git'); await mkdir(join(target, 'info'), {recursive: true});
@@ -364,11 +479,11 @@ test('correctness/TLS21-5 startup journal reads enforce private directories and 
   const folder = join(f.dataDir, 'runner/staged'), journal = join(folder, `${run.runId}.json`), bytes = await readFile(journal);
   for (const path of [f.dataDir, join(f.dataDir, 'runner'), folder]) assert.equal((await lstat(path)).mode & 0o777, 0o700);
   assert.equal((await lstat(journal)).mode & 0o777, 0o600);
-  await chmod(folder, 0o755); await assert.rejects(recoverStagedFiles(f), {code: 'PATH_UNSAFE'}); await chmod(folder, 0o700);
-  await chmod(journal, 0o644); await assert.rejects(recoverStagedFiles(f), {code: 'FILE_UNSAFE'}); await chmod(journal, 0o600);
+  await chmod(folder, 0o755); await assert.rejects(recoverStagedFiles(f), {code: process.platform === 'linux' ? 'RUNNER_STATE_UNAVAILABLE' : 'PATH_UNSAFE'}); await chmod(folder, 0o700);
+  await chmod(journal, 0o644); await assert.rejects(recoverStagedFiles(f), {code: process.platform === 'linux' ? 'RUNNER_STATE_INVALID' : 'FILE_UNSAFE'}); await chmod(journal, 0o600);
   const replacement = join(f.root, 'fake-journal'); await writeFile(replacement, bytes, {mode: 0o600});
   await rm(journal); await symlink(replacement, journal);
-  await assert.rejects(recoverStagedFiles(f), {code: 'PATH_UNSAFE'});
+  await assert.rejects(recoverStagedFiles(f), {code: process.platform === 'linux' ? 'ELOOP' : 'PATH_UNSAFE'});
   assert.equal(await readFile(join(f.cwd, 'actual'), 'utf8'), 'owned');
   await rm(journal); await writeFile(journal, bytes, {mode: 0o600}); await recoverStagedFiles(f);
   await assert.rejects(lstat(journal), {code: 'ENOENT'});
@@ -376,7 +491,7 @@ test('correctness/TLS21-5 startup journal reads enforce private directories and 
 
 test('R2-NEW-NEW-1 exclusions leave only info/exclude in plain, nested and worktree repositories', async t => {
   for (const kind of ['plain', 'nested', 'worktree']) {
-    const f = await fixture(t), common = join(f.cwd, '.git'); await mkdir(common);
+    const f = await fixture(t), common = join(f.cwd, '.git'); await createGitDirectory(common);
     const cwd = kind === 'worktree' ? await worktree(f.root, common, 'ledger-wt') : kind === 'nested' ? join(f.cwd, 'sub') : f.cwd;
     await mkdir(cwd, {recursive: true});
     const run = await createRunFolder({cwd, dataDir: f.dataDir, runId: `ledger-${kind}`});
@@ -398,7 +513,7 @@ async function exclusionLock(f: {cwd: string; dataDir: string}): Promise<string>
 
 test('R2-NEW-NEW-2/N3 old empty and partial locks recover create, stage, backup and startup recovery quickly', async t => {
   for (const content of ['', '{"pid":12']) {
-    const f = await fixture(t); await mkdir(join(f.cwd, '.git'));
+    const f = await fixture(t); await createGitDirectory(join(f.cwd, '.git'));
     const lock = await exclusionLock(f), old = new Date(Date.now() - 60_000);
     const temporary = `${lock}.abandoned.tmp`; await writeFile(temporary, 'partial'); await utimes(temporary, old, old);
     const interrupted = async <T>(action: () => Promise<T>): Promise<T> => {
@@ -419,7 +534,7 @@ test('R2-NEW-NEW-2/N3 old empty and partial locks recover create, stage, backup 
 });
 
 test('R2-NEW-NEW-2/N3 fresh malformed exclusion locks retain their inode while acquisition waits', async t => {
-  const f = await fixture(t); await mkdir(join(f.cwd, '.git'));
+  const f = await fixture(t); await createGitDirectory(join(f.cwd, '.git'));
   const lock = await exclusionLock(f); await writeFile(lock, ''); const original = await lstat(lock);
   let completed = false;
   const pending = createRunFolder({cwd: f.cwd, dataDir: f.dataDir, runId: 'fresh'}).then(run => { completed = true; return run; });
@@ -431,7 +546,7 @@ test('R2-NEW-NEW-2/N3 fresh malformed exclusion locks retain their inode while a
 });
 
 test('R2-NEW-NEW-2/N3 published exclusion locks always contain complete metadata during child operations', async t => {
-  const f = await fixture(t); await mkdir(join(f.cwd, '.git')); const lock = await exclusionLock(f);
+  const f = await fixture(t); await createGitDirectory(join(f.cwd, '.git')); const lock = await exclusionLock(f);
   const job = await childJob(t, `
     import fs from 'node:fs/promises';
     import {syncBuiltinESMExports} from 'node:module';
@@ -476,6 +591,7 @@ test('R2-NEW-NEW-3 importing folder code launches no process and failed own iden
     import cp from 'node:child_process';
     import {promisify} from 'node:util';
     import {syncBuiltinESMExports} from 'node:module';
+    Object.defineProperty(process, 'platform', {value: 'darwin'});
     let probes = 0;
     cp.execFile = Object.assign(function() {}, {[promisify.custom]: async () => {
       probes++; if (probes === 1) throw new Error('temporary ps failure');

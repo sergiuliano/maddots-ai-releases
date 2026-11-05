@@ -1,4 +1,5 @@
 import { realpath, writeFile } from 'node:fs/promises';
+import {selectedLoginFailure} from './linux-login-provider.js';
 import { randomBytes } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import type { ToolMatrix } from '../shared/tool-matrix.js';
@@ -9,10 +10,18 @@ import type { Adapter } from './adapter.js';
 import { AdapterRegistry } from './adapters/index.js';
 import { buildCardPrompt, safeUploadName, type RunCardRead } from './card-prompt.js';
 import { MadDotsApiError, type MaddotsApi } from './maddots-api.js';
-import { enforceAdapter, startTool, recoverProcess, processStartIdentity, cleanupRunHomes, timeoutSeconds, computeRunDeadline, ProcessCleanupError, type ProcessInspector, type RunningTool } from './process.js';
+import { enforceAdapter, startTool, recoverProcess, processStartIdentity, processIsRunning, verifyLegacyProcessAbsence, cleanupRunHomes, timeoutSeconds, computeRunDeadline, beforeDeadline, PROCESS_CLEANUP_CAP_MS, ProcessCleanupError, ProcessRefusal, type ProcessInspector, type RunningTool } from './process.js';
 import type { RunnerAgent, RunnerClaim, RunnerProtocolClient, RunnerSkill } from './protocol-client.js';
-import { reserveRunFolder, recoverStagedFiles, releaseLeftoverLock, runFolderAvailable, type RunFolder } from './run-folder.js';
+import { reserveRunFolder, recoverStagedFiles, releaseLeftoverLock, runFolderAvailable, isRunFolderStorageFailure, type RunFolder } from './run-folder.js';
 import { RunnerState, outcomeMetadataValid, type ActiveRun } from './state.js';
+import { signalIfStillOwned } from './signal-gate.js';
+import {acquireStorageOwner, RunnerStorageError, storageOwnersBusy, type RunnerStorageOwner} from './storage-owner.js';
+import type {RunnerStorageLock} from './storage-lock.js';
+import {diagnosticStorageBusy} from './test-run.js';
+import {createLinuxToolLifecycle, withLinuxOwnerContext} from './linux-lifecycle.js';
+import {createAcceptanceOperation} from './linux-authorization.js';
+import type {VerifiedAcceptance} from './acceptance.js';
+import {prepareLinuxLocalProvider} from './linux-local-provider.js';
 
 export type LocalAgent = { agentId: string; aiToolId: string; cwd: string; access: RunnerAccess };
 export type RunnerConnection = {
@@ -21,19 +30,29 @@ export type RunnerConnection = {
 };
 type Posted = RunnerOutcomeBody['posted'];
 export type RunnerOptions = {
+  helperId?: string;
   data: string; connections: () => Promise<RunnerConnection[]>; localAgents: () => Promise<LocalAgent[]>;
   registry: AdapterRegistry; matrix?: ToolMatrix; now?: () => number; sleep?: Timing['sleep']; processes?: ProcessInspector;
-  verifiedBuild: (digest: string, skill: RunnerSkill, connection: RunnerConnection, agentId: string) => Promise<boolean>;
-  allowedBuild: (skill: RunnerSkill, connection: RunnerConnection, agentId: string) => Promise<boolean>;
-  skillDescription?: (skill: RunnerSkill, connection: RunnerConnection, agentId: string) => Promise<string>;
+  verifiedBuild: (digest: string, skill: RunnerSkill, connection: RunnerConnection, agentId: string, runId?: string) => Promise<boolean>;
+  allowedBuild: (skill: RunnerSkill, connection: RunnerConnection, agentId: string, runId?: string) => Promise<boolean>;
+  skillDescription?: (skill: RunnerSkill, connection: RunnerConnection, agentId: string, runId?: string) => Promise<string>;
+  claimSkills?: <T extends {claim: RunnerClaim}>(connection: RunnerConnection, issue: () => Promise<T>) => Promise<T>;
+  releaseSkills?: (runId: string) => void;
+  withSkillsFence?: <T>(claim: RunnerClaim, connection: RunnerConnection, action: (release: () => Promise<void>) => Promise<T>) => Promise<T>;
   stageSkills: (context: {claim: RunnerClaim; folder: RunFolder; skillsDir: string; connection: RunnerConnection; signal: AbortSignal}) => Promise<void>;
   // TLS-22 and TLS-23 supply these hooks. Content is handed directly to delivery, never to the protocol client.
   startCheck?: (context: {api: MaddotsApi; claim: RunnerClaim; stop: (code: string) => Promise<void>}) => Promise<() => void>;
   deliver: (context: {api: MaddotsApi; claim: RunnerClaim; folder: RunFolder; text: string; signal: AbortSignal}) => Promise<{posted: Posted; outcome?: RunnerOutcomeBody['outcome']; code?: string | null}>;
   removeDeviceKey: (aiToolId: string, deviceKeyId: string | null) => Promise<void>;
   paired?: () => Promise<boolean>;
+  /** Data-only preparation runs before obtaining signed claim authorization. */
+  prepareLocalProvider?: typeof prepareLinuxLocalProvider;
 };
 const runners = new Set<RunnerCore>();
+// Runtime recreation may leave a timed-out physical write behind. Ownership
+// covers the whole loaded ledger, not only each write, so a replacement cannot
+// read an obsolete snapshot while its predecessor is still draining storage.
+const legacyStorageOwners = new Map<string, RunnerCore>();
 const emptyPosted = (): Posted => ({comments: 0, attachments: 0, filesSkipped: 0, moved: false, moveSkipped: null});
 // TLS-08's scope guard precedes the revoked-key check when the last runs grant is removed.
 const lostKey = new Set(['DEVICE_KEY_REVOKED', 'RUNS_NOT_ENABLED', 'SCOPE_MISSING']);
@@ -58,7 +77,9 @@ async function signed<T>(call: Promise<T>): Promise<T> {
   try { return await call; } catch (error) { throw lostKey.has(codeOf(error)) ? new KeyLost() : error; }
 }
 
-export function runnerBusy(): boolean { return [...runners].some(runner => runner.busy); }
+export function runnerBusy(data?: string): boolean {
+  return storageOwnersBusy(data) || diagnosticStorageBusy(data) || [...runners].some(runner => (data === undefined || resolve(runner.dataDirectory) === resolve(data)) && runner.busy);
+}
 export async function tickRunners(): Promise<void> { await Promise.allSettled([...runners].map(runner => runner.tick())); }
 export async function stopRunners(): Promise<void> { await Promise.allSettled([...runners].map(runner => runner.close())); }
 // TokenManager deletes the complete device-key item while holding its existing write lock.
@@ -66,103 +87,278 @@ export async function disconnectRunners(): Promise<void> { await Promise.allSett
 
 export class RunnerCore {
   private readonly state: RunnerState;
-  private readonly active = new Map<string, ActiveRun>();
-  private readonly unrecovered = new Map<string, ActiveRun>();
-  private readonly recoveryFolders = new Map<string, RunFolder>();
+  private active = new Map<string, ActiveRun>();
+  private unrecovered = new Map<string, ActiveRun>();
+  private recoveryFolders = new Map<string, RunFolder>();
   private readonly jobs = new Map<string, Promise<void>>();
   private readonly tools = new Map<string, RunningTool>();
   private readonly controllers = new Map<string, AbortController>();
+  private readonly preparations = new Map<string, {controller: AbortController; deviceKeyId: string}>();
   private readonly reasons = new Map<string, string>();
   private readonly lostKeys = new Set<string>();
   private readonly runKeys = new Map<string, string>();
-  private readonly folders = new Set<string>();
+  private folders = new Set<string>();
   private runHomesUnsafe = false;
   private lastError: string | null = null;
   private initialized = false;
+  private stateLoaded = false;
   private initializing?: Promise<void>;
   private cycling?: Promise<void>;
-  private writes = Promise.resolve();
+  private legacyWrites?: Promise<void>;
+  private owner?: RunnerStorageOwner;
+  private ownerGeneration = 0;
+  private readonly linuxStorage = process.platform === 'linux';
+  private get writes(): Promise<void> | undefined { return this.owner?.writes ?? this.legacyWrites; }
+  private set writes(value: Promise<void> | undefined) { this.legacyWrites = value; }
+  private writeRequested = false;
+  private legacyWriteStalled = false;
+  private get writeStalled(): boolean { return this.owner?.unavailable ?? this.legacyWriteStalled; }
+  private set writeStalled(value: boolean) { this.legacyWriteStalled = value; }
+  private storageDirectory?: string;
+  private disconnecting = 0;
   private closed = false;
+  private closeFinished = false;
   private nextCycle = 0;
   constructor(private readonly options: RunnerOptions) { this.state = new RunnerState(options.data); runners.add(this); }
+  get dataDirectory(): string { return this.owner?.state.data ?? this.options.data; }
   // Posting rows and outcomes survive a restart; only live work holds the updater.
-  get busy(): boolean { return this.jobs.size > 0 || [...this.unrecovered.values()].some(row => !!row.fence) || [...this.active.values()].some(row => row.phase !== 'posting'); }
+  get busy(): boolean { return (this.linuxStorage && (!this.owner ? !this.closeFinished : this.owner.busy)) || this.preparations.size > 0 || this.jobs.size > 0 || [...this.unrecovered.values()].some(row => !!row.fence || row.pid > 0 || !!row.pgid || !!row.processGroups?.length || row.legacyProcessIdentity) || [...this.active.values()].some(row => row.phase !== 'posting'); }
+  /** Inert in-memory evidence only, never a cleanup or storage capability. */
+  diagnosticSnapshot() {
+    return {busy: this.busy, idle: this.jobs.size === 0, jobs: this.jobs.size, closed: this.closed,
+      closeFinished: this.closeFinished, initializing: !!this.initializing, cycling: !!this.cycling,
+      disconnecting: this.disconnecting, tools: this.tools.size, owner: this.owner?.diagnosticSnapshot() ?? null};
+  }
   private lost(connection: RunnerConnection): boolean { return this.lostKeys.has(connection.deviceKeyId); }
   private now(): number { return (this.options.now ?? Date.now)(); }
-  private save(): Promise<void> {
-    this.writes = this.writes.catch(() => {}).then(() => this.state.writeActive([...this.active.values(), ...this.unrecovered.values()])); return this.writes;
+  private releaseStorage(): void {
+    if (!this.closeFinished || this.initializing || this.cycling || this.disconnecting || this.linuxStorage && this.jobs.size) return;
+    if (this.owner) { void this.owner.detach(this.ownerGeneration); return; }
+    if (this.writes) return;
+    if (this.storageDirectory && legacyStorageOwners.get(this.storageDirectory) === this) legacyStorageOwners.delete(this.storageDirectory);
+  }
+  private async save(deadline = Date.now() + PROCESS_CLEANUP_CAP_MS): Promise<void> {
+    if (this.linuxStorage) {
+      if (!this.owner) throw new RunnerStorageError();
+      return this.owner.save(this.ownerGeneration, deadline);
+    }
+    if (this.closeFinished || !this.storageDirectory || legacyStorageOwners.get(this.storageDirectory) !== this) throw new RunnerStorageError();
+    this.writeRequested = true;
+    if (this.writeStalled) throw new RunnerStorageError();
+    if (!this.writes) {
+      // A timeout releases only the waiter. The physical writer keeps its
+      // serialization slot, then flushes the latest ledger before retrying is
+      // allowed. It must never overlap a replacement write or clobber it late.
+      const writing = (async () => {
+        // Establish the slot before invoking storage, including sync failures.
+        await Promise.resolve();
+        try {
+          while (this.writeRequested) {
+            this.writeRequested = false;
+            await this.state.writeActive(structuredClone([...this.active.values(), ...this.unrecovered.values()]));
+          }
+        } finally {
+          // Clear the slot in the writer's continuation, before its promise
+          // settles. A new save must never join an already finished drain.
+          this.writes = undefined; this.writeStalled = false;
+          this.releaseStorage();
+        }
+      })();
+      this.writes = writing;
+      void writing.catch(() => {});
+    }
+    const writing = this.writes;
+    // Recovery may request one last durable snapshot after its process budget
+    // expires. A zero-length waiter says nothing about storage availability.
+    if (Date.now() >= deadline) throw new ProcessCleanupError();
+    try { await beforeDeadline(deadline, () => writing); }
+    catch (error) {
+      if (this.writes === writing && Date.now() >= deadline) {
+        this.writeStalled = true;
+        throw new RunnerStorageError();
+      }
+      throw error;
+    }
+  }
+  private storage<T>(action: (state: RunnerState) => Promise<T>, mutation = false): Promise<T> {
+    if (!this.linuxStorage) return action(this.state);
+    if (!this.owner) return Promise.reject(new RunnerStorageError());
+    return this.owner.operation(this.ownerGeneration, action, mutation);
+  }
+  private folderStorage<T>(action: (storage?: RunnerStorageLock) => Promise<T>): Promise<T> {
+    if (!this.linuxStorage) return action();
+    if (!this.owner) return Promise.reject(new RunnerStorageError());
+    return this.owner.operation(this.ownerGeneration, (_state, lock) => action(lock), isRunFolderStorageFailure);
+  }
+  private assertStorageGeneration(): void {
+    if (this.linuxStorage) {
+      if (!this.owner) throw new RunnerStorageError();
+      this.owner.assertGeneration(this.ownerGeneration);
+    }
   }
   private async recoverRow(row: ActiveRun): Promise<void> {
+    if (this.writeStalled) throw new RunnerStorageError();
     const cwd = dirname(dirname(dirname(row.runDir)));
     if (resolve(row.runDir) !== join(cwd, '.maddots', 'runs', row.runId)) throw new HelperError('RUNNER_STATE_INVALID', 'The saved run folder is invalid.');
-    const onGroups = async (processGroups: ActiveRun['processGroups']) => { row.processGroups = processGroups; await this.save(); };
-    // Validate paths before inspecting or signalling any saved process.
-    if (row.pid > 0) {
-      const identity = await (this.options.processes?.identity ?? processStartIdentity)(row.pid);
-      if (identity === null) {
-        let alive = true;
-        try { process.kill(row.pid, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
-        if (alive) throw new HelperError('RUNNER_RECOVERY_UNAVAILABLE', 'Process identity could not be verified safely. Retry recovery when process inspection is available.');
-      } else if (!row.fence && !row.pgid && !row.processGroups?.length && identity === row.startedAt && !await recoverProcess(row.pid, row.startedAt, this.options.processes, undefined, [], onGroups)) {
-        throw new HelperError('RUNNER_RECOVERY_UNAVAILABLE', 'Process identity changed during recovery. Retry recovery safely.');
+    // Linux recovery derives completion only from a fully replayed CLEAN
+    // record. A pid, fence, phase, empty scan or missing active.json never
+    // upgrades legacy evidence into authority. S3 supplies containment recovery.
+    if (this.owner?.requiresJournal) this.owner.assertRetiredProjection(row.runId);
+    else {
+      // Preliminary checks and legacy verification consume the same process
+      // cleanup budget as the tree sweep, including an unavailable inspector.
+      const cleanupStarted = Date.now(), cleanupEnds = cleanupStarted + PROCESS_CLEANUP_CAP_MS;
+      const onGroups = async (processGroups: ActiveRun['processGroups']) => {
+        this.assertStorageGeneration(); row.processGroups = this.owner ? structuredClone(processGroups) : processGroups;
+        await this.save(cleanupEnds);
+      };
+      if (row.legacyProcessIdentity && row.legacyProcessGroups === undefined) {
+        row.legacyProcessGroups = structuredClone(row.processGroups ?? []);
+        await this.save(cleanupEnds);
       }
+      // Validate paths before inspecting or signalling any saved process.
+      if (row.pid > 0) {
+        const identity = await beforeDeadline(cleanupEnds, () => (this.options.processes?.identity ?? processStartIdentity)(row.pid));
+        if (identity === null) {
+          let alive = true;
+          if (!this.options.processes) alive = await beforeDeadline(cleanupEnds, () => processIsRunning(row.pid));
+          else try { alive = (await signalIfStillOwned({kind: 'probe', pid: row.pid}, 0)).status === 'sent'; } catch { /* Keep uncertain recovery pending. */ }
+          if (alive) throw new HelperError('RUNNER_RECOVERY_UNAVAILABLE', 'Process identity could not be verified safely. Retry recovery when process inspection is available.');
+        } else if (!row.fence && !row.pgid && !row.processGroups?.length && identity === row.startedAt && !await recoverProcess(row.pid, row.startedAt, this.options.processes, undefined, [], onGroups, cleanupStarted)) {
+          throw new HelperError('RUNNER_RECOVERY_UNAVAILABLE', 'Process identity changed during recovery. Retry recovery safely.');
+        }
+      }
+      // The direct child may already be gone, reused, or not yet saved after spawn.
+      if (row.fence || row.pgid || row.processGroups?.length) await recoverProcess(row.pid, row.startedAt, this.options.processes, row.fence,
+        [...(row.pgid || row.pid ? [{pgid: row.pgid ?? row.pid, startedAt: row.startedAt}] : []), ...row.processGroups ?? []], onGroups, cleanupStarted);
+      if (row.legacyProcessIdentity) await verifyLegacyProcessAbsence(row.pid,
+        [...(row.pgid || row.pid ? [{pgid: row.pgid ?? row.pid, startedAt: row.startedAt}] : []), ...row.legacyProcessGroups ?? []], this.options.processes, cleanupEnds);
     }
-    // The direct child may already be gone, reused, or not yet saved after spawn.
-    if (row.fence || row.pgid || row.processGroups?.length) await recoverProcess(row.pid, row.startedAt, this.options.processes, row.fence,
-      [...(row.pgid || row.pid ? [{pgid: row.pgid ?? row.pid, startedAt: row.startedAt}] : []), ...row.processGroups ?? []], onGroups);
     // Once verified gone, never inspect a possibly reused pid during a later folder retry.
-    row.pid = 0; delete row.fence; delete row.pgid; delete row.processGroups;
-    await recoverStagedFiles({cwd, dataDir: this.options.data, runId: row.runId});
+    row.pid = 0; delete row.fence; delete row.pgid; delete row.processGroups; delete row.legacyProcessIdentity; delete row.legacyProcessGroups;
+    await this.folderStorage(storage => recoverStagedFiles({cwd, dataDir: this.dataDirectory, runId: row.runId, storage}));
     const held = this.recoveryFolders.get(row.runId);
     if (held) { await held.release(); this.recoveryFolders.delete(row.runId); }
     else await releaseLeftoverLock(cwd, row.runId);
   }
   async init(): Promise<void> {
-    if (this.initialized) return;
+    if (this.closed || this.writeStalled) throw new RunnerStorageError();
+    if (this.initialized) {
+      if (this.owner) { await this.owner.validate(); if (this.owner.admissionBlocked) throw new RunnerStorageError(); }
+      return;
+    }
     if (this.initializing) return this.initializing;
     this.initializing = (async () => {
-      await this.state.init();
-      this.active.clear(); this.unrecovered.clear(); this.folders.clear();
+      if (!this.stateLoaded) {
+        if (this.linuxStorage) {
+          if (!this.owner) {
+            const acquisition = await acquireStorageOwner(this.options.data, this.state);
+            if (this.closed) {await acquisition.release(); throw new RunnerStorageError();}
+            const owner = acquisition.owner;
+            this.ownerGeneration = acquisition.attach(); this.owner = owner;
+            this.active = owner.active; this.unrecovered = owner.unrecovered;
+            this.recoveryFolders = owner.recoveryFolders; this.folders = owner.folders;
+          }
+          await this.owner.validate();
+          await this.owner.replayJournal(this.ownerGeneration);
+          if (!this.owner.stateLoaded) await this.storage(state => state.init(), true);
+        } else {
+          await this.state.init();
+          const directory = await realpath(this.options.data);
+          if (this.closed || legacyStorageOwners.has(directory) && legacyStorageOwners.get(directory) !== this) throw new RunnerStorageError();
+          legacyStorageOwners.set(directory, this); this.storageDirectory = directory;
+        }
+        const rows = this.owner?.stateLoaded ? [] : await this.storage(state => state.active());
+        if (this.owner?.requiresJournal) for (const row of rows) this.owner.assertRetiredProjection(row.runId);
+        // Load once per core, including after a failed final save. Re-reading
+        // the old disk snapshot would lose newly discovered process authority.
+        for (const row of rows) this.unrecovered.set(row.runId, row);
+        this.stateLoaded = true;
+        if (this.owner) this.owner.stateLoaded = true;
+      }
       const restored: ActiveRun[] = [];
-      const rows = await this.state.active();
+      const rows = [...this.unrecovered.values()];
       // Recovery callbacks persist the entire ledger, including rows whose
       // cleanup has not started and rows awaiting pending-outcome validation.
-      for (const row of rows) this.unrecovered.set(row.runId, row);
       for (const row of rows) {
         try { await this.recoverRow(row); restored.push({...row, pid: 0, phase: 'posting'}); }
         catch (error) {
           // One absent or damaged folder never blocks other runs, sync or credential removal.
           this.unrecovered.set(row.runId, row);
           this.folders.add(resolve(dirname(dirname(dirname(row.runDir)))));
-          await this.state.log(row.runId, 'recovery', safeCode(error), 0).catch(() => {});
+          // Once the writer is unavailable, do not wait on more disk I/O to
+          // log or finalize this failed attempt. All rows stay in memory.
+          if (this.writeStalled) {
+            if (this.owner) await this.save().catch(() => {});
+            else this.writeRequested = true;
+            throw new RunnerStorageError();
+          }
+          await this.storage(state => state.log(row.runId, 'recovery', safeCode(error), 0), true).catch(() => {});
         }
       }
       // Homes are cleaned only after every recorded process was safely verified gone.
-      if ([...this.unrecovered.values()].some(row => row.pid > 0 || row.fence)) this.runHomesUnsafe = true;
+      if ([...this.unrecovered.values()].some(row => row.pid > 0 || row.fence || row.pgid || row.processGroups?.length || row.legacyProcessIdentity)) this.runHomesUnsafe = true;
       else {
         // Runs-on diagnostics have their own process ledger and lease, and may be live.
-        try { await cleanupRunHomes(this.options.data, {skipTests: true}); }
+        try {
+          if (this.owner) this.runHomesUnsafe = await this.owner.operation(this.ownerGeneration, async (_state, lock) => {
+            const directory = await lock.directory('run-homes');
+            try {await cleanupRunHomes(this.dataDirectory, {skipTests: true, directory}); return false;}
+            catch (error) {
+              // Unsafe leftover contents only disable run-home adapters. The
+              // existing ledger stays usable if its retained storage is intact.
+              if (!(error instanceof ProcessRefusal)) throw error;
+              await directory.assertCurrent();
+              return true;
+            }
+          }, true);
+          else {await cleanupRunHomes(this.dataDirectory, {skipTests: true}); this.runHomesUnsafe = false;}
+        }
         catch { this.runHomesUnsafe = true; }
       }
       // Recover processes before validating pending files. A row without an outcome already finished.
-      const pendingRuns = new Set((await this.state.pending()).map(pending => pending.runId));
+      const pendingRuns = new Set((await this.storage(state => state.pending())).map(pending => pending.runId));
       for (const row of restored) {
         this.unrecovered.delete(row.runId);
+        this.folders.delete(resolve(dirname(dirname(dirname(row.runDir)))));
         if (pendingRuns.has(row.runId)) this.active.set(row.runId, row);
       }
       await this.save(); this.initialized = true;
+      if (this.owner) this.owner.initialized = true;
     })();
-    try { await this.initializing; } finally { this.initializing = undefined; }
+    try { await this.initializing; } finally { this.initializing = undefined; this.releaseStorage(); }
+  }
+  /** Service diagnostics share the core's retained owner and generation.
+   * A separate acquisition cannot attach while this core is still live. */
+  async withToolContext<T>(action: () => Promise<T>): Promise<T> {
+    if (!this.linuxStorage) return action();
+    await this.init();
+    this.assertStorageGeneration();
+    const owner = this.owner;
+    if (!owner || owner.unrecovered.size || owner.admissionBlocked) throw new RunnerStorageError();
+    return withLinuxOwnerContext(owner, this.ownerGeneration, action);
   }
   async tick(): Promise<void> {
     if (this.closed) return;
     if (this.cycling) return this.cycling;
-    this.cycling = this.cycle().catch(error => { this.lastError = safeCode(error); });
-    try { await this.cycling; } finally { this.cycling = undefined; }
+    this.cycling = (async () => {
+      await this.init();
+      return this.owner?.requiresJournal ? withLinuxOwnerContext(this.owner, this.ownerGeneration, () => this.cycle()) : this.cycle();
+    })().catch(error => { this.lastError = safeCode(error); });
+    try { await this.cycling; } finally { this.cycling = undefined; this.releaseStorage(); }
   }
   private async cycle(): Promise<void> {
-    await this.init();
+    if (this.owner?.admissionBlocked) throw new RunnerStorageError();
     if (this.options.paired && !await this.options.paired()) { await this.disconnect(); return; }
+    // Qualify the native boundary before reading connections or advertising
+    // claim capacity. Actual launch still needs its separate durable intent
+    // and one-use permission through this same retained owner.
+    if (process.platform === 'linux' && this.owner?.requiresJournal) {
+      await beforeDeadline(Date.now() + PROCESS_CLEANUP_CAP_MS, async () => {
+        const backend = await this.owner!.getLinuxContainment(this.ownerGeneration);
+        await backend.qualifyAdmission?.();
+      });
+    }
     if (this.now() < this.nextCycle) return;
     this.nextCycle = this.now() + 15_000;
     for (const row of [...this.unrecovered.values()]) {
@@ -170,9 +366,13 @@ export class RunnerCore {
         await this.recoverRow(row);
         this.unrecovered.delete(row.runId);
         this.folders.delete(resolve(dirname(dirname(dirname(row.runDir)))));
-        if ((await this.state.pending()).some(pending => pending.runId === row.runId)) this.active.set(row.runId, {...row, pid: 0, phase: 'posting'});
+        if ((await this.storage(state => state.pending())).some(pending => pending.runId === row.runId)) this.active.set(row.runId, {...row, pid: 0, phase: 'posting'});
         await this.save();
-      } catch { await this.save().catch(() => {}); /* Persist verified process cleanup even when folder recovery must retry. */ }
+      } catch {
+        // Persist verified process cleanup even when folder recovery must retry.
+        // A stalled writer must also stop the cycle before any new work starts.
+        await this.save().catch(error => { if (error instanceof RunnerStorageError) throw error; });
+      }
     }
     const connections = await this.options.connections();
     await this.expire();
@@ -182,14 +382,21 @@ export class RunnerCore {
       try {
         await this.flush(connection);
         const running = new Map([...this.active.values()].filter(row => row.aiToolId === connection.aiToolId).map(({runId, phase}) => [runId, {runId, phase}]));
-        for (const pending of await this.state.pending()) if (pending.aiToolId === connection.aiToolId && !running.has(pending.runId)) running.set(pending.runId, {runId: pending.runId, phase: 'posting'});
+        for (const pending of await this.storage(state => state.pending())) if (pending.aiToolId === connection.aiToolId && !running.has(pending.runId)) running.set(pending.runId, {runId: pending.runId, phase: 'posting'});
         const connectionLocals = locals.filter(local => local.aiToolId === connection.aiToolId);
         const heartbeat = await signed(connection.protocol.heartbeat({helperVersion: VERSION, toolVersion: connection.toolVersion,
           agents: connectionLocals.slice(0, 200).map(local => ({agentId: local.agentId, access: local.access})),
           running: [...running.values()].slice(0, 20)}));
         for (const stop of heartbeat.stop) await this.stop(stop.runId, 'heartbeat_stop');
         for (const offered of heartbeat.claimable) {
-          if (this.closed || this.active.size + this.unrecovered.size >= 20 || this.lost(connection)) break;
+          if (this.closed || this.disconnecting || this.active.size + this.unrecovered.size >= 20 || this.lost(connection)) break;
+          // The approved CPU model is qualified for one joint workload. Other
+          // tools keep their existing capacity when no local provider is live.
+          if (process.platform === 'linux') {
+            const live = [...this.active.values(), ...this.unrecovered.values()].filter(row => row.phase !== 'posting');
+            if (live.some(row => connections.some(candidate => candidate.aiToolId === row.aiToolId && candidate.tool === 'opencode')) ||
+                connection.tool === 'opencode' && live.length) break;
+          }
           const agent = heartbeat.agents.find(agent => agent.agentId === offered.agentId);
           const local = connectionLocals.find(local => local.agentId === offered.agentId);
           const key = local ? await realpath(local.cwd).catch(() => null) : null;
@@ -201,12 +408,27 @@ export class RunnerCore {
           const accepted = await enforceAdapter({adapter, bin: connection.bin, recordedRealpath: connection.realpath,
             model: agent.model, provider: agent.provider, effort: agent.effort, access: local.access, matrix: this.options.matrix});
           if (!accepted.ok) continue;
+          if (process.platform === 'linux' && connection.tool === 'opencode') {
+            const controller = new AbortController();
+            this.preparations.set(offered.runId, {controller, deviceKeyId: connection.deviceKeyId});
+            if (this.closed || this.disconnecting || this.lost(connection)) controller.abort();
+            try {
+              await (this.options.prepareLocalProvider ?? prepareLinuxLocalProvider)({tool: connection.tool,
+                provider: agent.provider, model: agent.model, signal: controller.signal});
+              if (controller.signal.aborted || this.closed || this.disconnecting || this.lost(connection)) continue;
+            } catch {continue;}
+            finally {this.preparations.delete(offered.runId);}
+          }
           // Reserve the O_EXCL folder lock before issuing a claim, including across helper processes.
           let reservation: Awaited<ReturnType<typeof reserveRunFolder>>;
-          try { reservation = await reserveRunFolder({cwd: local.cwd, runId: offered.runId, dataDir: this.options.data}); } catch { continue; }
+          try { reservation = await this.folderStorage(storage => reserveRunFolder({cwd: local.cwd, runId: offered.runId, dataDir: this.dataDirectory, storage})); } catch { continue; }
           this.folders.add(key);
           let response: Awaited<ReturnType<RunnerProtocolClient['claim']>>;
-          try { response = await signed(connection.protocol.claim({runId: offered.runId, access: local.access, toolVersion: connection.toolVersion})); }
+          try {
+            if (this.closed || this.disconnecting || this.lost(connection)) throw new HelperError('runner_stopped', 'The runner has stopped.');
+            const issue = () => signed(connection.protocol.claim({runId: offered.runId, access: local.access, toolVersion: connection.toolVersion}));
+            response = await (this.options.claimSkills ? this.options.claimSkills(connection, issue) : issue());
+          }
           catch (error) {
             try { await reservation.release(); } finally { this.folders.delete(key); }
             if (error instanceof KeyLost) { await this.loseKey(connection.aiToolId, [connection.deviceKeyId]); break; }
@@ -214,45 +436,49 @@ export class RunnerCore {
           }
           const {claim, api} = response;
           if (this.closed || this.lost(connection) || claim.runId !== offered.runId || claim.agentId !== agent.agentId || claim.kind !== offered.kind || !outcomeMetadataValid(claim.model, claim.provider)) {
+            this.options.releaseSkills?.(claim.runId);
             api.dispose(); try { await reservation.release(); } finally { this.folders.delete(key); } continue;
           }
           let folder: RunFolder;
-          try { folder = await reservation.create(); }
+          try { folder = await this.folderStorage(() => reservation.create()); }
           catch {
+            this.options.releaseSkills?.(claim.runId);
             api.dispose(); try { await reservation.release(); } finally { this.folders.delete(key); }
-            await this.state.queue({runId: claim.runId, aiToolId: connection.aiToolId, queuedAt: this.now(),
-              body: this.outcome(claim, connection, local.access, this.now(), 'failed', 'folder_unavailable')});
+            await this.storage(state => state.queue({runId: claim.runId, aiToolId: connection.aiToolId, queuedAt: this.now(),
+              body: this.outcome(claim, connection, local.access, this.now(), 'failed', 'folder_unavailable')}), true);
             continue;
           }
           if (this.closed || this.lost(connection)) {
+            this.options.releaseSkills?.(claim.runId);
             api.dispose(); try { await folder.release(); } finally { this.folders.delete(key); } continue;
           }
           this.runKeys.set(claim.runId, connection.deviceKeyId);
           const controller = new AbortController(); this.controllers.set(claim.runId, controller);
-          this.active.set(claim.runId, {runId: claim.runId, agentId: claim.agentId, aiToolId: connection.aiToolId,
-            pid: 0, startedAt: new Date(this.now()).toISOString(), runDir: folder.runDir, phase: 'preparing', fence: randomBytes(16).toString('hex')});
           const claimedAt = this.now();
+          this.active.set(claim.runId, {runId: claim.runId, agentId: claim.agentId, aiToolId: connection.aiToolId,
+            pid: 0, claimedAt, startedAt: new Date(claimedAt).toISOString(), runDir: folder.runDir, phase: 'preparing', fence: randomBytes(16).toString('hex')});
           try {
-            await this.state.queue({runId: claim.runId, aiToolId: connection.aiToolId, queuedAt: claimedAt,
-              body: this.outcome(claim, connection, local.access, claimedAt, 'failed', 'runner_restarted')});
+            await this.storage(state => state.queue({runId: claim.runId, aiToolId: connection.aiToolId, queuedAt: claimedAt,
+              body: this.outcome(claim, connection, local.access, claimedAt, 'failed', 'runner_restarted')}), true);
             await this.save();
           } catch {
+            this.options.releaseSkills?.(claim.runId);
             api.dispose(); this.controllers.delete(claim.runId); this.active.delete(claim.runId); this.runKeys.delete(claim.runId);
             try { await folder.release(); } finally { this.folders.delete(key); }
             await this.save().catch(() => {});
             continue;
           }
           if (this.closed || this.lost(connection)) await this.stop(claim.runId);
-          const job = this.execute(connection, local, agent, adapter, claim, api, folder, claimedAt, controller)
+          const job = this.execute(connection, local, agent, adapter, claim, api, folder, claimedAt, controller, response.acceptance)
             .catch(() => {}) // Content and errors from tool code are never logged by the service.
-            .finally(() => { this.jobs.delete(claim.runId); this.controllers.delete(claim.runId); this.reasons.delete(claim.runId); this.runKeys.delete(claim.runId); });
+            .finally(() => { this.jobs.delete(claim.runId); this.controllers.delete(claim.runId); this.reasons.delete(claim.runId); this.runKeys.delete(claim.runId); if (this.linuxStorage) this.releaseStorage(); });
           this.jobs.set(claim.runId, job);
         }
       } catch (error) { if (error instanceof KeyLost) await this.loseKey(connection.aiToolId, [connection.deviceKeyId]); }
     }
   }
-  private async buildsReady(skills: RunnerSkill[], connection: RunnerConnection, agentId: string): Promise<boolean> {
-    for (const skill of skills) if (!skill.digest || !await this.options.verifiedBuild(skill.digest, skill, connection, agentId) || skill.hasCode && !await this.options.allowedBuild(skill, connection, agentId)) return false;
+  private async buildsReady(skills: RunnerSkill[], connection: RunnerConnection, agentId: string, runId?: string): Promise<boolean> {
+    for (const skill of skills) if (!skill.digest || !await this.options.verifiedBuild(skill.digest, skill, connection, agentId, runId) || skill.hasCode && !await this.options.allowedBuild(skill, connection, agentId, runId)) return false;
     return true;
   }
   private async read<T>(action: () => Promise<T>, expiresAt: string, signal: AbortSignal): Promise<T> {
@@ -281,13 +507,19 @@ export class RunnerCore {
       posted, startedAt: new Date(started).toISOString(), finishedAt: new Date(this.now()).toISOString()};
   }
   private async execute(connection: RunnerConnection, local: LocalAgent, agent: RunnerAgent, adapter: Adapter,
-    claim: RunnerClaim, api: MaddotsApi, folder: RunFolder, claimedAt: number, controller: AbortController): Promise<void> {
+    claim: RunnerClaim, api: MaddotsApi, folder: RunFolder, claimedAt: number, controller: AbortController, acceptance?: VerifiedAcceptance): Promise<void> {
     let stopCheck: (() => void) | undefined;
     let cleanupIncomplete = false;
     let outcome: RunnerOutcomeBody;
     let posted = emptyPosted();
-    const checkStopped = () => { if (controller.signal.aborted) throw new HelperError(this.reasons.get(claim.runId) ?? 'runner_stopped', 'The run stopped.'); };
+    const checkStopped = () => {
+      this.assertStorageGeneration();
+      if (controller.signal.aborted || this.linuxStorage && this.closed) throw new HelperError(this.reasons.get(claim.runId) ?? 'runner_stopped', 'The run stopped.');
+    };
     try {
+      const acceptanceOperation = acceptance ? createAcceptanceOperation(acceptance, {helperId: this.options.helperId ?? '',
+        aiToolId: connection.aiToolId, deviceKeyId: connection.deviceKeyId, toolKey: connection.tool, platform: 'linux',
+        runId: claim.runId, generation: claim.generation ?? '', purpose: 'claim'}) : undefined;
       stopCheck = await this.options.startCheck?.({api, claim, stop: code => this.stop(claim.runId, code)});
       checkStopped();
       let card: RunCardRead;
@@ -314,38 +546,51 @@ export class RunnerCore {
       }
       const prompt = buildCardPrompt({runId: claim.runId, kind: claim.kind, agentName: agent.name, commentId: claim.commentId,
         runDir: folder.runDir, card, skills: await Promise.all(claim.skills.map(async skill =>
-          ({name: skill.name, description: await this.options.skillDescription?.(skill, connection, claim.agentId) ?? ''}))), uploads});
+          ({name: skill.name, description: await this.options.skillDescription?.(skill, connection, claim.agentId, claim.runId) ?? ''}))), uploads});
       await writeFile(folder.promptFile, prompt, {flag: 'wx', mode: 0o600});
-      if (!await this.buildsReady(claim.skills, connection, claim.agentId)) throw new HelperError('skills_not_ready', 'A verified skill build is no longer available.');
-      checkStopped();
-      const skillsDir = adapter.info.skillsDir.replaceAll('{cwd}', folder.cwd).replaceAll('{runDir}', folder.runDir);
-      await this.options.stageSkills({claim, folder, skillsDir, connection, signal: controller.signal});
-      checkStopped();
-      const supported = adapter.supports({model: claim.model, provider: claim.provider, effort: claim.effort, access: local.access});
-      if (!supported.ok) throw new HelperError('adapter_refused', 'The claimed settings are unsupported.');
-      const deadline = computeRunDeadline(claimedAt, Date.parse(claim.expiresAt), claim.maxRunMinutes);
-      const tool = await startTool({adapter, spec: {bin: connection.bin, cwd: folder.cwd, runDir: folder.runDir, promptFile: folder.promptFile,
-        model: claim.model, provider: claim.provider, effort: claim.effort, access: local.access, skillsDir,
-        skillNames: claim.skills.map(skill => skill.name), maxTurns: 50,
-        timeoutSeconds: timeoutSeconds(deadline, this.now()), runHome: null}, recordedRealpath: connection.realpath, claimedAt,
-        expiresAt: Date.parse(claim.expiresAt), maxRunMinutes: claim.maxRunMinutes, matrix: this.options.matrix, processes: this.options.processes, now: this.options.now,
-        fence: this.active.get(claim.runId)!.fence,
-        dataDir: this.options.data, runId: claim.runId,
-        stageProjectFile: file => folder.stageProjectFile({...file, kind: 'config'}),
-        onSpawn: async (pid, startedAt, pgid) => {
-          const row = this.active.get(claim.runId)!;
-          const groups = row.processGroups ?? [];
-          this.active.set(claim.runId, {...row, pid, startedAt: startedAt || row.startedAt, pgid,
-            processGroups: [...groups.filter(group => group.pgid !== pgid), {...groups.find(group => group.pgid === pgid), pgid, startedAt}], phase: 'running'}); await this.save();
-        },
-        onGroups: async processGroups => {
-          const row = this.active.get(claim.runId);
-          if (row) { this.active.set(claim.runId, {...row, processGroups}); await this.save(); }
-        }});
+      const prepare = async (release?: () => Promise<void>) => {
+        // The production stager validates once inside the destination fence.
+        if (!this.options.withSkillsFence && !await this.buildsReady(claim.skills, connection, claim.agentId, claim.runId)) throw new HelperError('skills_not_ready', 'A verified skill build is no longer available.');
+        checkStopped();
+        const skillsDir = adapter.info.skillsDir.replaceAll('{cwd}', folder.cwd).replaceAll('{runDir}', folder.runDir);
+        await this.folderStorage(() => this.options.stageSkills({claim, folder, skillsDir, connection, signal: controller.signal}));
+        checkStopped();
+        const supported = adapter.supports({model: claim.model, provider: claim.provider, effort: claim.effort, access: local.access});
+        if (!supported.ok) throw new HelperError('adapter_refused', 'The claimed settings are unsupported.');
+        const deadline = computeRunDeadline(claimedAt, Date.parse(claim.expiresAt), claim.maxRunMinutes);
+        return startTool({adapter, spec: {bin: connection.bin, cwd: folder.cwd, runDir: folder.runDir, promptFile: folder.promptFile,
+          model: claim.model, provider: claim.provider, effort: claim.effort, access: local.access, skillsDir,
+          skillNames: claim.skills.map(skill => skill.name), maxTurns: 50,
+          timeoutSeconds: timeoutSeconds(deadline, this.now()), runHome: null}, recordedRealpath: connection.realpath, claimedAt,
+          expiresAt: Date.parse(claim.expiresAt), maxRunMinutes: claim.maxRunMinutes, matrix: this.options.matrix, processes: this.options.processes, now: this.options.now,
+          fence: this.active.get(claim.runId)!.fence, signal: controller.signal,
+          acceptanceOperation,
+          ...(this.linuxStorage ? {assertLaunchAllowed: () => {
+            checkStopped();
+          }, linuxLifecycle: this.owner?.requiresJournal ? createLinuxToolLifecycle(this.owner, this.ownerGeneration, claim.runId) : undefined} : {}),
+          onStarted: release,
+          dataDir: this.dataDirectory, runId: claim.runId,
+          runHomesDirectory: this.owner ? await this.owner.operation(this.ownerGeneration, (_state, lock) => lock.directory('run-homes')) : undefined,
+          stageProjectFile: file => this.folderStorage(() => folder.stageProjectFile({...file, kind: 'config'})),
+          onSpawn: async (pid, startedAt, pgid) => {
+            this.assertStorageGeneration();
+            const row = this.active.get(claim.runId)!;
+            const groups = row.processGroups ?? [];
+            this.active.set(claim.runId, {...row, pid, startedAt: startedAt || row.startedAt, pgid,
+              processGroups: [...groups.filter(group => group.pgid !== pgid), {...groups.find(group => group.pgid === pgid), pgid, startedAt}], phase: 'running'}); await this.save();
+            if (this.linuxStorage) checkStopped();
+          },
+          onGroups: async processGroups => {
+            this.assertStorageGeneration();
+            const row = this.active.get(claim.runId);
+            if (row) { this.active.set(claim.runId, {...row, processGroups: this.owner ? structuredClone(processGroups) : processGroups}); await this.save(); }
+          }});
+      };
+      const tool = await (this.options.withSkillsFence ? this.options.withSkillsFence(claim, connection, prepare) : prepare());
       this.tools.set(claim.runId, tool);
       if (controller.signal.aborted) await tool.stop(this.reasons.get(claim.runId) ?? 'runner_stopped');
       const result = await tool.finished;
-      if (result.failureDetail) await this.state.log(claim.runId, 'running', result.failureDetail, this.now() - claimedAt);
+      if (result.failureDetail) await this.storage(state => state.log(claim.runId, 'running', result.failureDetail ?? null, this.now() - claimedAt), true);
       this.tools.delete(claim.runId);
       // Completion verified the process tree. Never retain group authority
       // while a posting outcome waits, because its numeric ID can be reused.
@@ -359,16 +604,20 @@ export class RunnerCore {
       outcome = this.outcome(claim, connection, local.access, claimedAt, delivery.outcome ?? 'done', delivery.code ?? null, delivery.posted);
     } catch (error) {
       cleanupIncomplete = error instanceof ProcessCleanupError;
-      const reason = this.reasons.get(claim.runId) ?? codeOf(error);
+      // A stop request explains why cleanup began, but cannot turn an
+      // unverified process tree into a successfully stopped run.
+      const loginFailure = selectedLoginFailure(error);
+      const reason = cleanupIncomplete ? 'tool_failed' : this.reasons.get(claim.runId) ?? loginFailure?.code ?? codeOf(error);
       const final = error instanceof MadDotsApiError && error.classification === 'final';
       const contract = Object.hasOwn(RUN_TOKEN_ERROR_CODES, reason);
       const code = reason === 'TOKEN_EXPIRED' ? 'token_expired'
         : final ? (contract ? reason : `HTTP_${(error as MadDotsApiError).status}`)
-        : FAILED_CODES.has(reason) || STOPPED_CODES.has(reason) || reason === 'maddots_unreachable' ||
+        : loginFailure?.code === reason || FAILED_CODES.has(reason) || STOPPED_CODES.has(reason) || reason === 'maddots_unreachable' ||
           this.reasons.has(claim.runId) && (contract || /^HTTP_\d{3}$/.test(reason)) ? reason : 'tool_failed';
       outcome = this.outcome(claim, connection, local.access, claimedAt,
-        code === 'maddots_unreachable' ? 'not_delivered' : (final || controller.signal.aborted) && !['token_expired', 'runner_stopped'].includes(code) ? 'stopped' : 'failed', code, posted);
+        cleanupIncomplete ? 'failed' : code === 'maddots_unreachable' ? 'not_delivered' : (final || controller.signal.aborted) && !['token_expired', 'runner_stopped'].includes(code) ? 'stopped' : 'failed', code, posted);
     } finally {
+      this.options.releaseSkills?.(claim.runId);
       this.tools.delete(claim.runId);
       try { stopCheck?.(); } catch { /* Cleanup hooks cannot retain the token or folder lock. */ }
       api.dispose();
@@ -377,10 +626,10 @@ export class RunnerCore {
         this.recoveryFolders.set(claim.runId, folder);
         this.unrecovered.set(claim.runId, row); this.active.delete(claim.runId);
         this.runHomesUnsafe = true;
-        await this.state.queue({runId: claim.runId, aiToolId: connection.aiToolId, queuedAt: this.now(), body: outcome!});
+        await this.storage(state => state.queue({runId: claim.runId, aiToolId: connection.aiToolId, queuedAt: this.now(), body: outcome!}), true);
         await this.save();
       } else {
-        try { await folder.backupStaged(this.options.data); }
+        try { await this.folderStorage(() => folder.backupStaged(this.dataDirectory)); }
         catch { if (outcome!.outcome === 'done') outcome = this.outcome(claim, connection, local.access, claimedAt, 'failed', 'folder_unavailable', outcome!.posted); }
         finally {
           try { await folder.release(); }
@@ -391,30 +640,47 @@ export class RunnerCore {
     }
     if (cleanupIncomplete) return;
     if (!this.lost(connection)) {
-      await this.state.queue({runId: claim.runId, aiToolId: connection.aiToolId, queuedAt: this.now(), body: outcome});
-      const row = this.active.get(claim.runId); if (row) this.active.set(claim.runId, {...row, pid: 0, phase: 'posting'});
-      await this.save(); await this.state.log(claim.runId, 'posting', outcome.code, this.now() - claimedAt);
+      await this.storage(async state => {
+        await state.queue({runId: claim.runId, aiToolId: connection.aiToolId, queuedAt: this.now(), body: outcome});
+        const row = this.active.get(claim.runId);
+        if (row) {
+          const posting = {...row, pid: 0, phase: 'posting' as const};
+          // Cancellation can interrupt onSpawn after it saves the group but
+          // before startTool returns its handle. That path joins cleanup then
+          // throws, bypassing the normal finished-result projection above.
+          // Only durable CLEAN retires these diagnostic process fields; a stop
+          // reason or dead PID never discharges an unverified obligation.
+          // Inspect inside the owner queue so another run's journal operation
+          // cannot temporarily mask the acknowledged CLEAN result.
+          if (this.owner?.requiresJournal && this.owner.isRunRetired(claim.runId)) {
+            delete posting.pgid; delete posting.processGroups;
+          }
+          this.active.set(claim.runId, posting);
+        }
+      }, true);
+      await this.save(); await this.storage(state => state.log(claim.runId, 'posting', outcome.code, this.now() - claimedAt), true);
     }
   }
   private async expire(): Promise<void> {
-    const pending = await this.state.pending(), kept = new Set<string>();
+    const pending = await this.storage(state => state.pending()), kept = new Set<string>();
     let changed = false;
     for (const row of pending) {
       if (this.jobs.has(row.runId) || this.unrecovered.get(row.runId)?.fence || this.now() - row.queuedAt < 7 * 86400_000) { kept.add(row.runId); continue; }
       if (this.active.delete(row.runId)) await this.save();
-      await this.state.drop(row.runId);
+      await this.storage(state => state.drop(row.runId), true);
     }
     for (const row of [...this.active.values()]) if (row.phase === 'posting' && !this.jobs.has(row.runId) && !kept.has(row.runId)) {
       this.active.delete(row.runId); changed = true;
     }
-    for (const row of [...this.unrecovered.values()]) if (!row.fence && this.now() - Date.parse(row.startedAt) > 7 * 86400_000) {
-      await this.state.log(row.runId, 'recovery', 'folder_unavailable', 0).catch(() => {});
+    for (const row of [...this.unrecovered.values()]) if (!row.fence && row.pid === 0 && !row.pgid && !row.processGroups?.length && !row.legacyProcessIdentity &&
+      row.claimedAt !== undefined && this.now() - row.claimedAt > 7 * 86400_000) {
+      await this.storage(state => state.log(row.runId, 'recovery', 'folder_unavailable', 0), true).catch(() => {});
       this.unrecovered.delete(row.runId); this.folders.delete(resolve(dirname(dirname(dirname(row.runDir))))); changed = true;
     }
     if (changed) await this.save();
   }
   private async flush(connection: RunnerConnection): Promise<void> {
-    for (const pending of await this.state.pending()) {
+    for (const pending of await this.storage(state => state.pending())) {
       if (pending.aiToolId !== connection.aiToolId || this.jobs.has(pending.runId) || this.unrecovered.get(pending.runId)?.fence) continue;
       if (this.now() - pending.queuedAt < 7 * 86400_000) {
         try { await signed(connection.protocol.outcome(pending.runId, pending.body)); }
@@ -422,23 +688,26 @@ export class RunnerCore {
       }
       // Keep the outcome if persisting the active row's removal fails.
       if (!this.unrecovered.has(pending.runId)) this.active.delete(pending.runId);
-      await this.save(); await this.state.drop(pending.runId);
+      await this.save(); await this.storage(state => state.drop(pending.runId), true);
     }
   }
   async stop(runId: string, code = 'runner_stopped'): Promise<void> {
     if (!this.reasons.has(runId)) this.reasons.set(runId, code);
+    this.preparations.get(runId)?.controller.abort();
     this.controllers.get(runId)?.abort(); await this.tools.get(runId)?.stop(code);
   }
   private async loseKey(aiToolId: string, deviceKeyIds: string[], removeKey = true): Promise<void> {
+    for (const preparation of this.preparations.values()) if (deviceKeyIds.includes(preparation.deviceKeyId)) preparation.controller.abort();
     const rows = [...this.active.values()].filter(row => row.aiToolId === aiToolId);
     for (const id of [...deviceKeyIds, ...rows.map(row => this.runKeys.get(row.runId))]) if (id) this.lostKeys.add(id);
     try {
+      this.assertStorageGeneration();
       const jobs = rows.map(row => this.jobs.get(row.runId));
       await Promise.allSettled(rows.map(row => this.stop(row.runId, 'runner_stopped')));
       await Promise.allSettled(jobs);
       for (const row of rows) this.active.delete(row.runId);
       await this.save();
-      for (const pending of await this.state.pending()) if (pending.aiToolId === aiToolId) await this.state.drop(pending.runId);
+      for (const pending of await this.storage(state => state.pending())) if (pending.aiToolId === aiToolId) await this.storage(state => state.drop(pending.runId), true);
     } finally {
       // Corrupt outcome files or an unavailable disk cannot retain a revoked credential.
       if (removeKey) {
@@ -448,19 +717,45 @@ export class RunnerCore {
     }
   }
   async disconnect(removeKey = true): Promise<void> {
-    try { await this.init(); } catch { /* Still revoke every known key when saved state is unreadable. */ }
+    for (const preparation of this.preparations.values()) preparation.controller.abort();
+    this.disconnecting++;
+    try { await this.disconnectKeys(removeKey); }
+    finally { this.disconnecting--; this.releaseStorage(); }
+  }
+  private async disconnectKeys(removeKey: boolean): Promise<void> {
+    let storageFailure: RunnerStorageError | undefined;
+    try { await this.init(); } catch (error) {
+      // Still revoke every known key when saved state is unreadable.
+      if (error instanceof RunnerStorageError) storageFailure = error;
+    }
     const keys = new Map<string, string[]>();
     for (const row of [...this.active.values(), ...this.unrecovered.values()]) keys.set(row.aiToolId, []);
     for (const connection of await this.options.connections().catch(() => [])) {
       keys.set(connection.aiToolId, [...keys.get(connection.aiToolId) ?? [], connection.deviceKeyId]);
     }
-    for (const [id, ids] of keys) await this.loseKey(id, ids, removeKey).catch(() => {});
+    for (const [id, ids] of keys) await this.loseKey(id, ids, removeKey).catch(error => {
+      if (error instanceof RunnerStorageError) storageFailure = error;
+    });
+    if (storageFailure) throw storageFailure;
   }
   async idle(): Promise<void> { await Promise.all([...this.jobs.values()]); }
   async close(): Promise<void> {
     this.closed = true;
-    if (this.cycling) await this.cycling;
-    await Promise.allSettled([...this.active.values()].map(row => this.stop(row.runId)));
-    await this.idle(); runners.delete(this);
+    for (const preparation of this.preparations.values()) preparation.controller.abort();
+    this.owner?.retainRuntime();
+    if (this.linuxStorage) for (const controller of this.controllers.values()) controller.abort();
+    const finish = async () => {
+      if (this.cycling) await this.cycling;
+      await Promise.allSettled([...this.active.values()].map(row => this.stop(row.runId)));
+      await this.idle();
+    };
+    if (this.linuxStorage) {
+      try { await beforeDeadline(Date.now() + PROCESS_CLEANUP_CAP_MS, finish); }
+      catch { this.lastError = 'RUNNER_STATE_UNAVAILABLE'; }
+    } else await finish();
+    runners.delete(this);
+    this.closeFinished = true;
+    if (this.owner && !this.initializing && !this.cycling && !this.disconnecting && !this.jobs.size) await this.owner.detach(this.ownerGeneration);
+    else this.releaseStorage();
   }
 }

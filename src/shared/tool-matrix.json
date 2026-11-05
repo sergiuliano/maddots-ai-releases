@@ -234,9 +234,13 @@
         "adapter": "codex",
         "card": "TLS-26",
         "offered": false,
-        "folderOnly": "none",
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
+        "folderOnly": "os-sandbox",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
+        "reason": "Real-tool and no-MCP canary checks pending. Linux: Full access only (inside the MadDots sandbox). Folder confinement is not yet available on Linux.",
         "checkedAt": "2026-10-14"
       }
     },
@@ -329,9 +333,13 @@
         "adapter": "claude-code",
         "card": "TLS-26",
         "offered": false,
-        "folderOnly": "none",
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
+        "folderOnly": "os-sandbox",
         "mcpLevel": "servers-off",
-        "reason": "Real-tool and no-MCP canary checks pending.",
+        "reason": "Real-tool and no-MCP canary checks pending. Linux: Full access only (inside the MadDots sandbox). Folder confinement is not yet available on Linux.",
         "checkedAt": "2026-10-14"
       }
     },
@@ -461,6 +469,10 @@
         "adapter": "cursor",
         "card": "TLS-27",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "tools-denied",
         "reason": "Sync only: with the person's normal HOME, cursor-agent starts MCP servers from the Claude Code configuration (observed: the person's MadDots MCP) despite the project Mcp(*:*) deny. No verified switch stops it while keeping the sign-in.",
@@ -557,6 +569,10 @@
         "adapter": "copilot",
         "card": "TLS-27",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "tools-denied",
         "reason": "Acceptance passed on The Machine 2026-10-21 with --model auto (servers off by the CLI's own report; skill and completion verified). Offer pending the founder; Folder only is no-shell and needs R-02.",
@@ -639,6 +655,10 @@
         "adapter": "devin",
         "card": "TLS-43",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "tools-denied",
         "reason": "Sync only: Devin 3000.11.3 still loads native project .devin/mcp_config.json with an isolated config and all read_config_from sources disabled; no verified headless switch prevents MCP server startup.",
@@ -734,6 +754,10 @@
         "adapter": "cline",
         "card": "TLS-42",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "servers-off",
         "reason": "Skills sync only: in 3.0.71, CLINE_MCP_SETTINGS_PATH redirects ordinary MCP settings but does not stop project or Documents/Cline/Plugins agent plugins from adding MCP servers, tools or hooks. No complete plugin-startup disable was verified.",
@@ -808,6 +832,10 @@
         "adapter": "continue",
         "card": "TLS-34",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "servers-off",
         "reason": "Real-tool and no-MCP canary checks pending.",
@@ -863,6 +891,10 @@
         "adapter": "gemini-cli",
         "card": "TLS-43",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "servers-off",
         "reason": "Sync only: Gemini requires a paid key or verified enterprise sign-in. Personal/free Google authentication is not accepted, and its tier cannot be established from the permitted auth-type setting alone.",
@@ -959,6 +991,10 @@
         "adapter": "antigravity",
         "card": "TLS-43",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "servers-off",
         "reason": "Real Antigravity cached-login, staged-skill, custom-agent no-MCP/browser and access checks remain pending with the person's normal HOME and cached login.",
@@ -1055,9 +1091,13 @@
         "adapter": "opencode",
         "card": "TLS-28",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "servers-off",
-        "reason": "Pinned OpenCode v1 local-provider candidate keeps HOME and isolates XDG only. Real Ollama run, skill-tool proof, model metadata and process-watch acceptance are pending. An existing ~/.opencode or managed configuration prevents isolation and is refused. Folder only awaits R-02; hosted/custom providers need a supported credential path.",
+        "reason": "Pinned OpenCode v1 local-provider candidate keeps HOME and isolates XDG only. Real Ollama run, skill-tool proof, model metadata and process-watch acceptance are pending. An existing ~/.opencode or managed configuration prevents isolation and is refused. Linux: Full access only (inside the MadDots sandbox). Folder only awaits R-02; hosted/custom providers need a supported credential path.",
         "checkedAt": "2026-10-21"
       }
     },
@@ -1112,6 +1152,10 @@
         "adapter": "oh-my-pi",
         "card": "TLS-42",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "servers-off",
         "reason": "Skills sync only: in 18.10.4, --tools does not disable MCP discovery or project custom-tool module loading, and --no-extensions does not disable those startup paths. The proposed profile/overlay has no verified servers-off composition. Write approval is not a workspace sandbox.",
@@ -1186,6 +1230,10 @@
         "adapter": "openclaw",
         "card": "TLS-42",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "servers-off",
         "reason": "Skills sync only: temporary exec state preserves installed plugin roots with --config. Tool denies can hide MCP tools after servers load. Disabling all plugins also removes the bundled Ollama provider; a safe provider/plugin allowlist has not been verified.",
@@ -1258,6 +1306,10 @@
         "adapter": "hermes",
         "card": "TLS-42",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "servers-off",
         "reason": "Skills sync only: safe mode disables MCP/plugins, but both Hermes headless paths reload saved provider/fallback configuration. No supported per-run config or fallback-disable switch was verified that preserves normal HOME and pins the agent-selected Ollama route. The history/trust issue from round 1 is resolved by round 2; real-run acceptance remains pending.",
@@ -1337,6 +1389,10 @@
         "adapter": "grok",
         "card": "TLS-29",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "tools-denied",
         "reason": "Sync only: with the person's normal HOME, Grok 1.0.52 still starts MCP servers from the Claude Code configuration (observed: the person's MadDots MCP), even with all GROK_*_MCPS/HOOKS/AGENTS/RULES/SESSIONS/SKILLS imports and managed MCPs off. MCP calls stay denied (tools-denied), but servers start.",
@@ -1393,6 +1449,10 @@
         "adapter": "deepseek-harness",
         "card": "TLS-50",
         "offered": false,
+        "platforms": {
+          "darwin": { "accepted": false },
+          "linux": { "accepted": false }
+        },
         "folderOnly": "none",
         "mcpLevel": "servers-off",
         "reason": "TLS-50 adapter implemented; real DeepSeek API, privacy, workspace and no-MCP canary checks pending (R-22 to R-27).",

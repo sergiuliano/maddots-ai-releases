@@ -2,16 +2,18 @@ import { constants, type Stats } from 'node:fs';
 import { lstat, mkdir, open, readdir } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { foldedPath } from '../shared/build-format.js';
+import { withAgentDestinationLocks } from '../agent-fence.js';
 import { allowedBuild } from '../allow.js';
-import { HelperError } from '../config.js';
-import { inside, type HelperPaths } from '../paths.js';
+import { HelperError, type Timing } from '../config.js';
+import { LockStore, type LockEntry } from '../lock.js';
+import { inside, withWriteLock, type HelperPaths } from '../paths.js';
 import { verifiedBuild } from '../sync.js';
 import type { BuildTarget, BuildVerifier, SignedBuild, VerifiedBuild } from '../verify.js';
-import type { RunnerSkill } from './protocol-client.js';
+import type { RunnerClaim, RunnerSkill } from './protocol-client.js';
 import type { RunnerConnection, RunnerOptions } from './runner.js';
 
 export type StageContext = Parameters<RunnerOptions['stageSkills']>[0];
-export type SkillStagerOptions = {paths: HelperPaths; helperId: string; verifier?: BuildVerifier};
+export type SkillStagerOptions = {paths: HelperPaths; helperId: string; verifier?: BuildVerifier; timing?: Timing};
 const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT';
 const fail = (code: 'skills_not_ready' | 'skills_conflict' | 'config_conflict' | 'runner_stopped'): never => {
   throw new HelperError(code, code);
@@ -132,11 +134,27 @@ async function emptyTree(path: string): Promise<void> {
 
 /** Reads the signed cache anew for every check and run, never the delivered mutable tree. */
 export function createSkillStager(options: SkillStagerOptions) {
-  async function accepted(skill: RunnerSkill, connection: RunnerConnection, agentId: string): Promise<VerifiedBuild> {
+  // Cache envelopes include the signature in their filename and survive updates.
+  // Only this run may reuse its captured acceptance after the agent lock advances.
+  // Restarts end preparing runs, so these references need no durable recovery.
+  const claims = new Map<string, {agentId: string; aiToolId: string; target: BuildTarget; entries: LockEntry[]}>();
+  async function accepted(skill: RunnerSkill, connection: RunnerConnection, agentId: string, runId?: string): Promise<VerifiedBuild> {
     const digest = skill.digest;
     if (!agentId || !digest) return fail('skills_not_ready');
     const target = targetFor(connection);
     const selection = {...options, agentId};
+    if (runId !== undefined) {
+      const claim = claims.get(runId);
+      if (!claim) return fail('skills_not_ready');
+      if (claim.agentId !== agentId || claim.aiToolId !== connection.aiToolId || claim.target !== target) fail('skills_not_ready');
+      const entry = claim.entries.find(entry => entry.skillId === skill.skillId && entry.name === skill.name &&
+        entry.version === skill.version && entry.settingsRevision === skill.settingsRevision && entry.digest === digest);
+      if (!entry) return fail('skills_not_ready');
+      // Re-read the signed bytes and current revocations. Code consent is bound
+      // to the exact envelope accepted at claim time, never just the skill name.
+      return verifiedBuild(digest, {...selection, claimed: entry, accepted: {skillId: skill.skillId, target, name: skill.name},
+        allowedBuild: async build => matches(skill, build) && build.signature === entry.signature && entry.allowedDigests.includes(digest)});
+    }
     // TLS-14 resolves the accepted envelope and exact local code consent, including
     // a locally computed has-code value even if the heartbeat claims otherwise.
     const allowed = await allowedBuild(skill.skillId, target, skill.name, selection);
@@ -152,17 +170,61 @@ export function createSkillStager(options: SkillStagerOptions) {
     if (!matches(skill, verified.build) || verified.build.target !== target) fail('skills_not_ready');
     return verified;
   }
-  async function ready(skill: RunnerSkill, connection: RunnerConnection, agentId: string): Promise<boolean> {
-    try { await accepted(skill, connection, agentId); return true; } catch { return false; }
+  async function ready(skill: RunnerSkill, connection: RunnerConnection, agentId: string, runId?: string): Promise<boolean> {
+    try { await accepted(skill, connection, agentId, runId); return true; } catch { return false; }
   }
   return {
-    async verifiedBuild(digest: string, skill: RunnerSkill, connection: RunnerConnection, agentId: string): Promise<boolean> {
-      return digest === skill.digest && await ready(skill, connection, agentId);
+    async withSkillsFence<T>(claim: RunnerClaim, connection: RunnerConnection, action: (release: () => Promise<void>) => Promise<T>): Promise<T> {
+      let entered = false;
+      try {
+        return await withAgentDestinationLocks(options.paths, claim.skills.map(skill =>
+          ({...skill, agentId: claim.agentId, target: targetFor(connection)})), async release => {
+          entered = true;
+          return action(release);
+        }, options.timing);
+      } catch (error) {
+        if (!entered) fail('skills_not_ready');
+        throw error;
+      }
+    },
+    async claimSkills<T extends {claim: RunnerClaim}>(connection: RunnerConnection, issue: () => Promise<T>): Promise<T> {
+      // Serialize claim issuance with delivery, including other helper processes.
+      // Retain the response even if verification or lock cleanup fails after issuance.
+      let issued: T | undefined;
+      try {
+        return await withWriteLock(options.paths, async () => {
+          const lock = await new LockStore(options.paths, options.helperId, 'agent-lock.json').read();
+          issued = await issue();
+          const {claim} = issued, target = targetFor(connection);
+          const entries = lock.entries.filter(entry => entry.agentId === claim.agentId && entry.target === target && !entry.removed &&
+            claim.skills.some(skill => skill.skillId === entry.skillId && skill.name === entry.name && skill.version === entry.version &&
+              skill.settingsRevision === entry.settingsRevision && skill.digest === entry.digest));
+          for (const entry of entries) {
+            // Preserve both existing Allow sources, including an exact holding
+            // receipt not yet reflected in allowedDigests on the agent lock.
+            const allowed = await allowedBuild(entry.skillId, target, entry.name, {...options, agentId: claim.agentId});
+            if (allowed.build.signature !== entry.signature) fail('skills_not_ready');
+            if (allowed.hasCode) { entry.hasCode = true; entry.allowedDigests = [...new Set([...entry.allowedDigests, entry.digest])]; }
+          }
+          claims.set(claim.runId, {agentId: claim.agentId, aiToolId: connection.aiToolId, target, entries});
+          return issued;
+        });
+      } catch (error) {
+        if (!issued) throw error;
+        // Even lock-cleanup failure after issuance must reach normal run cleanup
+        // and report skills_not_ready, without losing the issued token/outcome.
+        claims.delete(issued.claim.runId);
+        return issued;
+      }
+    },
+    releaseSkills(runId: string): void { claims.delete(runId); },
+    async verifiedBuild(digest: string, skill: RunnerSkill, connection: RunnerConnection, agentId: string, runId?: string): Promise<boolean> {
+      return digest === skill.digest && await ready(skill, connection, agentId, runId);
     },
     allowedBuild: ready,
-    async skillDescription(skill: RunnerSkill, connection: RunnerConnection, agentId: string): Promise<string> {
+    async skillDescription(skill: RunnerSkill, connection: RunnerConnection, agentId: string, runId?: string): Promise<string> {
       try {
-        const build = await accepted(skill, connection, agentId);
+        const build = await accepted(skill, connection, agentId, runId);
         const text = build.files.find(file => file.path === 'SKILL.md')?.content.toString('utf8') ?? '';
         return descriptionFromFrontmatter(text);
       } catch { return ''; }
@@ -178,7 +240,7 @@ export function createSkillStager(options: SkillStagerOptions) {
       if (relative(folder.cwd, skillsDir).split(sep).includes('.git')) fail('skills_conflict');
       if (connection.tool === 'claude-code' && skillsDir !== join(folder.runDir, 'plugin', 'skills')) fail('skills_conflict');
       // Finish all verification before creating any destination. A removed or
-      // changed accepted build between claim and staging gets the closed run code.
+      // revoked claimed build between claim and staging gets the closed run code.
       const builds: VerifiedBuild[] = [];
       const names = new Set<string>();
       for (const skill of claim.skills) {
@@ -186,7 +248,7 @@ export function createSkillStager(options: SkillStagerOptions) {
         const name = foldedPath(skill.name);
         if (names.has(name)) fail('skills_conflict');
         names.add(name);
-        try { builds.push(await accepted(skill, connection, claim.agentId)); }
+        try { builds.push(await accepted(skill, connection, claim.agentId, claim.runId)); }
         catch { fail('skills_not_ready'); }
       }
       stopped();

@@ -5,9 +5,11 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { treeDigest } from '../shared/build-format.js';
 import { TOOL_MATRIX, validateToolMatrix, type ToolMatrix } from '../shared/tool-matrix.js';
 import { backupFolder } from '../backups.js';
-import { cleanEnvironment, HelperError, runCommand, type Runner } from '../config.js';
+import { cleanEnvironment, HelperError, type Runner } from '../config.js';
+import {guardToolRunner, toolCommandPolicy} from '../tool-command.js';
 import { entryKey, LockStore, safeName, type LockEntry } from '../lock.js';
 import { assertNoSymlinks, atomicWrite, ensurePrivateDirectory, inside, readPrivateFile, withWriteLock, type HelperPaths } from '../paths.js';
+import { assertLockUpgradeReady } from '../write-lock-upgrade.js';
 import { assertRouteRoot, durableRename, readSkillTree } from '../safe-fs.js';
 import { readStamp } from '../stamp.js';
 import { SyncEngine, type DeliveryError, type SyncInventory, type SyncOptions, type SyncPlan } from '../sync.js';
@@ -22,6 +24,8 @@ export type ClaudePluginOptions = {
   /** An already detected absolute CLI path, or null when only an app was found. */
   claudePath?: string | null;
   matrix?: ToolMatrix;
+  /** Fixture seam; production uses the current helper platform. */
+  platform?: NodeJS.Platform;
   /** Stable workspace slugs from the caller; IDs are used when no mapping exists. */
   workspaceSlugs?: Readonly<Record<string, string>>;
 };
@@ -56,7 +60,7 @@ export class ClaudePluginDeliveryTarget implements DeliveryTarget {
   constructor(private readonly options: ClaudePluginOptions) {
     this.paths = options.paths; this.helperId = options.helperId;
     this.matrix = options.matrix ? validateToolMatrix(options.matrix) : TOOL_MATRIX;
-    this.runner = options.runner ?? runCommand;
+    this.runner = guardToolRunner('claude-code', options.runner, {platform: options.platform, matrix: this.matrix});
     this.env = cleanEnvironment({...options.env ?? process.env, HOME: this.paths.home});
     const route = this.matrix.routes[this.route];
     if (!route || route.kind !== this.target || route.target !== this.target || route.path !== TOOL_MATRIX.routes[this.route].path) {
@@ -80,6 +84,7 @@ export class ClaudePluginDeliveryTarget implements DeliveryTarget {
   namespacedName(entry: Skill): string { this.folderFor(entry); return `${this.pluginName(entry.workspaceId)}:${entry.name}`; }
   private directory(): string { return resolve(this.paths.home, this.matrix.routes[this.route].path.slice(2)); }
   async root(): Promise<string> {
+    await assertLockUpgradeReady(this.paths);
     const root = this.directory();
     await assertNoSymlinks(root, this.paths.home);
     await mkdir(root, {recursive: true, mode: 0o700});
@@ -118,7 +123,12 @@ export class ClaudePluginDeliveryTarget implements DeliveryTarget {
     const lines = installed ? [commands[2], commands[3]] : [['plugin', 'marketplace', 'add', this.matrix.routes[this.route].path], commands[1]];
     return lines.map(args => `claude ${args.join(' ')}`).join('\n');
   }
+  commandPolicy(): {allowed: boolean; reason: string | null} {
+    return toolCommandPolicy(this.matrix.tools.find(tool => tool.key === 'claude-code'), this.options.platform);
+  }
   async requireCli(): Promise<string> {
+    const policy = this.commandPolicy();
+    if (!policy.allowed) throw new HelperError('TOOL_PLATFORM_NOT_ACCEPTED', policy.reason ?? 'Claude Code CLI commands are not accepted on this platform.');
     if (this.binary) {
       try { await access(this.binary, constants.X_OK); return this.binary; }
       catch { this.binary = undefined; }
@@ -145,11 +155,17 @@ export class ClaudePluginDeliveryTarget implements DeliveryTarget {
     this.waiting = items; this.waitingCode = code;
   }
   async statusLines(): Promise<string[]> {
-    let waiting: {format: number; code: string; workspaceIds: string[]};
+    let waiting: {format: number; code: string; workspaceIds: string[]} = {format: 1, code: 'CLAUDE_CLI_MISSING', workspaceIds: []};
     try { waiting = JSON.parse(await readPrivateFile(join(this.paths.data, 'claude-plugin-waiting.json'))); }
-    catch (error) { if (absent(error)) return []; throw new HelperError('PLUGIN_STATE_INVALID', 'Invalid Claude waiting state.'); }
+    catch (error) { if (!absent(error)) throw new HelperError('PLUGIN_STATE_INVALID', 'Invalid Claude waiting state.'); }
     if (!waiting || waiting.format !== 1 || !safeName(waiting.code) || !Array.isArray(waiting.workspaceIds) || waiting.workspaceIds.length > 2000 || waiting.workspaceIds.some(id => !safeName(id))) {
       throw new HelperError('PLUGIN_STATE_INVALID', 'Invalid Claude waiting state.');
+    }
+    const policy = this.commandPolicy();
+    if (!policy.allowed) {
+      const entries = (await new LockStore(this.paths, this.helperId).read()).entries.filter(entry => entry.route === this.route);
+      if (!entries.length && !waiting.workspaceIds.length && !(await this.state()).plugins.length) return [];
+      return [`Claude Code plugin registration is skipped: ${policy.reason}`];
     }
     if (waiting.code !== 'CLAUDE_CLI_MISSING' || !waiting.workspaceIds.length) return [];
     const state = await this.state();
@@ -170,7 +186,7 @@ export class ClaudePluginDeliveryTarget implements DeliveryTarget {
   }
   async place(build: SignedBuild, stagedDir: string): Promise<void> {
     await this.validateWorkspaces([build]);
-    await this.requireCli();
+    if (this.commandPolicy().allowed) await this.requireCli();
     await this.root();
     const destination = this.folderFor(build), parent = dirname(destination);
     await assertNoSymlinks(parent, this.paths.home);
@@ -312,6 +328,7 @@ export class ClaudePluginDeliveryTarget implements DeliveryTarget {
     }
     await this.metadata(join(this.directory(), '.claude-plugin'), 'marketplace.json', {name: 'maddots-ai', owner: {name: 'MadDots AI'},
       plugins: state.plugins.filter(plugin => plugin.fingerprint !== unregistered).map(plugin => ({name: `maddots-${plugin.slug}`, source: `./maddots-${plugin.slug}`, version: `1.0.${plugin.counter}`}))});
+    if (!this.commandPolicy().allowed) return sourceErrors;
     const due = state.plugins.filter(plugin => plugin.installed !== plugin.counter && !blocked.has(plugin.workspaceId));
     if (due.length) {
       const binary = await this.requireCli();
@@ -403,10 +420,11 @@ export class ClaudePluginDeliveryTarget implements DeliveryTarget {
   }
   async observe(inventory: SyncInventory): Promise<SyncInventory> {
     const entries = (await new LockStore(this.paths, this.helperId).read()).entries.filter(entry => entry.route === this.route);
+    const policy = this.commandPolicy();
     const missingRepairs = new Set<string>();
     const managed = await Promise.all(inventory.managed.map(async item => {
       const entry = entries.find(entry => entry.skillId === item.skillId && entry.target === item.target && entry.name === item.name);
-      if (!entry || entry.removed || !this.matrix.routes[this.route].readPath) return item;
+      if (!entry || entry.removed || !policy.allowed || !this.matrix.routes[this.route].readPath) return item;
       try {
         const localDigest = treeDigest(await readSkillTree(await this.readFolderFor(entry), this.paths.home));
         return {...item, localDigest, state: item.state === 'ok' && localDigest === entry.digest ? 'ok' as const : 'edited' as const};
@@ -418,7 +436,8 @@ export class ClaudePluginDeliveryTarget implements DeliveryTarget {
     const errors: DeliveryError[] = this.waiting.map(entry => ({skillId: entry.skillId, target: entry.target, name: entry.name, code: this.waitingCode}));
     for (const entry of entries) {
       const code = this.failedWorkspaces.get(entry.workspaceId) ?? this.registrationError ?? (!entry.removed ? this.sourceErrors.get(entryKey(entry)) : undefined) ??
-        (!entry.removed && missingRepairs.has(entryKey(entry)) ? 'CLAUDE_PLUGIN_READ_COPY_MISSING' : undefined);
+        (!entry.removed && missingRepairs.has(entryKey(entry)) ? 'CLAUDE_PLUGIN_READ_COPY_MISSING' : undefined) ??
+        (!policy.allowed ? 'TOOL_PLATFORM_NOT_ACCEPTED' : undefined);
       if (code) errors.push({skillId: entry.skillId, target: entry.target, name: entry.name, code});
     }
     const registered = await this.state().then(state => state.plugins.map(plugin => `maddots-${plugin.slug}`), () => []);
@@ -481,11 +500,15 @@ export class ClaudePluginSyncEngine extends SyncEngine {
   override async applyPlan(plan: SyncPlan, beforeApply?: (current: SyncPlan) => Promise<void>): Promise<void> {
     const waiting = plan.items.filter(item => item.route === this.plugin.route && item.state === 'approved' && item.kind !== 'forced_remove' && !item.forAgentIds.length);
     let ready = true, code: string | undefined;
-    if (waiting.length) {
-      try { await this.plugin.validateWorkspaces(waiting); await this.plugin.requireCli(); }
-      catch (error) { ready = false; code = error instanceof HelperError ? error.code : 'CLAUDE_PLUGIN_COMMAND_FAILED'; }
-    }
-    await this.plugin.setWaiting(ready ? [] : waiting, code);
+    await withWriteLock(this.syncOptions.paths, async () => {
+      if (waiting.length) {
+        try { await this.plugin.validateWorkspaces(waiting); if (this.plugin.commandPolicy().allowed) await this.plugin.requireCli(); }
+        catch (error) { ready = false; code = error instanceof HelperError ? error.code : 'CLAUDE_PLUGIN_COMMAND_FAILED'; }
+      }
+      // The waiting record is a publication too. Do not create it before the
+      // parent sync engine has a chance to validate this storage layout.
+      await this.plugin.setWaiting(ready ? [] : waiting, code);
+    }, this.syncOptions.timing);
     const accepted = (await this.locks.read()).entries.filter(entry => entry.route === this.plugin.route && !entry.removed);
     const redeliveries = plan.degraded ? [] : waiting.filter(item => ['install', 'update', 'local_newer'].includes(item.kind) &&
       ['update', 'always', 'replace'].includes(item.answer ?? '') && (item.kind !== 'local_newer' || item.answer === 'replace') && !item.missingDependencies.length &&

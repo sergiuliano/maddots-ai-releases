@@ -25,7 +25,7 @@ function fixture(fetcher: typeof fetch, start = epoch, storage: 'keychain' | 'fi
   let failWrite = false;
   let reads = 0;
   const secretStore: SecretStore = {
-    storage,
+    storage, platform: 'darwin',
     get: async name => { operations.push(`get:${name}`); reads++; return secrets.get(name); },
     set: async (name, secret, _scopes?: Scope[]) => { operations.push(`set:${name}`); if (failWrite) throw new Error('write failed'); secrets.set(name, secret); },
     delete: async name => { operations.push(`delete:${name}`); secrets.delete(name); },

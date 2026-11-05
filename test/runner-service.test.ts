@@ -1,41 +1,50 @@
 import assert from 'node:assert/strict';
-import {generateKeyPairSync, randomUUID} from 'node:crypto';
+import {createHash, generateKeyPairSync, randomUUID, sign, verify} from 'node:crypto';
 import {chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test, {type TestContext} from 'node:test';
+import {parseRunnerAuthorization, parseRunnerDefinition, signedRunnerAuthorizationString, signedRunnerDefinitionString,
+  type RunnerAuthorizationFields, type RunnerDefinitionFields} from '../src/shared/runner-acceptance.js';
 import {deviceKeyFingerprint, RUNNER_HEADERS, verifyRunnerRequest} from '../src/shared/runner-protocol.js';
 import {runCli, type CliOptions} from '../src/cli.js';
 import {CommandError, readConfig, type Runner, type Timing} from '../src/config.js';
 import {atomicWrite, createPaths, ensurePaths, ensurePrivateDirectory} from '../src/paths.js';
+import {RunnerAcceptanceVerifier} from '../src/runner/acceptance.js';
+import {codexAdapter} from '../src/runner/adapters/codex.js';
 import {RunsRuntime} from '../src/runner/cli-runs.js';
+import {withLinuxRunContext} from '../src/runner/linux-lifecycle.js';
 import {RunsOnController} from '../src/runner/runs-on.js';
 import type {RuntimeContext} from '../src/runtime.js';
-import {KeychainSecretStore} from '../src/secret-store.js';
+import {FileSecretStore, KeychainSecretStore} from '../src/secret-store.js';
 import {StateStore} from '../src/state.js';
+import {qualifyLinuxFixtureWithoutWorkloads} from './support/linux-native-workloads.js';
+import {initializeCleanRunnerJournal} from './support/runner-journal-fixture.js';
 
 const wait = () => new Promise<void>(resolve => setTimeout(resolve, 5));
 async function until(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 400 && !predicate(); attempt++) await wait();
   assert(predicate(), 'Timed out waiting for the activation request.');
 }
-async function fixture(t: TestContext, active = false) {
+async function fixture(t: TestContext, active = false, platform: 'darwin' | 'linux' = 'darwin', authorizeActivation = false) {
   // These service tests inject Apple commands and exercise the macOS pilot wiring.
   const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
-  Object.defineProperty(process, 'platform', {...descriptor, value: 'darwin'});
+  Object.defineProperty(process, 'platform', {...descriptor, value: platform});
   t.after(() => Object.defineProperty(process, 'platform', descriptor));
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-service-runs-'));
   t.after(() => rm(root, {recursive: true, force: true}));
   const home = join(root, 'home'), binDir = join(root, 'bin');
   await mkdir(home, {mode: 0o700}); await mkdir(binDir, {mode: 0o700});
   const bin = join(binDir, 'codex'); await writeFile(bin, '#!/bin/sh\nexit 0\n'); await chmod(bin, 0o755);
-  const env = {PATH: binDir}, config = readConfig(env, home), paths = await createPaths(config); await ensurePaths(paths);
+  const env = {PATH: binDir}, config = readConfig(env, home, platform), paths = await createPaths(config); await ensurePaths(paths);
+  await initializeCleanRunnerJournal(paths.data);
+  if (platform === 'linux') qualifyLinuxFixtureWithoutWorkloads(t);
   const token = 'mdai_skill_' + 'S'.repeat(43), helperId = randomUUID(), aiToolId = randomUUID(), deviceKeyId = randomUUID(), agentId = randomUUID();
-  const items = new Map<string, string>(), keychainWrites: string[] = [], dialogs: string[] = [], output: string[] = [];
+  const items = new Map<string, string>(), keychainWrites: string[] = [], dialogs: string[] = [], output: string[] = [], toolCommands: string[][] = [];
   const runner: Runner = async (file, args, options) => {
     if (file === '/usr/sbin/scutil') return {stdout: 'Service-Test-Mac\n', stderr: ''};
     if (file === '/usr/bin/osascript') {dialogs.push(args.join('\n')); return {stdout: 'button returned:Later, gave up:false', stderr: ''};}
-    if (file === bin) return {stdout: args.includes('--version') ? 'codex-cli 1.0.0\n' : '', stderr: ''};
+    if (file === bin) {toolCommands.push([...args]); return {stdout: args.includes('--version') ? 'codex-cli 1.0.0\n' : '', stderr: ''};}
     assert.equal(file, '/usr/bin/security');
     assert(!args.some(value => value.includes(token) || value.includes('"format"')));
     if (args[0] === '-i') {
@@ -48,18 +57,45 @@ async function fixture(t: TestContext, active = false) {
     if (!items.has(account)) throw new CommandError(44);
     return {stdout: items.get(account)! + '\n', stderr: ''};
   };
-  const secrets = new KeychainSecretStore(config.endpoint, paths.data, runner, env);
+  const secrets = platform === 'linux'
+    ? await FileSecretStore.open(join(paths.config!, 'credentials.json'), paths, {explicit: true, confirmed: true})
+    : new KeychainSecretStore(config.endpoint, paths.data, runner, env);
   await secrets.set('skills-token', token);
   let now = Date.now();
   const startedAt = now, grantExpiresAt = new Date(now + 600_000).toISOString();
   const state = new StateStore(paths, config.endpoint);
   await state.write({format: 1, endpoint: config.endpoint.href, helperId, status: 'connected', scopes: ['sync', 'run_claim'],
-    tokenStorage: 'keychain', pendingTools: [], connections: [{id: aiToolId, tool: 'codex', variant: 'cli'}],
+    tokenStorage: secrets.storage, ...(secrets instanceof FileSecretStore ? {tokenFile: secrets.path, credentialBackendSelected: true} : {}), pendingTools: [], connections: [{id: aiToolId, tool: 'codex', variant: 'cli'}],
     tools: [{tool: 'codex', variant: 'cli', version: '1.0.0', models: [], syncOnly: false, path: bin, realpath: bin}]});
   const registrations: Record<string, unknown>[] = [], results: Record<string, unknown>[] = [], statusTimes: number[] = [], heartbeats: unknown[] = [];
   let publicKey = '';
   const agent = {agentId, name: 'Service agent', handle: 'service-agent', status: 'active', model: 'test-model', provider: null,
     effort: null, accessWanted: 'folder_only', maxRunMinutes: 5, skills: []};
+  const definitions: Record<string, unknown>[] = [], acceptanceRequests: Record<string, unknown>[] = [];
+  const definitionSigner = generateKeyPairSync('ed25519');
+  const definitionKeyId = createHash('sha256').update(definitionSigner.publicKey.export({format: 'der', type: 'spki'}).subarray(-32)).digest('hex').slice(0, 16);
+  const activationAcknowledgment = {purpose: 'activation-result', deviceKeyId, runId: randomUUID(), generation: 'a'.repeat(64), scopeId: agentId, scopeVersion: 1};
+  if (platform === 'linux' && !active) {
+    // The exported helper pins its own roots. Trust only this fixture's signer
+    // while retaining definition parsing and domain-separated signature checks.
+    t.mock.method(RunnerAcceptanceVerifier.prototype, 'verifyDefinition', (value: unknown) => {
+      const definition = parseRunnerDefinition(value);
+      assert.equal(definition.keyId, definitionKeyId);
+      assert(verify(null, Buffer.from(signedRunnerDefinitionString(definition)), definitionSigner.publicKey, Buffer.from(definition.signature, 'base64')));
+      return definition;
+    });
+    if (authorizeActivation) t.mock.method(RunnerAcceptanceVerifier.prototype, 'verify', (value: unknown) => {
+      const authorization = parseRunnerAuthorization(value);
+      assert.equal(authorization.keyId, definitionKeyId);
+      assert(verify(null, Buffer.from(signedRunnerAuthorizationString(authorization)), definitionSigner.publicKey, Buffer.from(authorization.signature, 'base64')));
+      return authorization;
+    });
+    await ensurePrivateDirectory(join(paths.data, 'runner'));
+    await atomicWrite(join(paths.data, 'runner', 'agents.json'), JSON.stringify({[agentId]: {
+      aiToolId, handle: agent.handle, folder: join(home, 'agent-workspace'), folderCreated: false,
+      access: 'full_access', accessConfirmedAt: now, setupDone: false,
+    }}));
+  }
   if (active) {
     const jwk = generateKeyPairSync('ed25519').privateKey.export({format: 'jwk'}); publicKey = jwk.x!;
     await secrets.set('device-key', JSON.stringify({format: 1, keys: {[aiToolId]: {deviceKeyId, d: jwk.d!, x: jwk.x!}}}));
@@ -88,13 +124,35 @@ async function fixture(t: TestContext, active = false) {
       const body = JSON.parse(String(init?.body)); registrations.push(body); publicKey = body.publicKey;
       return Response.json({data: {deviceKeyId, fingerprint: deviceKeyFingerprint(publicKey)}});
     }
-    if (path === '/api/runner/test-result' || path === '/api/runner/heartbeat') {
+    if (['/api/runner/agent-definitions', '/api/runner/test-acceptance', '/api/runner/test-result', '/api/runner/heartbeat'].includes(path)) {
       const headers = new Headers(init?.headers), raw = Buffer.from(String(init?.body));
       assert.equal(headers.get('authorization'), `Bearer ${token}`);
       assert.equal(headers.get(RUNNER_HEADERS.deviceKey), deviceKeyId);
       assert(verifyRunnerRequest({method: 'POST', path, body: raw, deviceKeyId,
         timestamp: headers.get(RUNNER_HEADERS.timestamp)!, nonce: headers.get(RUNNER_HEADERS.nonce)!}, headers.get(RUNNER_HEADERS.signature)!, publicKey));
       const body = JSON.parse(raw.toString('utf8'));
+      if (path === '/api/runner/agent-definitions') {
+        definitions.push(body);
+        const definition: RunnerDefinitionFields = {format: 1, keyId: definitionKeyId, purpose: 'agent-definition',
+          helperId, aiToolId, deviceKeyId, requestNonce: headers.get(RUNNER_HEADERS.nonce)!,
+          issuedAt: new Date(now).toISOString(), expiresAt: new Date(now + 30_000).toISOString(),
+          scopeId: agentId, scopeVersion: 1, toolKey: 'codex', platform: 'linux',
+          agents: [{agentId, name: agent.name, handle: agent.handle, model: agent.model,
+            provider: agent.provider, effort: agent.effort, accessWanted: 'full_access'}]};
+        return Response.json({data: {definition: {...definition,
+          signature: sign(null, Buffer.from(signedRunnerDefinitionString(definition)), definitionSigner.privateKey).toString('base64')}}});
+      }
+      if (path === '/api/runner/test-acceptance') {
+        acceptanceRequests.push(body);
+        if (!authorizeActivation) return Response.json({error: {code: 'NOT_FOUND'}}, {status: 404});
+        const authorization: RunnerAuthorizationFields = {format: 1, keyId: definitionKeyId, purpose: 'activation',
+          helperId, aiToolId, deviceKeyId, runId: activationAcknowledgment.runId, generation: activationAcknowledgment.generation,
+          requestNonce: headers.get(RUNNER_HEADERS.nonce)!, issuedAt: new Date(now).toISOString(),
+          startBy: new Date(now + 30_000).toISOString(), workloadDeadline: new Date(now + 60_000).toISOString(),
+          acceptanceGrant: {scopeId: agentId, scopeVersion: 1, toolKey: 'codex', platform: 'linux', expiresAt: new Date(now + 60_000).toISOString()}};
+        return Response.json({data: {authorization: {...authorization,
+          signature: sign(null, Buffer.from(signedRunnerAuthorizationString(authorization)), definitionSigner.privateKey).toString('base64')}}});
+      }
       if (path === '/api/runner/heartbeat') {
         heartbeats.push(body); return Response.json({data: {heartbeatSeconds: 15, agents: [agent], claimable: [], stop: []}});
       }
@@ -118,10 +176,13 @@ async function fixture(t: TestContext, active = false) {
     if (ms < 1000) {await wait(); return;}
     now += ms; await onSleep(++serviceSleeps);
   }};
-  const run = (updates?: CliOptions['updates']) => runCli(['service'], {home, env, runner, request, timing, runtime,
+  let inspections = 0;
+  const run = (updates?: CliOptions['updates'], inspection: NonNullable<CliOptions['inspectRunProcesses']> = async () => {inspections++;}) => runCli(['service'], {home, env, runner, request, timing, runtime,
+    // Native inspection belongs to the process suites, not this service protocol fixture.
+    inspectRunProcesses: inspection,
     signal: stop.signal, output: line => output.push(line), isTTY: false, updates, watchRoute: () => ({close() {}})});
-  return {paths, aiToolId, agentId, deviceKeyId, keychainWrites, dialogs, output, registrations, results, statusTimes, heartbeats,
-    startedAt, runtime, stop, releaseResult, resultAnswered: () => resultAnswered, serviceSleeps: () => serviceSleeps,
+  return {paths, aiToolId, agentId, deviceKeyId, keychainWrites, dialogs, output, toolCommands, registrations, results, statusTimes, heartbeats, definitions, acceptanceRequests, activationAcknowledgment,
+    startedAt, runtime, stop, releaseResult, resultAnswered: () => resultAnswered, serviceSleeps: () => serviceSleeps, inspections: () => inspections,
     onSleep: (value: typeof onSleep) => {onSleep = value;}, run};
 }
 
@@ -198,15 +259,99 @@ for (const failure of ['init', 'syncGrants'] as const) test(`service still ticks
   assert(f.output.includes(failure === 'init' ? 'Test recovery unavailable this cycle (RUNNER_TEST_RECOVERY_UNAVAILABLE).' : 'Run activation unavailable this cycle (runner_failed).'));
 });
 
-for (const platform of ['linux', 'win32']) test(`service refuses runner activation and recovery on ${platform}`, async t => {
+for (const platform of ['win32']) test(`service refuses runner activation and recovery on ${platform}`, async t => {
   const f = await fixture(t, true);
   Object.defineProperty(process, 'platform', {value: platform});
   t.mock.method(RunsRuntime.prototype, 'init', async () => {assert.fail('Unsupported runs must not inspect or recover processes.');});
   t.mock.method(RunsOnController.prototype, 'syncGrants', async () => {assert.fail('Unsupported runs must not activate tools.');});
   const writes = f.keychainWrites.length;
-  await f.run();
-  assert(f.output.includes('Runs paused this cycle (RUNS_PLATFORM_UNSUPPORTED).'));
+  await assert.rejects(f.run(), {code: 'PLATFORM_UNSUPPORTED'});
+
   assert.deepEqual(f.registrations, []); assert.deepEqual(f.results, []); assert.deepEqual(f.heartbeats, []);
   assert.deepEqual(f.dialogs, []); assert.equal(f.keychainWrites.length, writes);
-  assert.equal(f.statusTimes.length, 1, 'Helper status polling continues without running agents.');
+  assert.equal(f.statusTimes.length, 0, 'An unsupported OS is refused before polling.');
+});
+
+for (const initialized of [false, true]) test(initialized
+  ? 'Linux service activation diagnostic reuses its already initialized core owner'
+  : 'Linux service recovers, forwards grants, and preserves acceptance 404 refusal with private file credentials', {skip: process.platform !== 'linux'}, async t => {
+  const f = await fixture(t, false, 'linux', initialized);
+  let recoveries = 0, activationCallbacks = 0, identityChecks = 0;
+  const init = RunsRuntime.prototype.init;
+  t.mock.method(RunsRuntime.prototype, 'init', async function(this: RunsRuntime) {
+    recoveries++;
+    if (initialized) {
+      const core = this.core;
+      await core.init();
+      const owner = core['owner'], generation = core['ownerGeneration'];
+      assert(owner, 'The service core must retain its initialized owner before activation.');
+      // Signed activation now reaches the shared S3 lifecycle. This service
+      // protocol fixture refuses identity before any executable probe or run.
+      t.mock.method(codexAdapter, 'identity', async () => {
+        identityChecks++;
+        assert.equal(core['owner'], owner, 'Identity validation must retain the initialized core owner.');
+        assert.equal(core['ownerGeneration'], generation, 'Identity validation must retain the core owner generation.');
+        owner.assertGeneration(generation);
+        return {ok: false, version: null};
+      });
+      const withToolContext = core.withToolContext.bind(core);
+      t.mock.method(core, 'withToolContext', <T>(action: () => Promise<T>) => withToolContext(async () => {
+        if (f.acceptanceRequests.length) {
+          activationCallbacks++;
+          assert.equal(core['owner'], owner, 'The activation callback must reuse the already initialized core owner.');
+          assert.equal(core['ownerGeneration'], generation, 'The activation callback must retain the core owner generation.');
+          owner.assertGeneration(generation);
+          await withLinuxRunContext(f.paths.data, async () => {
+            assert.equal(core['owner'], owner, 'A nested tool context must reuse the retained owner without acquiring another owner.');
+          });
+        }
+        return action();
+      }));
+    }
+    await init.call(this);
+  });
+  f.onSleep(async () => {
+    await until(() => f.results.length === 1);
+    f.releaseResult(); await until(f.resultAnswered); f.stop.abort();
+  });
+  await f.run();
+  assert.equal(recoveries, 1);
+  assert.equal(f.inspections(), 1);
+  assert.equal(f.registrations.length, 1);
+  assert.deepEqual(f.definitions, [{toolKey: 'codex'}]);
+  assert.deepEqual(f.acceptanceRequests, [{purpose: 'activation', agents: [{agentId: f.agentId, access: 'full_access'}]}]);
+  assert.equal(activationCallbacks, initialized ? 1 : 0, 'Successful authorization must enter the activation callback exactly once.');
+  assert.equal(identityChecks, initialized ? 1 : 0, 'Only successful authorization may reach identity validation.');
+  assert.deepEqual(f.results, initialized
+    ? [{ok: false, code: 'tool_identity', toolVersion: null, acknowledgment: f.activationAcknowledgment}]
+    : [{ok: false, code: 'adapter_refused', toolVersion: null}]);
+  assert.deepEqual(f.toolCommands, [], 'The service protocol fixture must refuse before any CLI command executes.');
+  assert.deepEqual(f.dialogs, []);
+  const saved = JSON.parse(await readFile(join(f.paths.data, 'runner', 'runs.json'), 'utf8'));
+  assert.equal(saved.tools[0].state, 'failed');
+});
+
+test('Linux service keeps heartbeats running behind unresolved recovery and reports setup in the journal', {skip: process.platform !== 'linux'}, async t => {
+  const f = await fixture(t, true, 'linux');
+  const directory = join(f.paths.data, 'runner', 'test-processes');
+  await ensurePrivateDirectory(directory);
+  const evidence = join(directory, 'invalid-ledger');
+  await writeFile(evidence, 'synthetic recovery evidence', {mode: 0o600});
+  await f.run();
+  assert.equal(f.heartbeats.length, 1);
+  assert.equal(f.inspections(), 1);
+  assert.deepEqual(f.dialogs, []);
+  assert(f.output.includes('Test recovery unavailable this cycle (RUNNER_TEST_RECOVERY_UNAVAILABLE).'));
+  assert(f.output.some(line => line.includes('Run maddots-ai agent setup in an interactive terminal.')));
+  assert.equal(await readFile(evidence, 'utf8'), 'synthetic recovery evidence');
+});
+
+test('Linux service refuses recovery, activation and heartbeats when process preflight fails', {skip: process.platform !== 'linux'}, async t => {
+  const f = await fixture(t, true, 'linux');
+  t.mock.method(RunsRuntime.prototype, 'init', async () => {assert.fail('Failed inspection cannot enter recovery.');});
+  t.mock.method(RunsOnController.prototype, 'syncGrants', async () => {assert.fail('Failed inspection cannot activate tools.');});
+  await f.run(undefined, async () => {throw Object.assign(new Error('SYNTHETIC_PRIVATE_INSPECTION_TEXT'), {code: 'adapter_refused'});});
+  assert.deepEqual(f.registrations, []); assert.deepEqual(f.results, []); assert.deepEqual(f.heartbeats, []);
+  assert(f.output.includes('Runs paused this cycle (adapter_refused).'));
+  assert.equal(f.output.some(line => line.includes('SYNTHETIC_PRIVATE_INSPECTION_TEXT')), false);
 });

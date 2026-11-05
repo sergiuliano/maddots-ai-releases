@@ -1,5 +1,6 @@
 import { HelperError } from './config.js';
 import {HELPER_VALIDATION_PATHS_HEADER, helperRouteTemplate, safeHelperInstancePaths, type HelperHttpDiagnostic} from './shared/helper-http-diagnostics.js';
+import {parseJsonWithoutDuplicateKeys} from './shared/strict-json.js';
 
 export type Scope = 'sync' | 'import_upload' | 'proposal_upload' | 'run_claim';
 export type ApiRequestOptions = {
@@ -60,7 +61,7 @@ export async function boundedJson(response: Response, limit: number): Promise<Re
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    const parsed: unknown = parseJsonWithoutDuplicateKeys(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
     if (!isObject(parsed)) throw new Error();
     return parsed;
   } catch (error) {

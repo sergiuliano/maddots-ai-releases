@@ -1,7 +1,9 @@
 // Fixture backends exercise trust policy and activation without hosted signing or real installs.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import fsPromises, { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -10,16 +12,20 @@ import test, { type TestContext } from 'node:test';
 import * as tar from 'tar';
 import fetch from 'make-fetch-happen';
 import { HelperError, readConfig, type Timing } from '../src/config.js';
-import { createPaths, withWriteLock } from '../src/paths.js';
+import { createPaths, ensurePaths, withWriteLock } from '../src/paths.js';
 import { discoverNpm, installEnvironment, packageInfrastructure, PACKAGE_TIMEOUT_MS, type PackageInfrastructure } from '../src/npm.js';
 import { RELEASE_IDENTITY, type ReleaseIdentity } from '../src/release-identity.js';
-import { checkForUpdate, downloadRelease, prepareArchive, releaseFromStatement, rollbackRelease, selectRelease, startUpdateChecks,
-  UPDATE_CHECK_INTERVAL_MS, updateDirectory, verifyArtifactDigest, verifyReleaseBundle, type UpdateBackend, type UpdateOptions } from '../src/updater.js';
+import { checkForUpdate, diagnosticStatus, downloadRelease, prepareArchive, releaseFromStatement, rollbackRelease, selectRelease, startUpdateChecks,
+  UPDATE_CHECK_INTERVAL_MS, updateDirectory, verifyArtifactDigest, verifyReleaseBundle, type UpdateBackend, type UpdateOptions, type UpdateResult } from '../src/updater.js';
 
 const source: Readonly<ReleaseIdentity> = { repository: 'fixture/helper', workflowPath: '.github/workflows/helper-release.yml',
   allowedSigner: 'fixture-only signer', releasePrefix: 'helper-', assetName: 'helper.tgz' };
 const digest = createHash('sha256').update('fixture artifact').digest('hex');
 const commitA = 'a'.repeat(40), commitB = 'b'.repeat(40), commitC = 'c'.repeat(40);
+const admissionCodes = ['LINUX_LOCK_RETIREMENT_UNVERIFIED', 'HELPER_BUSY', 'EIO', 'CANDIDATE_FAILED', 'INVALID_CHECKSUM'] as const;
+function admissionError(code: string): Error {
+  return code === 'EIO' ? Object.assign(new Error(code), {code}) : new HelperError(code, code);
+}
 async function fixture(t: TestContext) {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'maddots-updater-'));
   t.after(() => rm(home, { recursive: true, force: true }));
@@ -51,10 +57,110 @@ function signedFixture() {
   } };
 }
 
+async function refusedAdmission(t: TestContext, options: UpdateOptions, guard: string, run: () => Promise<UpdateResult>,
+  code = 'LINUX_LOCK_RETIREMENT_UNVERIFIED') {
+  const nativeOpen = fsPromises.open, nativeRename = fsPromises.rename, directory = updateDirectory(options);
+  let refused = false, status = '', entries: string[] = [], updateLockHeld = false;
+  let lastCheck: unknown;
+  const writes: string[] = [];
+  t.mock.method(fsPromises, 'open', (async (path, flags, mode) => {
+    if (String(path) === guard) {
+      status = await readFile(join(directory, 'last-check.json'), 'utf8');
+      lastCheck = (await diagnosticStatus(options)).lastCheck;
+      entries = (await readdir(directory)).sort();
+      updateLockHeld = entries.includes('.lock');
+      if (updateLockHeld) assert.equal(await readFile(join(directory, '.lock'), 'utf8'), String(process.pid));
+      refused = true;
+      throw admissionError(code);
+    }
+    const writing = typeof flags === 'number' ? !!(flags & (constants.O_WRONLY | constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_APPEND)) : /[wa+]/u.test(flags ?? 'r');
+    if (refused && writing) writes.push(String(path));
+    return nativeOpen(path, flags, mode);
+  }) as typeof fsPromises.open);
+  t.mock.method(fsPromises, 'rename', (async (from, to) => {
+    if (refused) writes.push(`rename:${String(from)}`);
+    return nativeRename(from, to);
+  }) as typeof fsPromises.rename);
+  syncBuiltinESMExports();
+  let result: UpdateResult;
+  try {result = await run();}
+  finally {t.mock.restoreAll(); syncBuiltinESMExports();}
+  assert.equal(refused, true, 'The update must reach the simulated admission refusal.');
+  assert.deepEqual(writes, [], 'Admission refusal must not publish status, rename a stage, or activate a runtime.');
+  assert.equal(await readFile(join(directory, 'last-check.json'), 'utf8'), status);
+  assert.deepEqual((await diagnosticStatus(options)).lastCheck, lastCheck, 'Failed admission must not publish an in-memory status either.');
+  // Publication refusal unwinds an already-owned outer update lock. Releasing
+  // that transient lock is required; every retained entry must stay in place.
+  assert.deepEqual((await readdir(directory)).sort(), entries.filter(name => name !== '.lock'), 'Any existing stage stays at its original path.');
+  return {result, updateLockHeld};
+}
+
 test('source checkout has no live default channel and fails closed before npm or network', async t => {
   const { options } = await fixture(t);
   if (RELEASE_IDENTITY === null) assert.equal((await checkForUpdate(options)).reason, 'RELEASE_UNCONFIGURED');
   assert.equal((await selectRelease(options)).root, options.bundledRoot);
+});
+test('fixed Linux update APIs refuse before inspecting any mutable cache or invoking a backend', {skip: process.platform !== 'linux'}, async t => {
+  const {options} = await fixture(t), fixedRoot = '/usr/local/libexec/mdai/helper';
+  const fixed: UpdateOptions = {...options, bundledRoot: fixedRoot,
+    paths: new Proxy(options.paths, {get: () => assert.fail('Fixed runtime operations cannot inspect mutable updater paths.')}),
+  };
+  const refused = {status: 'failed', reason: 'SYSTEM_RUNTIME_FIXED'};
+  const blocked = backend(commitA, '0.6.0', {
+    latest: async () => assert.fail('Fixed updates cannot discover releases.'),
+    prepare: async () => assert.fail('Fixed updates cannot prepare cached code.'),
+    validate: async () => assert.fail('Fixed updates cannot execute candidate code.'),
+  });
+  await assert.rejects(selectRelease(fixed, source), {code: 'SYSTEM_RUNTIME_FIXED'});
+  assert.deepEqual(await checkForUpdate(fixed, blocked), refused);
+  assert.deepEqual(await checkForUpdate({...fixed, env: {MADDOTS_AI_AUTO_UPDATE: '0'}}, blocked), refused);
+  assert.deepEqual(await checkForUpdate({...fixed, force: true}, blocked), refused);
+  assert.deepEqual(await rollbackRelease(fixed, undefined, source), refused);
+  assert.deepEqual(await rollbackRelease(fixed, commitA, source), refused);
+  assert.deepEqual(await diagnosticStatus(fixed), {automaticUpdates: false, checkIntervalMs: UPDATE_CHECK_INTERVAL_MS,
+    lastCheck: null, selectedRuntime: {root: fixedRoot, version: options.version}});
+  const stop = startUpdateChecks(fixed, () => assert.fail('Fixed runtimes cannot schedule updater callbacks.'), blocked);
+  await immediate(); stop();
+});
+test('registration refusal precedes all updater creation and preserves an existing cache', async t => {
+  for (const code of admissionCodes) for (const cache of ['absent', 'empty data', 'prepared'] as const) await t.test(`${code} ${cache}`, async context => {
+    const {options, home} = await fixture(context);
+    if (cache === 'empty data') await mkdir(options.paths.data, {recursive: true, mode: 0o700});
+    if (cache === 'prepared') assert.equal((await checkForUpdate(options, backend())).status, 'prepared');
+    const before = (await readdir(home)).sort();
+    const status = cache === 'prepared' ? await readFile(join(updateDirectory(options), 'last-check.json'), 'utf8') : undefined;
+    const lastCheck = (await diagnosticStatus(options)).lastCheck;
+    const nativeOpen = fsPromises.open, nativeMkdir = fsPromises.mkdir, nativeRename = fsPromises.rename;
+    const writes: string[] = [];
+    let refusals = 0;
+    context.mock.method(fsPromises, 'open', (async (path, flags, mode) => {
+      if (String(path).endsWith('/.write-lock-upgrade.json')) {refusals++; throw admissionError(code);}
+      const writing = typeof flags === 'number' ? !!(flags & (constants.O_WRONLY | constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_APPEND)) : /[wa+]/u.test(flags ?? 'r');
+      if (writing) writes.push(String(path));
+      return nativeOpen(path, flags, mode);
+    }) as typeof fsPromises.open);
+    context.mock.method(fsPromises, 'mkdir', (async (...args: Parameters<typeof fsPromises.mkdir>) => {
+      writes.push(`mkdir:${String(args[0])}`); return nativeMkdir(...args);
+    }) as typeof fsPromises.mkdir);
+    context.mock.method(fsPromises, 'rename', (async (from, to) => {
+      writes.push(`rename:${String(from)}`); return nativeRename(from, to);
+    }) as typeof fsPromises.rename);
+    syncBuiltinESMExports();
+    let result: UpdateResult;
+    try {result = await checkForUpdate({...options, force: true}, backend(commitB, '0.7.0', {
+      latest: async () => assert.fail('registration must be accepted before discovery'),
+    }));}
+    finally {context.mock.restoreAll(); syncBuiltinESMExports();}
+    assert.equal(result.status, code === 'HELPER_BUSY' || code === 'LINUX_LOCK_RETIREMENT_UNVERIFIED' ? 'busy' : 'failed');
+    assert.equal(refusals, 1);
+    assert.deepEqual(writes, [], 'Rejected registration must not create cache roots or publish a failure status.');
+    assert.deepEqual((await diagnosticStatus(options)).lastCheck, lastCheck);
+    assert.deepEqual((await readdir(home)).sort(), before);
+    if (status !== undefined) assert.equal(await readFile(join(updateDirectory(options), 'last-check.json'), 'utf8'), status);
+    else if (cache === 'empty data') assert.deepEqual(await readdir(options.paths.data), []);
+    else await assert.rejects(readdir(options.paths.data), {code: 'ENOENT'});
+    assert.equal((await checkForUpdate({...options, force: true}, backend(commitB, '0.7.0'))).status, 'prepared', 'A refused attempt must release its in-process admission.');
+  });
 });
 test('provenance pins one artifact, exact repository, workflow, main branch and immutable source commit', () => {
   assert.deepEqual(releaseFromStatement(source, statement()), { commit: commitA, sha256: digest });
@@ -95,7 +201,7 @@ test('digest mismatch and mutation of an immutable cached source release are rej
 });
 test('local fixture update preserves bootstrap and credentials, then rolls back to previous or bundled runtime', async t => {
   const { options } = await fixture(t);
-  await mkdir(options.paths.data, { recursive: true, mode: 0o700 });
+  await ensurePaths(options.paths);
   await writeFile(options.paths.state, 'saved credential state', { mode: 0o600 });
   await writeFile(join(options.bundledRoot, 'package.json'), 'bundled package', { mode: 0o600 });
   assert.deepEqual(await checkForUpdate(options, backend()), { status: 'prepared', commit: commitA, version: '0.6.0' });
@@ -117,6 +223,29 @@ test('downgrades below either selected or running versions are refused, includin
   assert.equal((await checkForUpdate({ ...options, force: true }, backend())).reason, 'DOWNGRADE_REFUSED');
   assert.equal((await selectRelease(options, source)).commit, commitB);
 });
+test('attest-only prerelease versions fail manifest validation before candidate execution or activation', async t => {
+  const { options: defaults } = await fixture(t);
+  const options = { ...defaults, version: '0.1.5' };
+  assert.deepEqual(await checkForUpdate(options, backend(commitA, '0.1.6')), { status: 'prepared', commit: commitA, version: '0.1.6' });
+  const selected = await selectRelease(options, source);
+  const directory = updateDirectory(options), pointer = await readFile(join(directory, 'current.json'), 'utf8');
+  const activeManifest = await readFile(join(selected.root, 'package.json'), 'utf8');
+  const activeCli = await readFile(join(selected.root, 'dist/cli.js'), 'utf8');
+  let prepared = false;
+  const candidateBackend = backend(commitB, '0.1.6-linux.s5.7.1');
+  const result = await checkForUpdate({ ...options, force: true, activate: async () => assert.fail('an attest-only candidate must not activate') }, {
+    ...candidateBackend,
+    prepare: async (release, target) => { prepared = true; await candidateBackend.prepare(release, target); },
+    validate: async () => assert.fail('an attest-only candidate must not execute'),
+  });
+  assert.equal(prepared, true, 'The prerelease package must reach the production manifest guard.');
+  assert.deepEqual(result, { status: 'failed', reason: 'INVALID_MANIFEST' });
+  assert.deepEqual(await selectRelease(options, source), selected);
+  assert.equal(await readFile(join(directory, 'current.json'), 'utf8'), pointer);
+  assert.deepEqual(await readdir(join(directory, 'releases')), [commitA]);
+  assert.equal(await readFile(join(selected.root, 'package.json'), 'utf8'), activeManifest);
+  assert.equal(await readFile(join(selected.root, 'dist/cli.js'), 'utf8'), activeCli);
+});
 test('unsigned, failed network, bad install and failed candidate leave working runtime intact with redacted errors', async t => {
   const { options } = await fixture(t); await checkForUpdate(options, backend());
   for (const phase of ['latest', 'prepare', 'validate'] as const) {
@@ -125,6 +254,23 @@ test('unsigned, failed network, bad install and failed candidate leave working r
     assert.equal((await selectRelease(options, source)).commit, commitA);
   }
   assert.equal((await checkForUpdate({ ...options, force: true }, backend(commitB, '0.7.0', { latest: async () => { throw new HelperError('INVALID_PROVENANCE', 'unsigned'); } }))).reason, 'INVALID_PROVENANCE');
+});
+test('candidate failures after successful admission still publish status and preserve failed stages in backups', async t => {
+  const {options} = await fixture(t);
+  assert.equal((await checkForUpdate(options, backend())).status, 'prepared');
+  let preserved = 0;
+  for (const code of ['EIO', 'CANDIDATE_FAILED', 'INVALID_CHECKSUM']) {
+    const result = await checkForUpdate({...options, force: true}, backend(commitB, '0.7.0', {
+      validate: async () => {throw admissionError(code);},
+    }));
+    assert.equal(result.status, 'failed');
+    const status = JSON.parse(await readFile(join(updateDirectory(options), 'last-check.json'), 'utf8'));
+    assert.equal(status.status, result.status); assert.equal(status.reason, result.reason);
+    assert.deepEqual((await diagnosticStatus(options)).lastCheck, status);
+    assert.equal((await readdir(options.paths.backups)).filter(name => name.startsWith('helper-update-')).length, ++preserved);
+    assert.equal((await readdir(updateDirectory(options))).some(name => name.startsWith('staging-')), false);
+    assert.equal((await selectRelease(options, source)).commit, commitA);
+  }
 });
 test('one hour cooldown persists across calls, disabled automatic checks allow explicit manual updates', async t => {
   const { options, advance } = await fixture(t); await checkForUpdate(options, backend());
@@ -166,6 +312,43 @@ test('concurrent preparation is busy and a failed activation restores the old po
     backend(commitB, '0.7.0', { latest: async () => { start(); await gate; return { commit: commitB, sha256: digest }; } }));
   await entered; assert.equal((await checkForUpdate({ ...options, force: true }, backend(commitC, '0.8.0'))).status, 'busy');
   finish(); assert.equal((await update).status, 'failed'); assert.equal((await selectRelease(options, source)).commit, commitA);
+});
+test('failed admission before update discovery or publication preserves status and stages without activating a writer', async t => {
+  for (const code of admissionCodes) for (const phase of ['discovery', 'publication'] as const) await t.test(`${code} ${phase}`, async context => {
+    const {options} = await fixture(context);
+    assert.equal((await checkForUpdate(options, backend())).status, 'prepared');
+    const pointer = await readFile(join(updateDirectory(options), 'current.json'), 'utf8');
+    let discoveries = 0, preparations = 0, activations = 0;
+    const prepared = backend(commitB, '0.7.0'), candidate = backend(commitB, '0.7.0', {
+      latest: async () => {discoveries++; return prepared.latest();},
+      prepare: async (release, target) => {preparations++; await prepared.prepare(release, target);},
+    });
+    const guard = phase === 'discovery' ? join(updateDirectory(options), '.lock.guard') : options.paths.lock + '.guard';
+    const {result, updateLockHeld} = await refusedAdmission(context, options, guard, () => checkForUpdate({...options, force: true,
+      activate: async () => {activations++;}}, candidate), code);
+    assert.equal(result.status, code === 'HELPER_BUSY' || code === 'LINUX_LOCK_RETIREMENT_UNVERIFIED' ? 'busy' : 'failed');
+    assert.equal(updateLockHeld, phase === 'publication', 'only the publication refusal unwinds an already-owned updater lock');
+    assert.equal(discoveries, phase === 'discovery' ? 0 : 1);
+    assert.equal(preparations, phase === 'discovery' ? 0 : 1);
+    assert.equal(activations, 0);
+    assert.equal(await readFile(join(updateDirectory(options), 'current.json'), 'utf8'), pointer);
+    assert.equal((await selectRelease(options, source)).commit, commitA);
+    const stages = (await readdir(updateDirectory(options))).filter(name => name.startsWith('staging-'));
+    assert.equal(stages.length, phase === 'discovery' ? 0 : 1);
+  });
+});
+test('Linux retirement refusal during rollback is busy and preserves the selected runtime without publishing', async t => {
+  const {options} = await fixture(t);
+  assert.equal((await checkForUpdate(options, backend())).status, 'prepared');
+  const pointer = await readFile(join(updateDirectory(options), 'current.json'), 'utf8');
+  let activations = 0;
+  const {result, updateLockHeld} = await refusedAdmission(t, options, options.paths.lock + '.guard', () =>
+    rollbackRelease({...options, activate: async () => {activations++;}}, undefined, source));
+  assert.equal(result.status, 'busy');
+  assert.equal(updateLockHeld, false);
+  assert.equal(activations, 0);
+  assert.equal(await readFile(join(updateDirectory(options), 'current.json'), 'utf8'), pointer);
+  assert.equal((await selectRelease(options, source)).commit, commitA);
 });
 test('manual rollback does not reject a different independently verified future release', async t => {
   const { options, advance } = await fixture(t); await checkForUpdate(options, backend());

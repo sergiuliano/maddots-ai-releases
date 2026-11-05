@@ -2,7 +2,7 @@ import { ApiClient, ApiError, isObject, isSkillsToken, type ApiRequestOptions, t
 import { HelperError, clock, type Timing } from './config.js';
 import type { DetectedTool } from './detect.js';
 import { parseConnections, parseScopes, reportedTools, safeText, type PairingCredential } from './pairing.js';
-import type { SecretStore } from './secret-store.js';
+import { requireCredentialCapability, type SecretStore } from './secret-store.js';
 import type { HelperState, StateStore } from './state.js';
 import { disconnectRunners } from './runner/runner.js';
 
@@ -38,6 +38,7 @@ export class TokenManager {
 
   async acceptPairing(credential: PairingCredential, tools: DetectedTool[]): Promise<HelperState> {
     if (!isSkillsToken(credential.token)) throw new HelperError('PAIRING_RESPONSE_INVALID', 'MadDots AI returned an invalid skills token.');
+    if (credential.scopes.includes('run_claim')) requireCredentialCapability(this.secrets, 'runClaims');
     await this.secrets.set('skills-token', credential.token, credential.scopes);
     if (await this.secrets.get('skills-token') !== credential.token) {
       throw new HelperError('SECRET_VERIFY_FAILED', 'The saved skills token could not be verified. Connect this computer again.');
@@ -47,7 +48,7 @@ export class TokenManager {
       ...previous, status: 'connected', helperId: credential.helperId, account: credential.account,
       scopes: [...credential.scopes], issuedAt: new Date(this.timing.now()).toISOString(),
       renewBy: credential.renewBy, idleLapseAt: credential.idleLapseAt,
-      tools: tools.map(tool => ({...tool, models: [...tool.models]})), pendingTools: [], tokenStorage: this.secrets.storage,
+      tools: tools.map(tool => ({...tool, models: [...tool.models]})), pendingTools: [], tokenStorage: this.secrets.storage, credentialBackendSelected: true,
       lastDetectionAt: new Date(this.timing.now()).toISOString(),
       connections: credential.connections.map(connection => ({ ...connection })), proposedTools: [],
     };
@@ -164,9 +165,7 @@ export class TokenManager {
       throw new HelperError('API_RESPONSE_INVALID', 'MadDots AI returned invalid connection status.');
     }
     const scopes = parseScopes(data.scopes);
-    if (this.secrets.storage === 'file' && scopes.includes('run_claim')) {
-      throw new HelperError('FILE_RUNS_REFUSED', 'Running agents requires Keychain storage.');
-    }
+    if (scopes.includes('run_claim')) requireCredentialCapability(this.secrets, 'runClaims');
     const pending = toolIdentities(data.pending);
     const connections = parseConnections(data.connections);
     const connected = new Set(connections.map(identity));
@@ -252,9 +251,14 @@ export class TokenManager {
     await disconnectRunners().catch(() => {});
     const state = await this.stateStore.read();
     await this.stateStore.write({ ...state, status: 'pair_again', scopes: [], pendingTools: [], connections: [], proposedTools: [] });
-    // Do not touch skills, lock.json, or backups. Attempt both removals even if one fails.
-    const results = await Promise.allSettled([this.secrets.delete('skills-token'), this.secrets.delete('device-key')]);
-    if (results.some(result => result.status === 'rejected')) {
+    // The file backend shares one read-modify-write document. Remove sequentially,
+    // attempting both even if one fails, without touching skills, locks, or backups.
+    let removalFailed = false;
+    for (const name of ['skills-token', 'device-key'] as const) {
+      try { await this.secrets.delete(name); }
+      catch { removalFailed = true; }
+    }
+    if (removalFailed) {
       throw new HelperError('SECRET_DELETE_FAILED', 'The connection stopped, but a saved credential could not be removed. Retry uninstall.');
     }
   }

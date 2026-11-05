@@ -11,6 +11,8 @@ import { assertNoSymlinks, atomicWrite, ensurePrivateDirectory, inside, readPriv
 import { packageInfrastructure, PACKAGE_TIMEOUT_MS, runPackageCommand, type PackageInfrastructure } from './npm.js';
 import { RELEASE_IDENTITY, type ReleaseIdentity } from './release-identity.js';
 import { runnerBusy } from './runner/runner.js';
+import { assertLockUpgradeReady } from './write-lock-upgrade.js';
+import { assertSystemRuntimeOperation, systemRuntimeMode } from './system-runtime.js';
 
 export const UPDATE_CHECK_INTERVAL_MS = 3_600_000;
 const SHA = /^[a-f0-9]{40}$/;
@@ -18,7 +20,7 @@ const DIGEST = /^[a-f0-9]{64}$/;
 export interface UpdateOptions {
   paths: HelperPaths; bundledRoot: string; version: string; runningVersion?: string;
   env: NodeJS.ProcessEnv; timing?: Timing; force?: boolean; signal?: AbortSignal;
-  /** Runs under the same write lock as sync. The stable launchd launcher needs no callback. */
+  /** Runs under the same write lock as sync. The stable user service launcher needs no callback. */
   activate?: (selected: SelectedRelease) => Promise<void>;
 }
 export interface SelectedRelease { root: string; version: string; commit?: string }
@@ -118,6 +120,7 @@ async function ready(options: UpdateOptions, source: Readonly<ReleaseIdentity>, 
   } catch { return; }
 }
 export async function selectRelease(options: UpdateOptions, fixtureIdentity?: Readonly<ReleaseIdentity>): Promise<SelectedRelease> {
+  assertSystemRuntimeOperation(options.bundledRoot, 'select a cached helper runtime');
   try {
     const source = identity(fixtureIdentity), directory = await validateLocation(options), selected = await pointer(directory);
     for (const commit of [selected?.current, selected?.previous]) {
@@ -187,6 +190,7 @@ export async function downloadRelease(url: string, limit: number, infrastructure
   } finally { clearTimeout(timer); combined.removeEventListener('abort', abort); body?.destroy(); }
 }
 async function signedLatest(options: UpdateOptions, source: Readonly<ReleaseIdentity>, infrastructure: PackageInfrastructure): Promise<SignedRelease> {
+  assertSystemRuntimeOperation(options.bundledRoot, 'start a release verification Node child');
   const bytes = await downloadRelease('https://github.com/' + source.repository + '/releases/latest/download/helper.sigstore.json', 1024 * 1024, infrastructure, options.signal);
   const cache = join(updateDirectory(options), 'sigstore-cache'); await privateFolder(cache, true);
   const env = Object.fromEntries(Object.entries(infrastructure.env).filter(([key]) => /^(PATH|HOME|TMPDIR|TEMP|TMP|NODE_EXTRA_CA_CERTS|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)$/i.test(key)));
@@ -228,6 +232,7 @@ async function prepareSigned(options: UpdateOptions, source: Readonly<ReleaseIde
   await prepareArchive(bytes, release, target);
 }
 async function validateInstalled(options: UpdateOptions, target: string, infrastructure: PackageInfrastructure): Promise<void> {
+  assertSystemRuntimeOperation(options.bundledRoot, 'start the package installer');
   const cache = join(updateDirectory(options), 'npm-cache'); await privateFolder(cache, true);
   try {
     await runPackageCommand(infrastructure.npm.command, [...infrastructure.npm.args, 'ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--bin-links=false', '--cache', cache],
@@ -236,16 +241,19 @@ async function validateInstalled(options: UpdateOptions, target: string, infrast
   await validateConnection(options, target, infrastructure);
 }
 async function validateConnection(options: UpdateOptions, target: string, infrastructure: PackageInfrastructure): Promise<void> {
+  assertSystemRuntimeOperation(options.bundledRoot, 'start a candidate helper Node child');
   try {
     await runPackageCommand(process.execPath, [join(target, 'dist/cli.js'), '--self-test'], {
       cwd: target, env: { ...infrastructure.env, MADDOTS_AI_AUTO_UPDATE: '0' }, timeout: PACKAGE_TIMEOUT_MS, signal: options.signal });
   } catch { fail('CANDIDATE_FAILED'); }
 }
-const knownReasons = new Set(['RELEASE_UNCONFIGURED', 'PATH_UNSAFE', 'FILE_UNSAFE', 'NPM_UNAVAILABLE', 'NPM_CONFIGURATION_UNAVAILABLE', 'NETWORK_OFFLINE', 'NETWORK_UNAVAILABLE', 'INVALID_PROVENANCE', 'INVALID_CHECKSUM', 'UNSAFE_ARCHIVE', 'INVALID_MANIFEST', 'INSTALL_FAILED', 'CANDIDATE_FAILED', 'DOWNGRADE_REFUSED', 'ARTIFACT_TOO_LARGE', 'CANCELLED']);
+const knownReasons = new Set(['SYSTEM_RUNTIME_FIXED', 'RELEASE_UNCONFIGURED', 'PATH_UNSAFE', 'FILE_UNSAFE', 'NPM_UNAVAILABLE', 'NPM_CONFIGURATION_UNAVAILABLE', 'NETWORK_OFFLINE', 'NETWORK_UNAVAILABLE', 'INVALID_PROVENANCE', 'INVALID_CHECKSUM', 'UNSAFE_ARCHIVE', 'INVALID_MANIFEST', 'INSTALL_FAILED', 'CANDIDATE_FAILED', 'DOWNGRADE_REFUSED', 'ARTIFACT_TOO_LARGE', 'CANCELLED']);
 function safeReason(error: unknown, phase: string): string {
   const reason = error instanceof HelperError ? error.code : error instanceof Error ? error.message : '';
   return knownReasons.has(reason) ? reason : phase;
 }
+const lockAdmissionBusy = (error: unknown): boolean => error instanceof HelperError &&
+  ['HELPER_BUSY', 'LINUX_LOCK_RETIREMENT_UNVERIFIED'].includes(error.code);
 function cancelled(options: UpdateOptions): void { if (options.signal?.aborted) fail('CANCELLED'); }
 async function remember(options: UpdateOptions, status: CheckStatus): Promise<void> {
   lastStatuses.set(options.paths.data, status);
@@ -263,15 +271,24 @@ async function savePointer(options: UpdateOptions, next: Pointer, selected: Sele
   catch (error) { await atomicJson(path, previous ?? {}); throw error; }
 }
 export async function checkForUpdate(options: UpdateOptions, fixture?: UpdateBackend): Promise<UpdateResult> {
+  if (systemRuntimeMode(options.bundledRoot)) return { status: 'failed', reason: 'SYSTEM_RUNTIME_FIXED' };
   if (options.env.MADDOTS_AI_AUTO_UPDATE === '0' && !options.force) return { status: 'disabled' };
   const key = updateDirectory(options); if (active.has(key)) return { status: 'busy' };
   active.add(key);
-  let phase = 'CACHE_UNAVAILABLE', stage: string | undefined, checkedAt: number | undefined;
-  const finish = async (result: UpdateResult) => { await remember(options, { ...result, checkedAt, finishedAt: timing(options).now() }); return result; };
+  let phase = 'CACHE_UNAVAILABLE', stage: string | undefined, checkedAt: number | undefined, retirementRefused = false, admitted = false;
+  const finish = async (result: UpdateResult) => {
+    if (admitted && !retirementRefused) await remember(options, { ...result, checkedAt, finishedAt: timing(options).now() });
+    return result;
+  };
   try {
-    const source = identity(fixture?.identity), directory = await validateLocation(options, true);
+    const source = identity(fixture?.identity);
+    // Registration must accept the real data root before optional cache setup
+    // creates content which would make that root look like retained history.
+    await assertLockUpgradeReady(options.paths, timing(options));
+    const directory = await validateLocation(options, true);
     const updatePaths = { ...options.paths, data: directory, lock: join(directory, '.lock') };
     return await withWriteLock(updatePaths, async () => {
+      admitted = true;
       if (!options.force) {
         try { const previous = await privateJson(join(directory, 'last-check.json')); const elapsed = timing(options).now() - previous.checkedAt;
           if (Number.isFinite(previous.checkedAt) && elapsed >= 0 && elapsed < UPDATE_CHECK_INTERVAL_MS) return { status: 'deferred' }; }
@@ -310,7 +327,11 @@ export async function checkForUpdate(options: UpdateOptions, fixture?: UpdateBac
         if (fixture) await fixture.validate(target); else await validateConnection(options, target, infrastructure!);
       }
       const candidate = selected;
+      // Repair can persist a patching barrier and then fail with any error.
+      // Only entering the next action proves admission succeeded again.
+      admitted = false;
       return withWriteLock(options.paths, async () => {
+        admitted = true;
         cancelled(options); const current = await selectRelease(options, source);
         try {
           const rejected = await privateJson(join(directory, 'rejected.json'));
@@ -331,12 +352,19 @@ export async function checkForUpdate(options: UpdateOptions, fixture?: UpdateBac
       }, timing(options));
     }, timing(options));
   } catch (error) {
-    if (error instanceof HelperError && error.code === 'HELPER_BUSY') return { status: 'busy' };
+    retirementRefused = error instanceof HelperError && error.code === 'LINUX_LOCK_RETIREMENT_UNVERIFIED';
+    if (lockAdmissionBusy(error)) return { status: 'busy' };
     return finish({ status: 'failed', reason: safeReason(error, phase) });
-  } finally { if (stage) await preserveStage(options, stage).catch(() => {}); active.delete(key); }
+  } finally {
+    // Failed admission also excludes status publication and cleanup writes.
+    // Preserve a previously prepared stage for the owner's bounded recovery.
+    if (stage && admitted && !retirementRefused) await preserveStage(options, stage).catch(() => {});
+    active.delete(key);
+  }
 }
 export async function rollbackRelease(options: UpdateOptions, failedCommit?: string, fixtureIdentity?: Readonly<ReleaseIdentity>): Promise<UpdateResult> {
   try {
+    assertSystemRuntimeOperation(options.bundledRoot, 'roll back the system helper runtime');
     const source = identity(fixtureIdentity), directory = await validateLocation(options);
     return await withWriteLock(options.paths, async () => {
       const selected = await pointer(directory);
@@ -348,14 +376,17 @@ export async function rollbackRelease(options: UpdateOptions, failedCommit?: str
       const result: UpdateResult = { status: 'rolled-back', version: next.version, ...(next.commit ? { commit: next.commit } : {}), reason: failedCommit ? 'CANDIDATE_FAILED' : 'MANUAL_ROLLBACK' };
       await remember(options, { ...result, finishedAt: timing(options).now() }); return result;
     }, timing(options));
-  } catch (error) { return { status: error instanceof HelperError && error.code === 'HELPER_BUSY' ? 'busy' : 'failed', reason: safeReason(error, 'ROLLBACK_UNAVAILABLE') }; }
+  } catch (error) { return { status: lockAdmissionBusy(error) ? 'busy' : 'failed', reason: safeReason(error, 'ROLLBACK_UNAVAILABLE') }; }
 }
 export async function diagnosticStatus(options: UpdateOptions): Promise<{ automaticUpdates: boolean; checkIntervalMs: number; lastCheck: CheckStatus | null; selectedRuntime: SelectedRelease }> {
+  if (systemRuntimeMode(options.bundledRoot)) return { automaticUpdates: false, checkIntervalMs: UPDATE_CHECK_INTERVAL_MS,
+    lastCheck: null, selectedRuntime: { root: options.bundledRoot, version: options.version } };
   let status = lastStatuses.get(options.paths.data);
   try { status ??= await privateJson(join(await validateLocation(options), 'last-check.json')) as CheckStatus; } catch { /* Optional diagnostics. */ }
   return { automaticUpdates: options.env.MADDOTS_AI_AUTO_UPDATE !== '0', checkIntervalMs: UPDATE_CHECK_INTERVAL_MS, lastCheck: status ?? null, selectedRuntime: await selectRelease(options) };
 }
 export function startUpdateChecks(options: UpdateOptions, onChecked?: (result: UpdateResult) => void | Promise<void>, fixture?: UpdateBackend): () => void {
+  if (systemRuntimeMode(options.bundledRoot)) return () => {};
   if (options.env.MADDOTS_AI_AUTO_UPDATE === '0') return () => {};
   const controller = new AbortController(), signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
   let running = false;

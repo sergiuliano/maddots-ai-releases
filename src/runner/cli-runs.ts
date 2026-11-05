@@ -1,10 +1,11 @@
 import {join} from 'node:path';
-import {TOOL_MATRIX, type ToolMatrix} from '../shared/tool-matrix.js';
-import {isSkillsToken, type ApiClient} from '../api.js';
+import {TOOL_MATRIX, toolRunCapability, type ToolMatrix} from '../shared/tool-matrix.js';
+import {isLinuxAcceptanceCandidate} from '../shared/tool-capabilities.js';
+import {ApiError, isSkillsToken, type ApiClient} from '../api.js';
 import {clock, HelperError, type Timing} from '../config.js';
 import type {NotifyOptions} from '../notify.js';
 import {atomicWrite, ensurePrivateDirectory, readPrivateFile, withWriteLock, type HelperPaths} from '../paths.js';
-import type {SecretStore} from '../secret-store.js';
+import {credentialCapabilities, type SecretStore} from '../secret-store.js';
 import type {StateStore} from '../state.js';
 import type {BuildVerifier} from '../verify.js';
 import {adapters, type AdapterRegistry} from './adapters/index.js';
@@ -12,20 +13,21 @@ import {LocalAgents, reserveAgentSetupDialog, showAgentSetupDialog} from './agen
 import {DeviceKeyStore, type RunnerDeviceKey} from './device-key.js';
 import {postResult} from './post.js';
 import {RunnerProtocolClient, type RunnerAgent, type RunnerHeartbeat} from './protocol-client.js';
+import type {RunnerAcceptanceVerifier} from './acceptance.js';
 import {RunnerCore, type RunnerConnection, type RunnerOptions} from './runner.js';
 import {RunsOnController} from './runs-on.js';
 import {createSkillStager} from './stage-skills.js';
 import {recoverTestRuns, runToolTest, type RunTestConnection} from './test-run.js';
 import {startTokenCheck} from './token-check.js';
 
-type CompositionOptions = Omit<RunnerOptions, 'data' | 'verifiedBuild' | 'allowedBuild' | 'skillDescription' | 'stageSkills' | 'startCheck' | 'deliver'> & {
+type CompositionOptions = Omit<RunnerOptions, 'data' | 'verifiedBuild' | 'allowedBuild' | 'skillDescription' | 'claimSkills' | 'releaseSkills' | 'withSkillsFence' | 'stageSkills' | 'startCheck' | 'deliver'> & {
   paths: HelperPaths; helperId: string; verifier?: BuildVerifier; timing?: Timing;
 };
 
 /** The production construction site. These lifecycle hooks are never optional here. */
 export function createComposedRunner({paths, helperId, verifier, timing = clock, ...options}: CompositionOptions): RunnerCore {
-  return new RunnerCore({...options, data: paths.data, now: timing.now, sleep: timing.sleep,
-    ...createSkillStager({paths, helperId, verifier}),
+  return new RunnerCore({...options, helperId, data: paths.data, now: timing.now, sleep: timing.sleep,
+    ...createSkillStager({paths, helperId, verifier, timing}),
     startCheck: context => startTokenCheck(context, timing),
     deliver: context => postResult(context, timing)});
 }
@@ -35,6 +37,7 @@ type RunsRuntimeOptions = {
   paths: HelperPaths; helperId: string; api: ApiClient; secrets: SecretStore; state: StateStore;
   endpoint: URL; env?: NodeJS.ProcessEnv; request?: typeof fetch; timing?: Timing; verifier?: BuildVerifier;
   registry?: AdapterRegistry; matrix?: ToolMatrix; processes?: RunnerOptions['processes']; notify?: NotifyOptions;
+  acceptanceVerifier?: RunnerAcceptanceVerifier;
 };
 
 /** Local service composition. Card contents and local folder paths never enter its protocol bodies. */
@@ -56,10 +59,10 @@ export class RunsRuntime {
     this.timing = options.timing ?? clock;
     this.catalogPath = join(options.paths.data, 'runner', 'agents-catalog.json');
     this.keys = new DeviceKeyStore({paths: options.paths, secrets: options.secrets, helperId: options.helperId, api: options.api});
-    this.activation = new RunsOnController({paths: options.paths, keys: this.keys, now: this.timing.now, sleep: this.timing.sleep,
-      connection: id => this.testConnection(id), protocol: key => this.protocol(key),
-      test: (connection, testOptions) => runToolTest({connection, ...testOptions, registry: this.registry,
-        matrix: options.matrix, processes: options.processes, now: this.timing.now, data: options.paths.data})});
+    this.activation = new RunsOnController({paths: options.paths, helperId: options.helperId, keys: this.keys, matrix: options.matrix, now: this.timing.now, sleep: this.timing.sleep,
+      connection: id => this.testConnection(id), localAgents: this.local, protocol: (key, aiToolId) => this.protocol(key, aiToolId),
+      test: (connection, testOptions) => this.core.withToolContext(() => runToolTest({connection, ...testOptions, registry: this.registry,
+        matrix: options.matrix, processes: options.processes, now: this.timing.now, data: options.paths.data}))});
     this.core = createComposedRunner({paths: options.paths, helperId: options.helperId, verifier: options.verifier, timing: this.timing,
       matrix: options.matrix, processes: options.processes, registry: this.registry,
       connections: () => this.connections(), localAgents: () => this.local.ready(),
@@ -75,11 +78,13 @@ export class RunsRuntime {
     // CLI diagnostics may start after service startup, then lose their owning process.
     // Revisit recovery on the service tick; a cooperating live test keeps its lease.
     this.nextRecovery = this.timing.now() + 60_000;
-    const recovered = await recoverTestRuns({data: this.options.paths.data, processes: this.options.processes, skipBusy: true});
+    const recovered = await this.core.withToolContext(() => recoverTestRuns({data: this.options.paths.data, processes: this.options.processes, skipBusy: true}));
     if (!recovered) this.nextRecovery = 0;
   }
-  private protocol(key: RunnerDeviceKey): RunnerProtocolClient {
-    return new RunnerProtocolClient({endpoint: this.options.endpoint, deviceKey: key, now: this.timing.now,
+  private protocol(key: RunnerDeviceKey, aiToolId: string): RunnerProtocolClient {
+    return new RunnerProtocolClient({endpoint: this.options.endpoint, helperId: this.options.helperId, aiToolId,
+      deviceKey: key, now: this.timing.now,
+      acceptanceVerifier: this.options.acceptanceVerifier,
       env: this.options.env, fetcher: this.options.request, maddots: {env: this.options.env, fetcher: this.options.request},
       token: async () => {
         const value = await this.options.secrets.get('skills-token');
@@ -89,7 +94,8 @@ export class RunsRuntime {
   }
   private async testConnection(aiToolId: string): Promise<RunTestConnection | undefined> {
     const state = await this.options.state.read();
-    if (state.status !== 'connected' || state.helperId !== this.options.helperId || state.tokenStorage !== 'keychain') return;
+    if (state.status !== 'connected' || state.helperId !== this.options.helperId ||
+      !credentialCapabilities(state.tokenStorage, this.options.paths.platform ?? this.options.secrets.platform).runClaims) return;
     const connection = state.connections?.find(item => item.id === aiToolId && item.variant === 'cli');
     const tool = connection && state.tools.find(item => item.tool === connection.tool && item.variant === 'cli');
     if (!connection || !tool?.path || !tool.realpath || !this.registry.get(connection.tool)) return;
@@ -97,17 +103,20 @@ export class RunsRuntime {
   }
   async connections(): Promise<RunnerConnection[]> {
     const state = await this.options.state.read();
-    if (state.status !== 'connected' || state.helperId !== this.options.helperId || state.tokenStorage !== 'keychain') return [];
+    if (state.status !== 'connected' || state.helperId !== this.options.helperId ||
+      !credentialCapabilities(state.tokenStorage, this.options.paths.platform ?? this.options.secrets.platform).runClaims) return [];
     const result: RunnerConnection[] = [];
-    const activations = await this.activation.snapshot();
     for (const item of state.connections ?? []) {
-      const activation = activations.find(row => row.aiToolId === item.id);
-      if (activation && activation.state !== 'on') continue;
       const tool = await this.testConnection(item.id);
       if (!tool) continue;
       const key = await this.keys.get(item.id);
       if (!key) continue;
-      const protocol = this.protocol(key);
+      // A concurrent bootstrap saves its wait before registering this key.
+      // Read activation after the key so a stale snapshot cannot expose it.
+      const activation = (await this.activation.snapshot()).find(row => row.aiToolId === item.id);
+      // Queued activation jobs can still hold a pre-bootstrap snapshot.
+      if (activation ? activation.state !== 'on' : this.activation.busy) continue;
+      const protocol = this.protocol(key, item.id);
       result.push({...tool, deviceKeyId: key.deviceKeyId, runsOn: true, protocol: {
         claim: body => protocol.claim(body), outcome: (id, body) => protocol.outcome(id, body),
         heartbeat: async body => {
@@ -127,7 +136,7 @@ export class RunsRuntime {
       const rows = (await this.catalog().catch(() => [])).filter(agent => agent.aiToolId !== aiToolId && !currentIds.has(agent.agentId));
       rows.push(...heartbeat.agents.map(agent => ({...agent, aiToolId, claimable: heartbeat.claimable.some(run => run.agentId === agent.agentId)})));
       await ensurePrivateDirectory(join(this.options.paths.data, 'runner'));
-      await atomicWrite(this.catalogPath, JSON.stringify(rows) + '\n');
+      await atomicWrite(this.catalogPath, JSON.stringify(rows) + '\n', {namedTemporary: process.platform === 'linux'});
     }, {now: this.timing.now, sleep: async () => {
       // The next heartbeat can refresh this disposable cache; never wait behind an import.
       throw new HelperError('HELPER_BUSY', 'The agent catalog update will retry on the next heartbeat.');
@@ -146,6 +155,36 @@ export class RunsRuntime {
       throw new HelperError('AGENT_STATE_INVALID', 'The local agent catalog is invalid. Wait for the next heartbeat.');
     }
   }
+  private async setupCatalog(): Promise<CatalogAgent[]> {
+    const state = await this.options.state.read(), connections = state.connections ?? [];
+    const connected = new Set(connections.map(connection => connection.id));
+    let catalog = (await this.catalog()).filter(agent => connected.has(agent.aiToolId));
+    if ((this.options.paths.platform ?? process.platform) !== 'linux') return catalog;
+    const activations = await this.activation.snapshot();
+    let refused: unknown;
+    for (const connection of connections) {
+      const definition = (this.options.matrix ?? TOOL_MATRIX).tools.find(tool => tool.key === connection.tool);
+      if (connection.variant !== 'cli' || !isLinuxAcceptanceCandidate(definition) || toolRunCapability(definition, 'linux')?.offered !== false) continue;
+      if (activations.some(row => row.aiToolId === connection.id && row.state === 'on')) continue;
+      // Pre-enable metadata is fetched afresh. A saved heartbeat catalog cannot
+      // substitute for the currently open acceptance scope.
+      catalog = catalog.filter(agent => agent.aiToolId !== connection.id);
+      const available = await this.testConnection(connection.id);
+      if (!available) continue;
+      try {
+        const agents = await this.activation.agentDefinitions(connection.id);
+        catalog.push(...agents.map(agent => ({...agent, aiToolId: connection.id, status: 'active' as const, maxRunMinutes: 5, skills: [], claimable: false})));
+      } catch (error) {
+        // Only the named connection can bootstrap. Other connected Linux tools
+        // must not prevent setup of that scoped agent.
+        if (!(error instanceof ApiError && [401, 403, 409].includes(error.status)) &&
+          !(error instanceof HelperError && error.code === 'RUNS_NOT_TESTING')) throw error;
+        refused ??= error;
+      }
+    }
+    if (!catalog.length && refused) throw refused;
+    return catalog;
+  }
   async notifySetup(): Promise<void> {
     if (this.dialog || this.dialogStop.signal.aborted) return;
     const locals = await this.local.read(), connections = await this.connections();
@@ -162,7 +201,8 @@ export class RunsRuntime {
       }
       if (needs) waiting.push({agentId: agent.agentId});
     }
-    const options = {...this.options.notify, timing: this.timing, env: this.options.env, signal: this.dialogStop.signal};
+    const options = {platform: this.options.paths.platform, ...this.options.notify,
+      timing: this.timing, env: this.options.env, signal: this.dialogStop.signal};
     const pending = await withWriteLock(this.options.paths, () => reserveAgentSetupDialog(this.options.paths, waiting, options), this.timing);
     if (typeof pending !== 'string') this.dialog = showAgentSetupDialog(pending, options).then(() => {}, () => {}).finally(() => {this.dialog = undefined;});
   }
@@ -191,11 +231,11 @@ export class RunsRuntime {
     }
     if (argv[0] !== 'agent' || !['setup', 'access'].includes(argv[1]) || argv.some(value => value.startsWith('--'))) throw new HelperError('USAGE', 'Use maddots-ai agent setup [handle|agent-id] or agent access <handle|agent-id> folder-only|full.');
     if (!io.isTTY && (argv[1] === 'setup' || argv[3] === 'full')) throw new HelperError('AGENT_TTY_REQUIRED', 'Agent setup requires an interactive terminal on this computer.');
+    if (argv[1] === 'setup' && argv.length > 3 || argv[1] === 'access' && (argv.length !== 4 || !['folder-only', 'full'].includes(argv[3]))) throw new HelperError('USAGE', 'Use agent setup [handle|agent-id] or agent access <handle|agent-id> folder-only|full.');
     const connected = new Set(((await this.options.state.read()).connections ?? []).map(connection => connection.id));
-    const catalog = (await this.catalog()).filter(agent => connected.has(agent.aiToolId));
+    const catalog = argv[1] === 'setup' ? await this.setupCatalog() : (await this.catalog()).filter(agent => connected.has(agent.aiToolId));
     const selected = catalog.filter(agent => (!argv[2] || agent.agentId === argv[2] || agent.handle === argv[2].replace(/^@/, '')) && agent.status === 'active');
     if (!selected.length) throw new HelperError('AGENT_NOT_FOUND', 'No matching agent has been received. Wait for the helper heartbeat.');
-    if (argv[1] === 'setup' && argv.length > 3 || argv[1] === 'access' && (argv.length !== 4 || !['folder-only', 'full'].includes(argv[3]))) throw new HelperError('USAGE', 'Use agent setup [handle|agent-id] or agent access <handle|agent-id> folder-only|full.');
     for (const agent of selected) {
       const connection = await this.testConnection(agent.aiToolId), adapter = connection && this.registry.get(connection.tool);
       if (!connection || !adapter) throw new HelperError('tool_not_found', 'The agent tool is unavailable on this computer.');

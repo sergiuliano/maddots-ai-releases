@@ -3,11 +3,9 @@ import { HelperError, clock, type Timing } from './config.js';
 import type { DetectedTool } from './detect.js';
 
 /** Protocol OS names; kept local to the reviewed helper package. */
-export type PairingOS = 'macos' | 'linux' | 'windows';
-export function helperOs(platform: string = process.platform): PairingOS {
-  return platform === 'darwin' ? 'macos' : platform === 'win32' ? 'windows' : 'linux';
-}
-export type PairingReport = { helperVersion: string; computerName: string; os: PairingOS; tools: DetectedTool[] };
+export { helperOs } from './platform.js';
+export type PairingOS = 'macos' | 'linux';
+export type PairingReport = { helperVersion: string; computerName: string; os: PairingOS; tools: DetectedTool[]; credentialStorage?: {version: 1; backend: 'keychain' | 'file' | 'secret-service'} };
 export type PendingPairing = { status: 'pending'; userCode: string; connectUrl: string; expiresAt: string; expiresIn: number };
 export type Connection = { id: string; tool: string; variant: string };
 export type PairingCredential = {

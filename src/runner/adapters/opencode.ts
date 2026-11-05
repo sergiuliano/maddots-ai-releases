@@ -1,12 +1,12 @@
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import {guardToolRunner, runToolCommand} from '../../tool-command.js';
+import {assertLinuxToolClosure, linuxToolClosure} from '../../linux-tool-closures.js';
+import { lstatSync, statSync } from 'node:fs';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
-import { promisify } from 'node:util';
-import type { Adapter, ParsedResult, RunSpec } from '../adapter.js';
+import { executeAdapterProbe, type Adapter, type ParsedResult, type RunSpec } from '../adapter.js';
+import {LINUX_LOCAL_PROVIDER_MODEL, LINUX_LOCAL_PROVIDER_URL, linuxLocalProviderSelection} from '../linux-local-provider.js';
 
-const exec = promisify(execFile);
 const providerID = /^[a-z][a-z0-9_-]{0,63}$/u;
 const modelID = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$/u;
 const variantID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
@@ -16,6 +16,12 @@ type Row = Record<string, unknown> & { type: string };
 type Part = Record<string, unknown> & { type: string; messageID: string; id: string; sessionID: string };
 
 export interface OpenCodeOptions {
+  runner?: typeof runToolCommand;
+  platform?: NodeJS.Platform;
+  /** Metadata-only hooks. No configuration or authentication contents are read. */
+  pathPresent?: (path: string) => boolean;
+  home?: () => string;
+  username?: () => string;
   /** Reserved trusted settings. Custom/hosted providers stay sync only until the core has their secret path. */
   providers?: Record<string, { baseURL: string }>;
 }
@@ -35,15 +41,29 @@ export function openCodeManagedPaths(platform: NodeJS.Platform, username: string
   ] : [])];
 }
 
-function managedConfigPresent(): boolean {
-  try { return openCodeManagedPaths(process.platform, userInfo().username, process.env.ProgramData).some(path => existsSync(path)); }
-  catch { return true; }
-}
-
-function personalConfigPresent(): boolean {
-  // Pinned v1 always enumerates ~/.opencode, including dependency setup, even
-  // when project discovery and external plugins are disabled. Do not read it.
-  return existsSync(join(process.env.HOME ?? homedir(), '.opencode'));
+function pathPresent(path: string): boolean {
+  try { lstatSync(path); return true; }
+  catch (error) {
+    // Unlike existsSync, preserve errors and detect dangling config symlinks.
+    // Inaccessible or malformed paths cannot establish isolation.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    // ENOENT can also hide an unreachable parent symlink. Walk metadata only
+    // until an existing directory proves this is an ordinary absent config.
+    let parent = dirname(path);
+    while (true) {
+      let info;
+      try { info = lstatSync(parent); }
+      catch (parentError) {
+        const next = dirname(parent);
+        if ((parentError as NodeJS.ErrnoException).code !== 'ENOENT' || next === parent) throw parentError;
+        parent = next;
+        continue;
+      }
+      // stat on an existing symlink must succeed, including intermediate links.
+      if (!(info.isSymbolicLink() ? statSync(parent) : info).isDirectory()) throw new Error('Invalid OpenCode configuration parent.');
+      return false;
+    }
+  }
 }
 
 function selection(input: Pick<RunSpec, 'provider' | 'model'>): { provider: string; model: string } | null {
@@ -151,6 +171,26 @@ function endpoint(value: unknown): string {
 }
 
 export function createOpenCodeAdapter(options: OpenCodeOptions = {}): Adapter {
+  const platform = options.platform ?? process.platform;
+  const exec = guardToolRunner('opencode', options.runner ?? runToolCommand, {platform});
+  const present = options.pathPresent ?? pathPresent;
+  const personalHome = options.home ?? (() => process.env.HOME ?? homedir());
+  const username = options.username ?? (() => userInfo().username);
+  const isolation = (): { ok: boolean; reason: string | null } => {
+    if (platform !== 'darwin' && platform !== 'linux') return { ok: false, reason: 'OpenCode runs require macOS or Linux.' };
+    try {
+      const home = personalHome();
+      if (!isAbsolute(home)) return { ok: false, reason: 'OpenCode HOME must be an absolute path to verify configuration isolation.' };
+      if (openCodeManagedPaths(platform, username(), process.env.ProgramData).some(path => present(path))) return { ok: false,
+        reason: 'Managed OpenCode configuration can override run isolation; this adapter refuses to bypass it.' };
+      // Pinned v1 enumerates ~/.opencode even with isolated XDG and --pure.
+      // Metadata alone is enough to refuse it, including a dangling symlink.
+      if (present(join(home, '.opencode'))) return { ok: false,
+        reason: 'Sync only: OpenCode still loads the personal ~/.opencode directory with isolated XDG configuration; no supported switch excludes it while preserving HOME and sign-in.' };
+      return { ok: true, reason: null };
+    } catch { return { ok: false, reason: 'OpenCode configuration isolation could not be verified from filesystem metadata.' }; }
+  };
+
   const providers = new Map<string, string>([['ollama', 'http://127.0.0.1:11434/v1'], ['lmstudio', 'http://127.0.0.1:1234/v1'],
     ['openrouter', 'https://openrouter.ai/api/v1']]);
   for (const [id, value] of Object.entries(options.providers ?? {})) {
@@ -161,24 +201,25 @@ export function createOpenCodeAdapter(options: OpenCodeOptions = {}): Adapter {
     info: { tool: 'opencode', harness: 'opencode', card: 'TLS-28', folderOnly: 'none', mcpLevel: 'servers-off',
       skillsDir: '{runDir}/skills', promptVia: 'stdin', runHome: false },
 
-    async identity(bin) {
+    async identity(bin, operation) {
       let home: string | undefined;
       try {
-        if (!isAbsolute(bin) || !/^opencode(?:\.exe)?$/u.test(basename(bin)) || managedConfigPresent() || personalConfigPresent()) return { ok: false, version: null };
+        if (!isAbsolute(bin) || !/^opencode(?:\.exe)?$/u.test(basename(bin)) || !isolation().ok) return { ok: false, version: null };
         const resolved = await realpath(bin);
         if (!/^opencode(?:\.exe)?$/u.test(basename(resolved))) return { ok: false, version: null };
+        if (platform === 'linux') await assertLinuxToolClosure('opencode', bin);
         home = await mkdtemp(join(tmpdir(), 'mdai-opencode-identity-'));
-        const options = { cwd: home, timeout: 10_000, maxBuffer: 16 * 1024, encoding: 'utf8' as const, shell: false as const,
-          env: { HOME: process.env.HOME ?? homedir(), XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share'),
+        const options = { platform, cwd: home, timeout: 10_000, maxBuffer: 16 * 1024, encoding: 'utf8' as const, shell: false as const,
+          env: { HOME: personalHome(), XDG_CONFIG_HOME: join(home, '.config'), XDG_DATA_HOME: join(home, '.local/share'),
             XDG_CACHE_HOME: join(home, '.cache'), XDG_STATE_HOME: join(home, '.local/state'),
             PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, TERM: 'dumb', NO_COLOR: '1', OPENCODE_DISABLE_AUTOUPDATE: '1',
             OPENCODE_DISABLE_PROJECT_CONFIG: '1', OPENCODE_DISABLE_DEFAULT_PLUGINS: '1', OPENCODE_PURE: '1' } };
-        const { stdout, stderr } = await exec(resolved, ['--version'], options);
+        const { stdout, stderr } = await executeAdapterProbe(exec, 'opencode.version', resolved, operation, options);
         // v2 has a different config contract. A major upgrade needs acceptance.
         const match = /^(1\.\d+\.\d+)$/u.exec(stdout.trim());
-        if (!match || stderr.trim()) return { ok: false, version: null };
+        if (!match || stderr.trim() || (platform === 'linux' && match[1] !== linuxToolClosure('opencode')!.version)) return { ok: false, version: null };
         // The version is bare, so also verify the expected harness and controls.
-        const help = await exec(resolved, ['run', '--help'], options);
+        const help = await executeAdapterProbe(exec, 'opencode.run-help', resolved, operation, options);
         const helpText = help.stdout || help.stderr;
         return /^opencode run \[message\.\.\]/mu.test(helpText) &&
           ['--pure', '--format', '--auto', '--dir', '--variant'].every(flag => helpText.includes(flag))
@@ -187,16 +228,22 @@ export function createOpenCodeAdapter(options: OpenCodeOptions = {}): Adapter {
       finally { if (home) await rm(home, { recursive: true, force: true }); }
     },
 
+    async preflight(input) {
+      if (input?.operation?.signal?.aborted || (input?.operation?.deadline !== undefined &&
+          (!Number.isFinite(input.operation.deadline) || Date.now() >= input.operation.deadline))) return {ok: false, reason: 'OpenCode prerequisite operation was cancelled or expired.'};
+      return isolation();
+    },
+
     supports(input) {
       if (input.access !== 'full_access') return { ok: false, reason: 'OpenCode Folder only is unavailable: shell and file confinement and the R-02 no-shell decision have not been accepted.' };
       const selected = selection(input);
       if (!selected) return { ok: false, reason: 'Select an explicit Ollama or LM Studio provider and model.' };
       if (!['ollama', 'lmstudio'].includes(selected.provider)) return { ok: false,
         reason: 'Sync only: hosted and custom OpenCode providers have no supported core secret path. Isolated XDG configuration is accepted only for local Ollama and LM Studio without sign-in.' };
+      if (platform === 'linux' && !linuxLocalProviderSelection({tool: 'opencode', provider: selected.provider, model: selected.model})) return {ok: false,
+        reason: `Linux OpenCode requires the immutable Ollama policy model ${LINUX_LOCAL_PROVIDER_MODEL}.`};
       if (input.effort !== null && (typeof input.effort !== 'string' || !variantID.test(input.effort))) return { ok: false, reason: 'Invalid OpenCode reasoning variant.' };
-      if (managedConfigPresent()) return { ok: false, reason: 'Managed OpenCode configuration can override run isolation; this adapter refuses to bypass it.' };
-      if (personalConfigPresent()) return { ok: false, reason: 'Sync only: OpenCode still loads the personal ~/.opencode directory with isolated XDG configuration; no supported switch excludes it while preserving HOME and sign-in.' };
-      return { ok: true, reason: null };
+      return isolation();
     },
 
     build(spec) {
@@ -207,7 +254,7 @@ export function createOpenCodeAdapter(options: OpenCodeOptions = {}): Adapter {
       const permission = { '*': 'deny', read: 'allow', glob: 'allow', grep: 'allow', list: 'allow', edit: 'allow',
         bash: 'allow', skill: 'allow', todowrite: 'allow', todoread: 'allow', external_directory: 'allow',
         task: 'deny', question: 'deny', webfetch: 'deny', websearch: 'deny', codesearch: 'deny', 'mcp*': 'deny', 'browser*': 'deny' };
-      const baseURL = providers.get(selected.provider);
+      const baseURL = platform === 'linux' ? LINUX_LOCAL_PROVIDER_URL : providers.get(selected.provider);
       const overlay = {
         $schema: 'https://opencode.ai/config.json', model, small_model: model, enabled_providers: [selected.provider],
         autoupdate: false, share: 'disabled', snapshot: false, plugin: [], mcp: {}, formatter: false, lsp: false,

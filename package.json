@@ -1,9 +1,9 @@
 {
   "name": "maddots-ai",
-  "version": "0.1.5",
+  "version": "0.1.6-linux.s5.7.1",
   "private": true,
   "license": "MIT",
-  "description": "MacOS helper for connecting AI tools to MadDots AI",
+  "description": "macOS and Linux helper for connecting AI tools to MadDots AI",
   "type": "module",
   "engines": {
     "node": "^22.22.2 || ^24.15.0"
@@ -19,7 +19,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node --input-type=module -e \"import {cpSync} from 'node:fs'; for (const name of ['tool-matrix.json', 'runner-contract.json']) cpSync('src/shared/' + name, 'dist/shared/' + name);\"",
-    "test": "tsx --test test/*.test.ts",
+    "test": "tsx --import ./test/support/runner-signal-runtime-guard.ts --test --test-concurrency=2 test/*.test.ts",
     "pack:check": "npm run build && node scripts/check-package.mjs"
   },
   "repository": {

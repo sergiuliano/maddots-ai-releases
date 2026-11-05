@@ -49,7 +49,7 @@ async function fixture(t: {after(fn: () => Promise<void>): void}, readPath: stri
     }
     return {stdout: '', stderr: ''};
   };
-  const plugin = new ClaudePluginDeliveryTarget({paths, helperId: 'helper-claude-local', matrix, runner, claudePath: binary,
+  const plugin = new ClaudePluginDeliveryTarget({paths, helperId: 'helper-claude-local', matrix, runner, claudePath: binary, platform: 'darwin',
     workspaceSlugs: {workspaceA: 'alpha'}});
   const signer = generateKeyPairSync('ed25519');
   const publicKey = signer.publicKey.export({type: 'spki', format: 'der'}).subarray(-32);

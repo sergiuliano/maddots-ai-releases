@@ -16,6 +16,7 @@ import { createSkillStager } from '../src/runner/stage-skills.js';
 import type { RunnerClaim, RunnerSkill } from '../src/runner/protocol-client.js';
 import type { RunnerConnection } from '../src/runner/runner.js';
 import { BuildVerifier, signedBuildString, type SignedBuild } from '../src/verify.js';
+import {createGitDirectory} from './git-fixture.js';
 
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'mdai-run-stage-'));
@@ -64,21 +65,24 @@ async function fixture(t: TestContext) {
   const skill = (build: SignedBuild): RunnerSkill & {digest: string} => ({skillId: build.skillId, name: build.name,
     version: build.version, settingsRevision: build.settingsRevision, digest: build.digest, hasCode: build.hasCode});
   let number = 0;
-  async function context(builds: SignedBuild[], local = false) {
+  async function context(builds: SignedBuild[], local = false, pin = true) {
     const runId = `stage-${++number}`;
     const folder = await createRunFolder({cwd, dataDir: paths.data, runId});
     t.after(() => folder.release());
     const claim: RunnerClaim = {runId, agentId, cardId: 'card-stage', boardId: 'board-stage', commentId: null,
       expiresAt: new Date(Date.now() + 60_000).toISOString(), kind: 'assignment', model: 'model', provider: null,
       effort: null, maxRunMinutes: 1, skills: builds.map(skill)};
-    return {claim, folder, skillsDir: local ? join(folder.runDir, 'skills') : join(cwd, '.agents', 'skills'), connection,
+    const runConnection = builds[0]?.target === 'claude-plugin' ? {...connection, tool: 'claude-code'} : connection;
+    if (pin) await stager.claimSkills(runConnection, async () => ({claim}));
+    t.after(() => stager.releaseSkills(runId));
+    return {claim, folder, skillsDir: local ? join(folder.runDir, 'skills') : join(cwd, '.agents', 'skills'), connection: runConnection,
       signal: new AbortController().signal};
   }
   return {root, cwd, paths, agentId, connection, stager, locks, build, accept, cache, skill, context};
 }
 
 test('TLS-25 stages only exact claimed accepted agent builds and backs up project copies with exclusion cleanup', async t => {
-  const f = await fixture(t); await mkdir(join(f.cwd, '.git', 'info'), {recursive: true});
+  const f = await fixture(t); await createGitDirectory(join(f.cwd, '.git')); await mkdir(join(f.cwd, '.git', 'info'), {recursive: true});
   await writeFile(join(f.cwd, '.git', 'info', 'exclude'), '# keep\n');
   const first = f.build(), other = f.build({skillId: 'other-skill', name: 'other'});
   await f.accept(first); await f.accept(other);
@@ -111,6 +115,54 @@ test('TLS-25 readiness pins skill, agent, target, version and settings even with
   assert.equal(await f.stager.verifiedBuild(first.digest, f.skill(first), {...f.connection, tool: 'claude-code'}, f.agentId), false);
   assert.equal(await f.stager.verifiedBuild('a'.repeat(64), f.skill(first), f.connection, f.agentId), false);
   assert.equal(await f.stager.skillDescription(f.skill(first), f.connection, f.agentId), 'A verified run skill');
+});
+
+test('claimed acceptance survives newer signed metadata with the same digest and ends with the run', async t => {
+  const f = await fixture(t), first = f.build({}, true), next = f.build({version: 2, settingsRevision: 1}, true);
+  assert.equal(first.digest, next.digest); assert.notEqual(first.signature, next.signature);
+  await f.accept(first, true);
+  const context = await f.context([first], true), runId = context.claim.runId;
+  await f.accept(next, true);
+  assert.equal(await f.stager.allowedBuild(f.skill(first), f.connection, f.agentId), false);
+  assert.equal(await f.stager.allowedBuild(f.skill(first), f.connection, f.agentId, runId), true);
+  assert.equal(await f.stager.allowedBuild(f.skill(next), f.connection, f.agentId, runId), false);
+  assert.equal(await f.stager.allowedBuild(f.skill(first), f.connection, 'another-agent', runId), false);
+  assert.equal(await f.stager.allowedBuild(f.skill(first), {...f.connection, aiToolId: 'another-tool'}, f.agentId, runId), false);
+  assert.equal(await f.stager.allowedBuild(f.skill(first), {...f.connection, tool: 'claude-code'}, f.agentId, runId), false);
+  assert.equal(await f.stager.allowedBuild(f.skill(first), f.connection, f.agentId, 'another-run'), false);
+  await f.stager.stageSkills(context);
+  assert.equal(await readFile(join(context.skillsDir, first.name, 'scripts/run.sh'), 'utf8'), '#!/bin/sh\nprintf accepted\n');
+  f.stager.releaseSkills(runId);
+  assert.equal(await f.stager.allowedBuild(f.skill(first), f.connection, f.agentId, runId), false);
+  assert.equal(await f.stager.allowedBuild(f.skill(next), f.connection, f.agentId), true);
+});
+
+test('claimed builds recheck bytes, signed metadata, revocation, removal and exact code consent after an update', async t => {
+  for (const cause of ['missing', 'tampered', 'wrong-envelope', 'revoked', 'removed', 'unaccepted', 'not-allowed']) {
+    const f = await fixture(t), first = f.build({}, true), next = f.build({version: 2}, true);
+    await f.accept(first, cause !== 'not-allowed');
+    const context = await f.context([first], true);
+    await f.accept(next, true);
+    if (cause === 'missing') await unlink(f.cache(first));
+    if (cause === 'tampered') await atomicWrite(f.cache(first), JSON.stringify({...first, files: []}));
+    if (cause === 'wrong-envelope') await atomicWrite(f.cache(first), JSON.stringify(next));
+    if (cause === 'revoked') await atomicWrite(join(f.paths.data, 'sync-meta.json'), JSON.stringify({revoked: [{skillId: first.skillId, digest: first.digest}]}));
+    if (cause === 'removed' || cause === 'unaccepted') {
+      const lock = await f.locks.read();
+      lock.entries = cause === 'removed' ? lock.entries.map(entry => ({...entry, removed: true})) : [];
+      await f.locks.write(lock);
+    }
+    assert.equal(await f.stager.allowedBuild(f.skill(first), f.connection, f.agentId, context.claim.runId), false, cause);
+    await assert.rejects(f.stager.stageSkills(context), {code: 'skills_not_ready'}, cause);
+    await assert.rejects(lstat(join(context.skillsDir, first.name)), {code: 'ENOENT'});
+  }
+});
+
+test('staging cannot substitute the current acceptance for a claim without a retained build', async t => {
+  const f = await fixture(t), build = f.build(); await f.accept(build);
+  const context = await f.context([build], true, false);
+  await assert.rejects(f.stager.stageSkills(context), {code: 'skills_not_ready'});
+  await assert.rejects(lstat(join(context.skillsDir, build.name)), {code: 'ENOENT'});
 });
 
 for (const [label, field, expected] of [

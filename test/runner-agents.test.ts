@@ -1,34 +1,45 @@
 import assert from 'node:assert/strict';
 import * as fsp from 'node:fs/promises';
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { TOOL_MATRIX } from '../src/shared/tool-matrix.js';
+import { LINUX_FOLDER_ONLY_REASON } from '../src/shared/tool-capabilities.js';
+import {enforceAdapter} from '../src/runner/process.js';
 import { createPaths, ensurePaths, withWriteLock } from '../src/paths.js';
 import type { Adapter } from '../src/runner/adapter.js';
 import { AGENT_DIALOG_INTERVAL_MS, FULL_ACCESS_WARNING, LocalAgents, reserveAgentSetupDialog, showAgentSetupDialog, validateAgentFolder,
   type AgentSetupOptions } from '../src/runner/agents-local.js';
 import type { StartToolOptions } from '../src/runner/process.js';
 import { readConfig } from '../src/config.js';
+import {initializeCleanRunnerJournal} from './support/runner-journal-fixture.js';
 
 const agent = {agentId: '11111111-1111-4111-8111-111111111111', aiToolId: '22222222-2222-4222-8222-222222222222', handle: 'assistant'};
 const anotherAgent = {agentId: '33333333-3333-4333-8333-333333333333'};
+// Generic local-state tests need an accepted adapter with both access modes.
+// The real Linux Codex/Claude policy is covered separately below.
+function fixtureMatrix() {
+  const matrix = structuredClone(TOOL_MATRIX), tool = matrix.tools.find(tool => tool.key === 'codex')!;
+  tool.key = 'fixture-agent'; tool.run!.adapter = 'fixture-agent';
+  Object.assign(tool.run!, {offered: true, platforms: {darwin: {accepted: true}, linux: {accepted: true}}, folderOnly: 'os-sandbox'});
+  return matrix;
+}
 const adapter: Adapter = {
-  info: {tool: 'codex', harness: 'codex', card: 'TLS-26', folderOnly: 'os-sandbox', mcpLevel: 'servers-off', skillsDir: '{cwd}/.agents/skills', promptVia: 'stdin', runHome: false},
+  info: {tool: 'fixture-agent', harness: 'fixture_agent', card: 'TLS-26', folderOnly: 'os-sandbox', mcpLevel: 'servers-off', skillsDir: '{cwd}/.agents/skills', promptVia: 'stdin', runHome: false},
   identity: async () => ({ok: true, version: '1.0'}), supports: () => ({ok: true, reason: null}),
   build: () => {throw new Error('The setup wrapper must replace the run invocation.');},
   parse: () => ({ok: true, text: '', failureCode: null}),
 };
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, initialized = true) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'runner-agents-'))), home = join(root, 'home');
   await mkdir(home, {mode: 0o700});
-  const paths = await createPaths(readConfig({MADDOTS_AI_HOME: join(home, '.helper-data')}, home)); await ensurePaths(paths);
+  const paths = await createPaths(readConfig({MADDOTS_AI_HOME: join(home, '.helper-data')}, home, 'darwin')); await ensurePaths(paths);
+  if (initialized) await initializeCleanRunnerJournal(paths.data);
   t.after(() => rm(root, {recursive: true, force: true}));
   const output: string[] = [], questions: string[] = [];
-  const matrix = structuredClone(TOOL_MATRIX);
-  Object.assign(matrix.tools.find(tool => tool.key === 'codex')!.run!, {offered: true, folderOnly: 'os-sandbox'});
+  const matrix = fixtureMatrix();
   const options = (answers: string[], changes: Partial<AgentSetupOptions> = {}): AgentSetupOptions => ({
     isTTY: true, prompt: async question => {questions.push(question); assert.ok(answers.length, 'Unexpected prompt: ' + question); return answers.shift()!;},
     output: line => output.push(line), now: () => 1234, adapter, bin: '/usr/bin/true', model: 'gpt-5', matrix, ...changes,
@@ -46,6 +57,18 @@ test('setup creates the private default folder and writes a private atomic local
   assert.deepEqual(JSON.parse(await readFile(f.agents.file, 'utf8')), {[agent.agentId]: row});
   assert.deepEqual(await f.agents.ready(), [{agentId: agent.agentId, aiToolId: agent.aiToolId, cwd: row.folder, access: 'folder_only'}]);
   assert.equal('folder' in (await f.agents.ready())[0], false, 'Heartbeat-facing identity contains no folder field.');
+});
+
+test('setup admission refuses before creating the default working folder', async t => {
+  const f = await fixture(t), retained = join(f.root, 'retained-guard');
+  await writeFile(retained, 'retained guard evidence', {mode: 0o600});
+  await symlink(retained, f.paths.lock + '.guard');
+  const before = await lstat(retained);
+  await assert.rejects(f.agents.setup(agent, f.options([''])), {code: 'PATH_UNSAFE'});
+  await assert.rejects(lstat(join(f.home, 'MadDots Agents')), {code: 'ENOENT'});
+  await assert.rejects(lstat(f.agents.file), {code: 'ENOENT'});
+  assert.equal(await readFile(retained, 'utf8'), 'retained guard evidence');
+  assert.equal((await lstat(retained)).ino, before.ino);
 });
 
 test('typed folders resolve to owned physical folders; unsafe roots and excluded aliases are refused', async t => {
@@ -92,13 +115,75 @@ test('server accessWanted alone cannot raise the local access reported for claim
 });
 
 test('matrix none never silently grants Full access or accepts Folder only', async t => {
-  const f = await fixture(t), matrix = structuredClone(TOOL_MATRIX);
-  matrix.tools.find(tool => tool.key === 'codex')!.run!.folderOnly = 'none';
+  const f = await fixture(t), matrix = fixtureMatrix();
+  matrix.tools.find(tool => tool.key === 'fixture-agent')!.run!.folderOnly = 'none';
   await assert.rejects(f.agents.setup(agent, f.options(['', ''], {matrix})), {code: 'ACCESS_NOT_CONFIRMED'});
   assert.deepEqual(await f.agents.read(), {});
   assert.equal((await f.agents.setup(agent, f.options(['', 'full', 'full'], {matrix}))).access, 'full_access');
   await assert.rejects(f.agents.access(agent, 'folder-only', f.options([], {matrix})), {code: 'ACCESS_UNAVAILABLE'});
   assert.equal((await f.agents.ready())[0].access, 'full_access');
+});
+
+test('agent setup refuses absent and other-platform acceptance before prompting, tool code or folder creation', async t => {
+  const f = await fixture(t), matrix = fixtureMatrix();
+  const run = matrix.tools.find(tool => tool.key === 'fixture-agent')!.run!;
+  run.offered = true;
+  let prompts = 0, identity = 0, preflight = 0, setups = 0;
+  const guarded: Adapter = {...adapter,
+    identity: async () => {identity++; return {ok: true, version: 'fixture'};},
+    preflight: async () => {preflight++; return {ok: true, reason: null};},
+    agentSetup: () => {setups++; return ['/usr/bin/true'];},
+  };
+  const otherPlatform = process.platform === 'linux' ? {darwin: {accepted: true}} : {linux: {accepted: true}};
+  for (const platforms of [undefined, {}, otherPlatform]) {
+    run.platforms = platforms;
+    await assert.rejects(f.agents.setup(agent, f.options([], {matrix, adapter: guarded,
+      prompt: async () => {prompts++; return '';}})), {code: 'AGENT_SETUP_INVALID'});
+    assert.deepEqual(await f.agents.read(), {});
+    await assert.rejects(stat(join(f.home, 'MadDots Agents')), {code: 'ENOENT'});
+  }
+  assert.deepEqual({prompts, identity, preflight, setups}, {prompts: 0, identity: 0, preflight: 0, setups: 0});
+  run.offered = false;
+  run.platforms = {darwin: {accepted: true}, linux: {accepted: true}};
+  assert.equal((await f.agents.setup(agent, f.options(['', ''], {matrix}))).access, 'folder_only');
+});
+
+for (const key of ['codex', 'claude-code']) test(`Linux ${key} setup and access refuse Folder only without silently raising access`, {skip: process.platform !== 'linux'}, async t => {
+  const f = await fixture(t), matrix = structuredClone(TOOL_MATRIX);
+  matrix.tools.find(tool => tool.key === key)!.run!.platforms = {linux: {accepted: true}};
+  const configured = {...adapter, info: {...adapter.info, tool: key}};
+  const changes = {matrix, adapter: configured};
+  for (const answer of ['', 'folder-only']) {
+    await assert.rejects(f.agents.setup(agent, f.options(['', answer], changes)),
+      {code: 'ACCESS_NOT_CONFIRMED', message: LINUX_FOLDER_ONLY_REASON});
+    assert.deepEqual(await f.agents.read(), {});
+  }
+  const row = await f.agents.setup(agent, f.options(['', 'full', 'full'], changes));
+  assert.equal(row.access, 'full_access');
+  await assert.rejects(f.agents.access(agent, 'folder-only', f.options([], changes)),
+    {code: 'ACCESS_UNAVAILABLE', message: LINUX_FOLDER_ONLY_REASON});
+  assert.deepEqual(await f.agents.read(), {[agent.agentId]: row});
+  assert.equal(f.questions.some(question => question.includes('or type folder-only')), false);
+});
+
+test('Linux candidate local definition grants no executable setup or runner permission', {skip: process.platform !== 'linux'}, async t => {
+  const f = await fixture(t);
+  let executable = 0;
+  const candidate: Adapter = {...adapter, info: {...adapter.info, tool: 'codex'},
+    identity: async () => {executable++; return {ok: true, version: 'fixture'};},
+    preflight: async () => {executable++; return {ok: true, reason: null};}};
+  const changes = {matrix: TOOL_MATRIX, adapter: candidate};
+  const row = await f.agents.setup(agent, f.options(['', 'full', 'full'], changes));
+  assert.equal(row.access, 'full_access');
+  await assert.rejects(f.agents.access(agent, 'folder-only', f.options([], changes)), {code: 'ACCESS_UNAVAILABLE'});
+  assert.equal((await enforceAdapter({adapter: candidate, model: 'gpt-5', provider: null, effort: null, access: 'full_access',
+    bin: '/usr/bin/true', recordedRealpath: '/usr/bin/true', matrix: TOOL_MATRIX})).ok, true,
+  'static candidate eligibility never grants executable permission');
+  const setup: Adapter = {...candidate, agentSetup: () => {executable++; return ['/usr/bin/true'];}};
+  await assert.rejects(f.agents.setup({...agent, agentId: anotherAgent.agentId}, f.options(['', 'full', 'full'], {...changes, adapter: setup})),
+    {code: 'AGENT_SETUP_AUTHORIZATION_REQUIRED'});
+  assert.equal((await f.agents.read())[anotherAgent.agentId].setupDone, false);
+  assert.equal(executable, 0);
 });
 
 test('one-time setup displays argv and needs exact yes; core spawn is used once per tool and folder', async t => {
@@ -142,6 +227,17 @@ test('one-time setup completion preserves access lowered while its process was r
   assert.equal((await f.agents.ready())[0].access, 'folder_only');
 });
 
+test('Linux one-time setup refuses uninitialized durable storage before invoking a launcher', {skip: process.platform !== 'linux'}, async t => {
+  const f = await fixture(t, false);
+  await assert.rejects(f.agents.setup(agent, f.options(['', '', 'yes'], {
+    adapter: {...adapter, agentSetup: () => ['/usr/bin/true']},
+    startTool: async () => assert.fail('No durable INTENT or containment backend exists for setup.'),
+  })), {code: 'RUNNER_STATE_UNAVAILABLE'});
+  assert.equal((await f.agents.read())[agent.agentId].setupDone, false);
+  assert.deepEqual(await f.agents.ready(), []);
+  assert.equal((await fsp.readdir(join(f.paths.data, 'runner'))).some(name => name.startsWith('agent-setup-')), false);
+});
+
 test('unsafe state permissions, unknown access fields and replaced working folder are refused', async t => {
   const f = await fixture(t), row = await f.agents.setup(agent, f.options(['', '']));
   await chmod(f.agents.file, 0o644); await assert.rejects(f.agents.read(), {code: 'FILE_UNSAFE'}); await chmod(f.agents.file, 0o600);
@@ -166,7 +262,7 @@ test('setup dialog reserves one prompt per new agent and enforces the four-hour 
   const second = await reserve([agent, anotherAgent]); assert.equal(typeof second, 'object'); if (typeof second === 'string') throw new Error();
   assert.equal(second.count, 2); now += AGENT_DIALOG_INTERVAL_MS; assert.equal(await reserve([agent, anotherAgent]), 'unchanged');
   const calls: {file: string; args: readonly string[]}[] = [];
-  assert.equal(await showAgentSetupDialog(second, {env: {}, runner: async (file, args) => {
+  assert.equal(await showAgentSetupDialog(second, {platform: 'darwin', env: {}, runner: async (file, args) => {
     calls.push({file, args}); return {stdout: file === '/usr/bin/osascript' ? 'button returned:Set up, gave up:false' : '', stderr: ''};
   }}), 'opened');
   assert.ok(calls[0].args[1].includes('2 agents need setup or Allow on this computer'));
@@ -178,10 +274,23 @@ test('Later never opens Terminal; relative launcher paths and symbolic launcher 
   await assert.rejects(reserveAgentSetupDialog(f.paths, [agent], {...options, entrypoint: 'relative'}), {code: 'NOTIFY_INVALID'});
   const dialog = await reserveAgentSetupDialog(f.paths, [agent], options); if (typeof dialog === 'string') throw new Error();
   let calls = 0;
-  assert.equal(await showAgentSetupDialog(dialog, {env: {}, runner: async () => {calls++; return {stdout: 'button returned:Later, gave up:false', stderr: ''};}}), 'later');
+  assert.equal(await showAgentSetupDialog(dialog, {platform: 'darwin', env: {}, runner: async () => {calls++; return {stdout: 'button returned:Later, gave up:false', stderr: ''};}}), 'later');
   assert.equal(calls, 1);
   await rm(dialog.command); await symlink(join(f.home, 'other'), dialog.command);
-  await assert.rejects(showAgentSetupDialog(dialog, {env: {}, runner: async () => ({stdout: 'button returned:Set up, gave up:false', stderr: ''})}), {code: 'PATH_UNSAFE'});
+  await assert.rejects(showAgentSetupDialog(dialog, {platform: 'darwin', env: {}, runner: async () => ({stdout: 'button returned:Set up, gave up:false', stderr: ''})}), {code: 'PATH_UNSAFE'});
+});
+
+test('Linux setup notification prints an interactive instruction without writing or opening a desktop launcher', async t => {
+  const f = await fixture(t), output: string[] = [];
+  const options = {platform: 'linux' as const, env: {}, output: (line: string) => output.push(line),
+    runner: async () => {assert.fail('Headless setup must not invoke a desktop command.');}};
+  const dialog = await reserveAgentSetupDialog(f.paths, [agent], options);
+  assert.equal(typeof dialog, 'object'); if (typeof dialog === 'string') throw new Error();
+  assert.equal(dialog.command, 'maddots-ai agent setup');
+  assert.equal(await showAgentSetupDialog(dialog, options), 'later');
+  assert.deepEqual(output, ['1 agents need setup or Allow on this computer. Run maddots-ai agent setup in an interactive terminal.']);
+  await assert.rejects(lstat(join(f.paths.data, 'agent-setup.command')), {code: 'ENOENT'});
+  assert.equal(await reserveAgentSetupDialog(f.paths, [agent], options), 'unchanged');
 });
 
 test('interrupted agent-state replacement leaves the previous complete access record intact', async t => {

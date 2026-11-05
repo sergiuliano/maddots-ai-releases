@@ -39,6 +39,7 @@ export const HELPER_ERROR_CODES = [
 ] as const;
 export type HelperErrorCode = typeof HELPER_ERROR_CODES[number];
 export type HelperAuthKind = 'public' | 'browser' | 'step-up' | 'skills token';
+export type CredentialStorage = {version: 1; backend: 'keychain' | 'file' | 'secret-service'};
 export type HelperOS = 'macos' | 'linux' | 'windows';
 export type ToolIdentity = {tool: string; variant: string};
 export type ReportedTool = ToolIdentity & {version: string | null; models: string[]; syncOnly: boolean};
@@ -53,12 +54,12 @@ export type HelperProposalUpload = {
   files: {path: string; mode: '100644' | '100755'; content: string}[];
 };
 export type ToolConnection = ToolIdentity & {id: string};
-export type PairingStartRequest = {helperVersion: string; computerName: string; os: HelperOS; tools: ReportedTool[]};
+export type PairingStartRequest = {helperVersion: string; computerName: string; os: HelperOS; tools: ReportedTool[]; credentialStorage?: CredentialStorage};
 export type PairingStartResponse = {deviceCode: string; userCode: string; expiresAt: string; expiresIn: 300; interval: 3; connectUrl: string};
 export type PairingInspectRequest = {userCode: string; pickedTool?: string};
 export type PairingWorkspace = {id: string; name: string; role: 'admin' | 'pm' | 'member'};
 export type PairingInspectResponse = {
-  computerName: string; os: HelperOS; helperVersion: string; tools: (ReportedTool & {picked: boolean})[];
+  credentialStorage?: CredentialStorage; computerName: string; os: HelperOS; helperVersion: string; tools: (ReportedTool & {picked: boolean})[];
   ip: string; country: string | null; createdAt: string; expiresAt: string; ageSeconds: number;
   currentWorkspace: PairingWorkspace | null; workspaces: PairingWorkspace[];
   mismatches: {network: boolean; country: boolean; pickedToolMissing: boolean};
@@ -101,6 +102,7 @@ const userCode = {type: 'string', minLength: 8, maxLength: 32, pattern: '^[A-Za-
 const account = helperSchemaObject({id, name: line(256)});
 const workspace = helperSchemaObject({id, name: line(256), role: {type: 'string', enum: ['admin', 'pm', 'member']}});
 const scopes = {type: 'array', items: {type: 'string', enum: HELPER_SCOPES}, uniqueItems: true, minItems: 1, maxItems: HELPER_SCOPES.length};
+const credentialStorage = helperSchemaObject({version: {type: 'integer', const: 1}, backend: {type: 'string', enum: ['keychain', 'file', 'secret-service']}});
 const tokenFields = {token: {type: 'string', pattern: SKILLS_TOKEN_PATTERN}, renewBy: date, idleLapseAt: date};
 const approvalFields = {
   workspaceScope: {type: 'string', enum: ['workspace', 'all']}, workspaceId: id,
@@ -111,7 +113,7 @@ const approvalFields = {
 export const HELPER_SCHEMAS = {
   empty: helperSchemaObject({}),
   toolIdentity, reportedTool, connection, account, scopes,
-  pairingStart: helperSchemaObject({helperVersion: line(128), computerName, os: {type: 'string', enum: ['macos', 'linux', 'windows']}, tools: array(reportedTool, HELPER_MAX_TOOLS)}),
+  pairingStart: helperSchemaObject({helperVersion: line(128), computerName, os: {type: 'string', enum: ['macos', 'linux', 'windows']}, tools: array(reportedTool, HELPER_MAX_TOOLS), credentialStorage}, ['helperVersion', 'computerName', 'os', 'tools']),
   pairingPoll: helperSchemaObject({deviceCode: {type: 'string', pattern: DEVICE_CODE_PATTERN}}),
   pairingInspect: helperSchemaObject({userCode, pickedTool: key}, ['userCode']),
   pairingApprove: helperSchemaObject({userCode, tools: {...array(toolIdentity, HELPER_MAX_TOOLS, 1), uniqueItems: true}, ...approvalFields, acknowledgeMismatch: {type: 'boolean'}}, ['userCode', 'tools']),
@@ -124,13 +126,13 @@ export const HELPER_SCHEMAS = {
     interval: {type: 'integer', const: PAIRING_POLL_SECONDS}, connectUrl: {type: 'string', format: 'uri', maxLength: 2048},
   }),
   pairingInspectResponse: helperSchemaObject({
-    computerName, os: {type: 'string', enum: ['macos', 'linux', 'windows']}, helperVersion: line(128),
+    credentialStorage, computerName, os: {type: 'string', enum: ['macos', 'linux', 'windows']}, helperVersion: line(128),
     tools: array(helperSchemaObject({...reportedTool.properties, picked: {type: 'boolean'}}), HELPER_MAX_TOOLS),
     ip: line(128), country: {anyOf: [{type: 'string', pattern: '^[A-Z]{2}$'}, {type: 'null'}]},
     createdAt: date, expiresAt: date, ageSeconds: {type: 'integer', minimum: 0},
     currentWorkspace: {anyOf: [workspace, {type: 'null'}]}, workspaces: array(workspace, 1000),
     mismatches: helperSchemaObject({network: {type: 'boolean'}, country: {type: 'boolean'}, pickedToolMissing: {type: 'boolean'}}),
-  }),
+  }, ['computerName', 'os', 'helperVersion', 'tools', 'ip', 'country', 'createdAt', 'expiresAt', 'ageSeconds', 'currentWorkspace', 'workspaces', 'mismatches']),
   pairingApproveResponse: helperSchemaObject({ok: {type: 'boolean', const: true}, helperId: id, connections: array(connection, HELPER_MAX_TOOLS)}),
   pendingToolsResponse: {type: 'array', items: helperSchemaObject({id, helperId: id, computerName, ...reportedTool.properties, expiresAt: date})},
   pairingPollResponse: {anyOf: [
