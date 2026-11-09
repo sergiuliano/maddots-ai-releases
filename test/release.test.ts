@@ -60,7 +60,7 @@ test('package manifest accepts Linux candidate versions only with explicit attes
   const pkg = {name: 'maddots-ai', private: true, license: 'MIT', bin: {'maddots-ai': 'dist/cli.js'},
     repository: {url: 'git+https://github.com/fixture-owner/helper-release.git'}};
   for (const options of [undefined, {attestOnly: false}, {attestOnly: true}]) checkManifest({...pkg, version: '0.1.6'}, options);
-  for (const version of ['0.1.6-linux.s5.7.1', '0.1.6-linux.rc-1']) {
+  for (const version of ['0.1.6-linux.s5.7.2', '0.1.6-linux.rc-1']) {
     checkManifest({...pkg, version}, {attestOnly: true});
     assert.throws(() => checkManifest({...pkg, version}), /Only attest-only mode/u);
     assert.throws(() => checkManifest({...pkg, version}, {attestOnly: false}), /Only attest-only mode/u);
@@ -120,7 +120,7 @@ await prepareRelease(${JSON.stringify([...flags, '--output', join(directory, out
 }
 
 test('candidate package check and exact-byte preparation require attest-only and retain all package and lock versions', async () => {
-  const version = '0.1.6-linux.s5.7.1';
+  const version = '0.1.6-linux.s5.7.2';
   const f = await fixture(version);
   const check = (...flags: string[]) => spawnSync(process.execPath, [join(f.directory, 'scripts/check-package.mjs'), ...flags],
     {cwd: f.directory, encoding: 'utf8', timeout: 30_000, env: {...process.env, npm_config_offline: 'true'}});

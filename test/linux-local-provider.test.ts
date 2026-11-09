@@ -1,19 +1,22 @@
 import assert from 'node:assert/strict';
 import {fstatSync} from 'node:fs';
-import fsPromises, {chmod, readFile, rename, symlink, writeFile, type FileHandle} from 'node:fs/promises';
+import fsPromises, {chmod, mkdir, readFile, rename, symlink, writeFile, type FileHandle} from 'node:fs/promises';
 import {syncBuiltinESMExports} from 'node:module';
 import {dirname, join} from 'node:path';
 import test, {type TestContext} from 'node:test';
-import {assertLinuxLocalProviderSpec, LINUX_LOCAL_PROVIDER_MODEL, LINUX_LOCAL_PROVIDER_URL, linuxLocalProviderSelection,
+import {assertLinuxLocalProviderSpec, LINUX_LOCAL_PROVIDER_MODEL, LINUX_LOCAL_PROVIDER_UPSTREAM, LINUX_LOCAL_PROVIDER_URL, linuxLocalProviderSelection,
   LINUX_LOCAL_PROVIDER_PREPARE_MS, parseLinuxLocalProviderInventory, preparedLinuxLocalProvider, prepareLinuxLocalProvider, revalidateLinuxLocalProvider} from '../src/runner/linux-local-provider.js';
 import {createOpenCodeAdapter} from '../src/runner/adapters/opencode.js';
 import {localProviderFixture} from './support/linux-local-provider-fixture.js';
 
 test('Linux local provider selects one explicit policy tag and refuses aliases and alternate providers', () => {
+  assert.equal(LINUX_LOCAL_PROVIDER_UPSTREAM, 'qwen3:30b-a3b');
+  assert.equal(LINUX_LOCAL_PROVIDER_MODEL, 'mdai-qwen3:30b-a3b-ctx8192-cpu16');
   const input = {tool: 'opencode', provider: 'ollama', model: LINUX_LOCAL_PROVIDER_MODEL};
   assert(linuxLocalProviderSelection(input));
   assert(linuxLocalProviderSelection({...input, provider: null, model: `ollama/${LINUX_LOCAL_PROVIDER_MODEL}`}));
-  for (const model of ['latest', 'qwen3-coder:30b-a3b-q4_K_M', 'mdai-qwen3-coder:latest', `ollama/${LINUX_LOCAL_PROVIDER_MODEL}`, `${LINUX_LOCAL_PROVIDER_MODEL}/fallback`]) {
+  for (const model of ['latest', 'qwen3:30b-a3b', 'mdai-qwen3:latest',
+    'mdai-qwen3-coder:30b-a3b-q4_K_M-ctx8192-cpu16', `ollama/${LINUX_LOCAL_PROVIDER_MODEL}`, `${LINUX_LOCAL_PROVIDER_MODEL}/fallback`]) {
     assert.equal(linuxLocalProviderSelection({...input, model}), false);
   }
   for (const provider of ['lmstudio', 'openrouter', 'custom', null]) assert.equal(linuxLocalProviderSelection({...input, provider}), false);
@@ -28,10 +31,16 @@ test('Linux local provider is immutable, JSON-safe, fully pinned, and opaque aft
   assertLinuxLocalProviderSpec(spec);
   assert.equal(preparedLinuxLocalProvider(fixture.input), spec);
   assert.equal(spec.model, LINUX_LOCAL_PROVIDER_MODEL); assert.equal(spec.baseURL, LINUX_LOCAL_PROVIDER_URL);
+  assert.equal(spec.upstreamModel, LINUX_LOCAL_PROVIDER_UPSTREAM);
+  assert.equal(spec.upstreamManifest, join(spec.modelsPath, 'manifests/registry.ollama.ai/library/qwen3/30b-a3b'));
+  assert.equal(spec.policyManifest, join(spec.modelsPath, 'manifests/registry.ollama.ai/library/mdai-qwen3/30b-a3b-ctx8192-cpu16'));
   assert.equal(spec.files.length, fixture.inventory.closure.files.length + fixture.inventory.store.blobs.length + 3);
   assert.equal(spec.resources.memoryMax, 25_000_000_000); assert.equal(spec.resources.cpuMax, '1600000 100000');
   assert.deepEqual(spec.parameters, {num_thread: 16, num_ctx: 8192, num_gpu: 0});
   assert.equal(spec.env.OLLAMA_MODELS, spec.modelsPath); assert.equal(spec.env.OLLAMA_NO_CLOUD, '1');
+  const cwd = spec.directories.find(row => row.path === join(fixture.closurePath, 'lib/ollama'))!;
+  assert.deepEqual(spec.providerCwd, {path: cwd.path, contract: 'ollama-inherited-cwd-v1', dev: cwd.dev, ino: cwd.ino});
+  assert(cwd.immutable); assert(Object.isFrozen(spec.providerCwd));
   assert(Object.isFrozen(spec)); assert(Object.isFrozen(spec.env)); assert(Object.isFrozen(spec.files[0]));
   assert.throws(() => assertLinuxLocalProviderSpec(JSON.parse(JSON.stringify(spec))), /preparation is required/);
   await revalidateLinuxLocalProvider(spec);
@@ -58,8 +67,45 @@ test('Linux local provider inventory refuses missing pins, reordered inventory, 
     (value: any) => {value.closure.files.reverse();},
     (value: any) => {value.store.blobs.push(value.store.blobs[0]);},
     (value: any) => {value.closure.executable = '../bin/ollama';},
+    (value: any) => {delete value.closure.providerCwd;},
+    (value: any) => {value.closure.providerCwd.path = '/tmp/mdai-provider';},
+    (value: any) => {value.closure.providerCwd.path = '/work';},
+    (value: any) => {value.closure.providerCwd.path = 'lib/ollama/../ollama';},
+    (value: any) => {value.closure.providerCwd.contract = 'unverified';},
+    (value: any) => {value.closure.providerCwd.extra = true;},
     (value: any) => {value.store.policyManifest.sha256 = '0'.repeat(64);},
   ]) {const value = structuredClone(fixture.inventory); mutate(value); assert.throws(() => parseLinuxLocalProviderInventory(value), {code: 'adapter_refused'});}
+});
+
+for (const change of ['writable', 'replacement', 'symlink', 'unexpected-entry'] as const) {
+  test(`Linux local provider refuses ${change} cwd during preparation and revalidation`, async t => {
+    const fixture = await localProviderFixture(t), spec = (await fixture.prepare())!, cwd = spec.providerCwd.path;
+    if (change === 'writable') await chmod(cwd, 0o755);
+    else if (change === 'unexpected-entry') {
+      await chmod(cwd, 0o755); await writeFile(join(cwd, 'injected.so'), 'unapproved', {mode: 0o444}); await chmod(cwd, 0o555);
+    } else {
+      await chmod(dirname(cwd), 0o755); await rename(cwd, `${cwd}-retained`);
+      if (change === 'symlink') await symlink(`${cwd}-retained`, cwd);
+      else await mkdir(cwd, {mode: 0o555});
+      await chmod(dirname(cwd), 0o555);
+    }
+    await assert.rejects(revalidateLinuxLocalProvider(spec), {code: 'adapter_refused'});
+    await assert.rejects(fixture.prepare(), {code: 'adapter_refused'});
+  });
+}
+
+test('Linux local provider rejects cwd owner drift without requiring root fixture privileges', async t => {
+  const fixture = await localProviderFixture(t), spec = (await fixture.prepare())!;
+  const original = fsPromises.lstat;
+  const intercepted = t.mock.method(fsPromises, 'lstat', (async (...args: Parameters<typeof original>) => {
+    const info = await original(...args);
+    if (args[0] === spec.providerCwd.path) Object.defineProperty(info, 'uid', {value: BigInt(process.getuid!() + 1)});
+    return info;
+  }) as typeof original);
+  syncBuiltinESMExports();
+  t.after(() => {intercepted.mock.restore(); syncBuiltinESMExports();});
+  await assert.rejects(revalidateLinuxLocalProvider(spec), {code: 'adapter_refused'});
+  await assert.rejects(fixture.prepare(), {code: 'adapter_refused'});
 });
 
 test('Linux local provider hashes every blob and refuses corrupt bytes of the same size', async t => {
@@ -68,6 +114,35 @@ test('Linux local provider hashes every blob and refuses corrupt bytes of the sa
   await chmod(fixture.weightPath, 0o644); await writeFile(fixture.weightPath, Buffer.alloc(original.length, 88)); await chmod(fixture.weightPath, 0o444);
   await assert.rejects(fixture.prepare(), {code: 'adapter_refused'});
   assert.throws(() => preparedLinuxLocalProvider(fixture.input), {code: 'adapter_refused'});
+});
+
+for (const layer of ['templatePath', 'upstreamParametersPath', 'parametersPath'] as const) {
+  test(`Linux local provider refuses substituted ${layer} bytes even at the pinned size`, async t => {
+    const fixture = await localProviderFixture(t), path = fixture[layer], original = await readFile(path);
+    await chmod(path, 0o644); await writeFile(path, Buffer.alloc(original.length, 88)); await chmod(path, 0o444);
+    await assert.rejects(fixture.prepare(), {code: 'adapter_refused'});
+  });
+}
+
+for (const manifest of ['upstream', 'policy', 'both'] as const) {
+  for (const layer of ['config', 'template', 'params'] as const) {
+    test(`Linux local provider refuses hash-valid ${manifest} ${layer} descriptor size drift`, async t => {
+      const fixture = await localProviderFixture(t, {manifestMutation: manifests => {
+        const changed = manifest === 'both' ? Object.values(manifests) : [manifests[manifest]];
+        for (const value of changed) {
+          const descriptor = layer === 'config' ? value.config :
+            value.layers.find(row => row.mediaType === `application/vnd.ollama.image.${layer}`)!;
+          descriptor.size += 3;
+        }
+      }});
+      await assert.rejects(fixture.prepare(), {code: 'adapter_refused'});
+    });
+  }
+}
+
+test('Linux local provider refuses a separately pinned policy template substituted for upstream', async t => {
+  const fixture = await localProviderFixture(t, {policyTemplate: 'unreviewed but internally hash-valid template'});
+  await assert.rejects(fixture.prepare(), {code: 'adapter_refused'});
 });
 
 test('Linux local provider hashes weight data in bounded streaming chunks', async t => {

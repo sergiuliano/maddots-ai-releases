@@ -11,14 +11,14 @@ separate installation and native acceptance requirements pass.
 The orchestrator integrates the included prerequisite slices, reviews the export
 boundary and freezes one source tree, export commit, package version, archive
 SHA-256 and export-manifest SHA-256. This Linux candidate uses package version
-`0.1.6-linux.s5.7.1` and signed tag `v0.1.6-linux.s5.7.1`. Reserve numeric
+`0.1.6-linux.s5.7.2` and signed tag `v0.1.6-linux.s5.7.2`. Reserve numeric
 `v0.1.6` for the later Mac export. Never move or replace an existing signed tag;
 if the candidate tag already exists, stop for a fresh reviewed version and freeze.
 Private source commit and public export commit are distinct identities; the
 workflow must build the latter.
 
 At integration freeze, synchronize all four source version fields to
-`0.1.6-linux.s5.7.1`: `helper/package.json`'s `version`,
+`0.1.6-linux.s5.7.2`: `helper/package.json`'s `version`,
 `helper/release-identity.ts`'s `VERSION`, and `helper/package-lock.json`'s
 top-level `version` and `packages[''].version`. This procedure does not change
 those fields on the slice branch. Export derives its package version, expected
@@ -80,7 +80,7 @@ using the release owner's approved signing setup:
 ```sh
 set -euo pipefail
 REPO='sergiuliano/maddots-ai-releases'
-CANDIDATE_TAG='v0.1.6-linux.s5.7.1'
+CANDIDATE_TAG='v0.1.6-linux.s5.7.2'
 [[ "$EXPORT_SHA" =~ ^[a-f0-9]{40}$ ]]
 cd "$EXPORT_CHECKOUT"
 test -z "$(git status --porcelain)"
@@ -110,7 +110,7 @@ another branch or repository. Verify the published signed source independently:
 ```sh
 set -euo pipefail
 REPO='sergiuliano/maddots-ai-releases'
-CANDIDATE_TAG='v0.1.6-linux.s5.7.1'
+CANDIDATE_TAG='v0.1.6-linux.s5.7.2'
 [[ "$EXPORT_SHA" =~ ^[a-f0-9]{40}$ ]]
 [[ "$PACKAGE_SHA256" =~ ^[a-f0-9]{64}$ ]]
 [[ "$MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ ]]

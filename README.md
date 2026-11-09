@@ -8,10 +8,10 @@ Requirements: macOS or Linux with a systemd user manager, npm, and Node.js `^22.
 
 Follow the [installation guide](docs/install.md) to confirm the release signing
 key, verify the signed tag and attested `helper.tgz`, and install version
-0.1.6-linux.s5.7.1. Begin with the pinned source checkout:
+0.1.6-linux.s5.7.2. Begin with the pinned source checkout:
 
 ```sh
-git clone --branch v0.1.6-linux.s5.7.1 --depth 1 https://github.com/sergiuliano/maddots-ai-releases.git
+git clone --branch v0.1.6-linux.s5.7.2 --depth 1 https://github.com/sergiuliano/maddots-ai-releases.git
 ```
 
 The guide includes the complete tag and artifact verification commands, pairing,

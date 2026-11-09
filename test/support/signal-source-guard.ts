@@ -24,8 +24,10 @@ const guardianFile = relative(fileURLToPath(new URL('../../', import.meta.url)),
 // other code in their module remains subject to the generic source scan.
 // Fix 3 acknowledges monitor registration before fork and shares an unread
 // cancellation socket through both exec boundaries; signal authority is unchanged.
+// S5-07 s5.7.2 pins Qwen3 and validates the inherited immutable provider cwd.
+// The directory FD is CLOEXEC; retained pidfd signal recipients and scope are unchanged.
 const guardianDigests: Record<string, string> = {
-  LINUX_INNER_LAUNCHER: '706b5d570e13d8cbf8582f6b49d343e6d22be51b88e5f465b9a2d7f16479da18',
+  LINUX_INNER_LAUNCHER: '332ca14121c178ff7adc8896aa82ffb94365e6acd94ab398dd1cdcf4b9c393d5',
   LINUX_GUARDIAN: '7fa290d4fef874ef0fa9d15caa8f2e27f8706c15d4c5ffd17bb3f45fabef525d',
 };
 const forbiddenNames = new Set(['kill', '_kill', 'signalGroup', 'pidfd_send_signal']);

@@ -17,6 +17,22 @@ const spec: RunSpec = {bin, cwd: '/work', runDir: '/work/.maddots/runs/fake', pr
   model: 'model', provider: null, effort: null, access: 'full_access', skillsDir: '/work/.agents/skills',
   maxTurns: 1, timeoutSeconds: 30, runHome: null};
 
+test('Codex Linux disables startup update checks for saved-login and local-provider exec runs', () => {
+  const linux = createCodexAdapter(undefined, {platform: 'linux'});
+  for (const provider of [null, 'ollama', 'lmstudio']) for (const effort of [null, 'high']) {
+    const invocation = linux.build({...spec, provider, effort});
+    const overrides = invocation.argv.flatMap((arg, index, argv) => arg === '-c' ? [argv[index + 1]] : []);
+    assert.deepEqual(overrides, ['check_for_update_on_startup=false', ...(effort ? ['model_reasoning_effort=high'] : [])]);
+    assert.equal(invocation.argv[1], 'exec');
+    assert.equal(invocation.argv.at(-1), '-');
+    assert.equal(invocation.argv.includes('--oss'), provider !== null);
+    if (provider !== null) assert.equal(invocation.argv[invocation.argv.indexOf('--local-provider') + 1], provider);
+    assert.equal(invocation.stdinFile, spec.promptFile);
+    assert.deepEqual(invocation.files, []);
+    assert.deepEqual(invocation.projectFiles, []);
+  }
+});
+
 test('Codex Linux Full access requires no bundled bubblewrap, dummy interface or host socket metadata', async t => {
   const unexpected = async () => assert.fail('Linux Full access preflight must not inspect host paths or execute probes.');
   t.mock.method(fs, 'lstat', unexpected);

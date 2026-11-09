@@ -1824,7 +1824,7 @@ test('released Linux updaters reject attest-only prerelease manifests before can
     }));
     const active = await runtimeDigests(), commands = [...f.commands];
     let prepared = false;
-    const candidateBackend = f.backend(commitB, '0.1.6-linux.s5.7.1');
+    const candidateBackend = f.backend(commitB, '0.1.6-linux.s5.7.2');
     const result = await updater.checkForUpdate({...options, activate: async () => assert.fail('an attest-only candidate must not activate')}, {
       ...candidateBackend,
       prepare: async (release, target) => {prepared = true; await candidateBackend.prepare(release, target);},

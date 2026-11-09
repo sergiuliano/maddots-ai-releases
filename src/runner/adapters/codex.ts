@@ -93,6 +93,9 @@ export function createCodexAdapter(runner: Runner = runToolCommand, options: Cod
     build(spec) {
       if (!this.supports(spec).ok) throw new Error('adapter_refused');
       const argv = [spec.bin, 'exec', '--json', '-C', spec.cwd, '--ephemeral', '--skip-git-repo-check', '-o', join(spec.runDir, 'last-message.txt'), '-m', spec.model];
+      // Disable the pinned CLI's startup version check explicitly. The Linux
+      // closure's ownership and read-only mount separately prevent replacement.
+      if (platform === 'linux') argv.push('-c', 'check_for_update_on_startup=false');
       if (spec.effort !== null) argv.push('-c', `model_reasoning_effort=${spec.effort}`);
       if (spec.provider !== null) argv.push('--oss', '--local-provider', spec.provider);
       argv.push(...(spec.access === 'folder_only' ? ['-s', 'workspace-write'] : ['--dangerously-bypass-approvals-and-sandbox']), ...noMcp, ...noBrowser, '-');

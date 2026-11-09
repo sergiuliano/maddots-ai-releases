@@ -232,7 +232,7 @@ test('attest-only prerelease versions fail manifest validation before candidate 
   const activeManifest = await readFile(join(selected.root, 'package.json'), 'utf8');
   const activeCli = await readFile(join(selected.root, 'dist/cli.js'), 'utf8');
   let prepared = false;
-  const candidateBackend = backend(commitB, '0.1.6-linux.s5.7.1');
+  const candidateBackend = backend(commitB, '0.1.6-linux.s5.7.2');
   const result = await checkForUpdate({ ...options, force: true, activate: async () => assert.fail('an attest-only candidate must not activate') }, {
     ...candidateBackend,
     prepare: async (release, target) => { prepared = true; await candidateBackend.prepare(release, target); },

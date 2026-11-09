@@ -87,11 +87,11 @@ def provider_environment(spec):
 def verify_provider(spec):
     required = {'format', 'kind', 'version', 'executable', 'closureDigest', 'storeDigest', 'modelsPath',
         'upstreamModel', 'model', 'modelDigest', 'upstreamDigest', 'baseURL', 'parameters', 'resources',
-        'files', 'directories', 'env', 'capabilities', 'upstreamManifest', 'policyManifest'}
+        'files', 'directories', 'env', 'capabilities', 'upstreamManifest', 'policyManifest', 'providerCwd'}
     if (type(spec) is not dict or set(spec) != required or type(spec['format']) is not int or spec['format'] != 1 or
             spec['kind'] != 'ollama' or spec['version'] != '0.40.14' or
-            spec['upstreamModel'] != 'qwen3-coder:30b-a3b-q4_K_M' or
-            spec['model'] != 'mdai-qwen3-coder:30b-a3b-q4_K_M-ctx8192-cpu16' or
+            spec['upstreamModel'] != 'qwen3:30b-a3b' or
+            spec['model'] != 'mdai-qwen3:30b-a3b-ctx8192-cpu16' or
             spec['baseURL'] != 'http://127.0.0.1:11434/v1' or
             spec['parameters'] != {'num_thread': 16, 'num_ctx': 8192, 'num_gpu': 0} or
             any(type(value) is not int for value in spec['parameters'].values()) or
@@ -157,6 +157,50 @@ def verify_provider(spec):
     for key in ('executable', 'upstreamManifest', 'policyManifest'):
         if spec[key] not in {entry['path'] for entry in spec['files']}:
             raise RuntimeError('provider executable or manifest missing from inventory')
+    verify_provider_cwd(spec)
+def verify_provider_cwd(spec, descriptor=None, entered=False):
+    cwd = spec['providerCwd']
+    path = '/usr/local/lib/mdai/ollama/' + spec['closureDigest'] + '/lib/ollama'
+    if (type(cwd) is not dict or set(cwd) != {'path', 'contract', 'dev', 'ino'} or
+            cwd['contract'] != 'ollama-inherited-cwd-v1' or cwd['path'] != path or
+            any(type(cwd[key]) is not str or re.fullmatch('[0-9]+', cwd[key]) is None for key in ('dev', 'ino'))):
+        raise RuntimeError('invalid provider cwd contract')
+    directories = {entry['path']: entry for entry in spec['directories']}
+    recorded = directories.get(path)
+    root = directories.get('/usr')
+    if (recorded is None or recorded['immutable'] is not True or root is None or
+            any(recorded[key] != cwd[key] for key in ('dev', 'ino'))):
+        raise RuntimeError('provider cwd missing from immutable inventory')
+    # Host-root ownership was verified before the user namespace. Its UID may
+    # be unmapped here, so bind to the owner of the retained /usr source inode.
+    root_info = os.stat('/usr', follow_symlinks=False)
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_mode & 0o6022 or
+            any(root[key] != str(actual) for key, actual in (('dev', root_info.st_dev), ('ino', root_info.st_ino)))):
+        raise RuntimeError('provider cwd root identity changed')
+    def check(info, entry, directory):
+        if (info.st_uid != root_info.st_uid or
+                not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)) or
+                stat.S_IMODE(info.st_mode) != (0o555 if directory or entry['executable'] else 0o444) or
+                any(entry[key] != str(actual) for key, actual in (('dev', info.st_dev), ('ino', info.st_ino),
+                    ('mtimeNs', info.st_mtime_ns), ('ctimeNs', info.st_ctime_ns)))):
+            raise RuntimeError('provider cwd entry identity or ownership changed')
+    if os.path.realpath(path) != path:
+        raise RuntimeError('provider cwd realpath changed')
+    check(os.stat(path, follow_symlinks=False), recorded, True)
+    if descriptor is not None:
+        check(os.fstat(descriptor), recorded, True)
+    if entered:
+        if descriptor is None or os.getcwd() != path:
+            raise RuntimeError('provider inherited cwd changed')
+        check(os.stat('.', follow_symlinks=False), recorded, True)
+    expected = {os.path.basename(entry['path']): entry for entry in spec['files'] + spec['directories']
+        if os.path.dirname(entry['path']) == path}
+    names = os.listdir(path if descriptor is None else descriptor)
+    if len(names) != len(expected) or set(names) != set(expected):
+        raise RuntimeError('provider cwd entries changed')
+    for name, entry in expected.items():
+        info = os.stat(entry['path'], follow_symlinks=False) if descriptor is None else os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        check(info, entry, entry['path'] in directories)
 def close_except(keep):
     begin = 3
     for descriptor in sorted(fd for fd in keep if fd >= 3):
@@ -177,10 +221,16 @@ def provider_exec(spec, status, release, expected, log_write):
     os.dup2(log_write, 2)
     close_except({status.fileno()})
     os.set_inheritable(status.fileno(), False)
-    os.chdir('/tmp/mdai-provider')
-    reset_provider_signals()
-    final_admission(status, release, expected)
-    os.execve(spec['executable'], [spec['executable'], 'serve'], provider_environment(spec))
+    cwd = os.open(spec['providerCwd']['path'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        verify_provider_cwd(spec, cwd)
+        os.fchdir(cwd)
+        reset_provider_signals()
+        verify_provider_cwd(spec, cwd, entered=True)
+        final_admission(status, release, expected)
+        os.execve(spec['executable'], [spec['executable'], 'serve'], provider_environment(spec))
+    finally:
+        os.close(cwd)
 def provider_http(path, payload, check):
     # Fixed namespace-local HTTP only. No proxy environment, redirects, unbounded
     # buffering, background requests, or blocking socket read can bypass checks.

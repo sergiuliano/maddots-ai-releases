@@ -1,14 +1,14 @@
 import {createHash} from 'node:crypto';
 import {constants, type BigIntStats} from 'node:fs';
-import {lstat, open, readdir, type FileHandle} from 'node:fs/promises';
+import {lstat, open, readdir, realpath, type FileHandle} from 'node:fs/promises';
 import {dirname, isAbsolute, join, normalize} from 'node:path';
 import {performance} from 'node:perf_hooks';
 import {parseJsonWithoutDuplicateKeys} from '../shared/strict-json.js';
 import {HelperError} from '../config.js';
 
 export const LINUX_LOCAL_PROVIDER_VERSION = '0.40.14';
-export const LINUX_LOCAL_PROVIDER_MODEL = 'mdai-qwen3-coder:30b-a3b-q4_K_M-ctx8192-cpu16';
-export const LINUX_LOCAL_PROVIDER_UPSTREAM = 'qwen3-coder:30b-a3b-q4_K_M';
+export const LINUX_LOCAL_PROVIDER_MODEL = 'mdai-qwen3:30b-a3b-ctx8192-cpu16';
+export const LINUX_LOCAL_PROVIDER_UPSTREAM = 'qwen3:30b-a3b';
 export const LINUX_LOCAL_PROVIDER_URL = 'http://127.0.0.1:11434/v1';
 export const LINUX_LOCAL_PROVIDER_PREPARE_MS = 120_000;
 export const LINUX_LOCAL_PROVIDER_INVENTORY = '/usr/local/share/mdai/ollama/provider.json';
@@ -19,15 +19,17 @@ const MAX_JSON = 1024 * 1024;
 const MAX_FILES = 4096;
 const PARAMETERS = Object.freeze({num_thread: 16, num_ctx: 8192, num_gpu: 0});
 const RESOURCES = Object.freeze({cpuMax: '1600000 100000', memoryMax: 25_000_000_000, memorySwapMax: 0, memoryOomGroup: 1});
-const UPSTREAM_MANIFEST = 'manifests/registry.ollama.ai/library/qwen3-coder/30b-a3b-q4_K_M';
-const POLICY_MANIFEST = 'manifests/registry.ollama.ai/library/mdai-qwen3-coder/30b-a3b-q4_K_M-ctx8192-cpu16';
+const UPSTREAM_MANIFEST = 'manifests/registry.ollama.ai/library/qwen3/30b-a3b';
+const POLICY_MANIFEST = 'manifests/registry.ollama.ai/library/mdai-qwen3/30b-a3b-ctx8192-cpu16';
 type Pin = Readonly<{path: string; sha256: string; size: number}>;
 type ClosurePin = Pin & Readonly<{executable: boolean}>;
+type ProviderCwdContract = Readonly<{path: 'lib/ollama'; contract: 'ollama-inherited-cwd-v1'}>;
 export type LinuxLocalProviderInventory = Readonly<{format: 1; kind: 'ollama'; version: '0.40.14';
-  closure: Readonly<{digest: string; executable: 'bin/ollama'; files: readonly ClosurePin[]}>;
+  closure: Readonly<{digest: string; executable: 'bin/ollama'; files: readonly ClosurePin[]; providerCwd: ProviderCwdContract}>;
   store: Readonly<{digest: string; upstreamManifest: Pin; policyManifest: Pin; blobs: readonly Pin[]}>}>;
 type Identity = Readonly<{path: string; dev: string; ino: string; mtimeNs: string; ctimeNs: string}>;
 export type LinuxLocalProviderSpec = Readonly<{format: 1; kind: 'ollama'; version: '0.40.14'; executable: string;
+  providerCwd: Readonly<{path: string; contract: 'ollama-inherited-cwd-v1'; dev: string; ino: string}>;
   closureDigest: string; storeDigest: string; modelsPath: string; upstreamModel: string; model: string;
   modelDigest: string; upstreamDigest: string; upstreamManifest: string; policyManifest: string; baseURL: string;
   capabilities: readonly ['completion', 'tools']; parameters: typeof PARAMETERS; resources: typeof RESOURCES;
@@ -113,14 +115,17 @@ function sorted(values: readonly Pin[]): boolean {return values.every((value, in
 /** Reviewed root provisioning binds both inventory digests to exact sorted pins. */
 export function parseLinuxLocalProviderInventory(value: unknown): LinuxLocalProviderInventory {
   if (!keys(value, 'format,kind,version,closure,store') || value.format !== 1 || value.kind !== 'ollama' || value.version !== LINUX_LOCAL_PROVIDER_VERSION ||
-      !keys(value.closure, 'digest,executable,files') || typeof value.closure.digest !== 'string' || !SHA.test(value.closure.digest) || value.closure.executable !== 'bin/ollama' ||
+      !keys(value.closure, 'digest,executable,files,providerCwd') || typeof value.closure.digest !== 'string' || !SHA.test(value.closure.digest) || value.closure.executable !== 'bin/ollama' ||
+      !keys(value.closure.providerCwd, 'path,contract') || value.closure.providerCwd.path !== 'lib/ollama' || value.closure.providerCwd.contract !== 'ollama-inherited-cwd-v1' ||
       !Array.isArray(value.closure.files) || !value.closure.files.length || value.closure.files.length > MAX_FILES || !value.closure.files.every(file => pin(file, true)) || !sorted(value.closure.files) ||
       !value.closure.files.some(file => file.path === 'bin/ollama' && file.executable) ||
+      !value.closure.files.some(file => file.path.startsWith('lib/ollama/')) ||
       !keys(value.store, 'digest,upstreamManifest,policyManifest,blobs') || typeof value.store.digest !== 'string' || !SHA.test(value.store.digest) ||
       !pin(value.store.upstreamManifest) || value.store.upstreamManifest.path !== UPSTREAM_MANIFEST || value.store.upstreamManifest.size > MAX_JSON ||
       !pin(value.store.policyManifest) || value.store.policyManifest.path !== POLICY_MANIFEST || value.store.policyManifest.size > MAX_JSON ||
       !Array.isArray(value.store.blobs) || !value.store.blobs.length || value.store.blobs.length > MAX_FILES || !value.store.blobs.every(blob => pin(blob) && blob.path === `blobs/sha256-${blob.sha256}`) || !sorted(value.store.blobs)) refuse();
-  const closure = {executable: value.closure.executable, files: value.closure.files.map(file => ({path: file.path, sha256: file.sha256, size: file.size, executable: file.executable}))};
+  const closure = {executable: value.closure.executable, files: value.closure.files.map(file => ({path: file.path, sha256: file.sha256, size: file.size, executable: file.executable})),
+    providerCwd: {path: value.closure.providerCwd.path, contract: value.closure.providerCwd.contract}};
   const plainPin = (file: Pin) => ({path: file.path, sha256: file.sha256, size: file.size});
   const store = {upstreamManifest: plainPin(value.store.upstreamManifest), policyManifest: plainPin(value.store.policyManifest), blobs: value.store.blobs.map(plainPin)};
   if (hash(JSON.stringify(closure)) !== value.closure.digest || hash(JSON.stringify(store)) !== value.store.digest ||
@@ -259,11 +264,14 @@ export async function prepareLinuxLocalProvider(input: LinuxLocalProviderSelecti
       }
     };
     await tree(closure, inventory.closure.files);
+    const cwdPath = join(closure, inventory.closure.providerCwd.path), cwdIdentity = directories.get(cwdPath);
+    if (!cwdIdentity || !immutableDirectories.has(cwdPath)) refuse();
     await visit(dirname(modelsPath), true);
     await tree(modelsPath, [inventory.store.upstreamManifest, inventory.store.policyManifest, ...inventory.store.blobs]);
     verifyManifests(inventory, captured);
     const spec: LinuxLocalProviderSpec = deepFreeze({format: 1, kind: 'ollama', version: LINUX_LOCAL_PROVIDER_VERSION,
       executable: join(closure, inventory.closure.executable), closureDigest: inventory.closure.digest, storeDigest: inventory.store.digest, modelsPath,
+      providerCwd: {path: cwdPath, contract: inventory.closure.providerCwd.contract, dev: cwdIdentity.dev, ino: cwdIdentity.ino},
       upstreamModel: LINUX_LOCAL_PROVIDER_UPSTREAM, model: LINUX_LOCAL_PROVIDER_MODEL, modelDigest: `sha256:${inventory.store.policyManifest.sha256}`,
       upstreamDigest: `sha256:${inventory.store.upstreamManifest.sha256}`, upstreamManifest: join(modelsPath, UPSTREAM_MANIFEST), policyManifest: join(modelsPath, POLICY_MANIFEST),
       baseURL: LINUX_LOCAL_PROVIDER_URL, capabilities: ['completion', 'tools'], parameters: PARAMETERS, resources: RESOURCES,
@@ -295,5 +303,12 @@ export async function revalidateLinuxLocalProvider(spec: LinuxLocalProviderSpec,
     trusted(info, receipt.uid, false, row.executable ? 0o555 : 0o444);
     if (!same(row, info) || info.size !== BigInt(row.size)) refuse();
   }
+  const cwd = spec.providerCwd, directory = spec.directories.find(row => row.path === cwd.path);
+  if (!directory?.immutable || cwd.path !== join(dirname(dirname(spec.executable)), 'lib/ollama') ||
+      cwd.contract !== 'ollama-inherited-cwd-v1' || directory.dev !== cwd.dev || directory.ino !== cwd.ino ||
+      await bounded(operation, () => realpath(cwd.path)) !== cwd.path) refuse();
+  const expected = new Set([...spec.files, ...spec.directories].filter(row => dirname(row.path) === cwd.path).map(row => row.path.slice(cwd.path.length + 1)));
+  const actual = await bounded(operation, () => readdir(cwd.path));
+  if (actual.length !== expected.size || actual.some(name => !expected.has(name))) refuse();
   live(operation);
 }

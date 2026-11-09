@@ -386,7 +386,9 @@ const reviewedEmbedded: Record<string, readonly string[]> = {
     // recheck expiry/control, the monitor closes proof/output copies, and original-task proof remains authoritative.
     // Fix 3 requires registered-channel acknowledgement before fork, replays prior sealing,
     // and retains a shared unread cancellation socket through both final exec checks.
-    "6912a20fc20a6a9e1ab173c1d183df05d154be2d62d6d78a928229b5f3e285c9",
+    // s5.7.2 pins Qwen3 and validates a retained immutable provider cwd descriptor
+    // before fchdir and execve; final admission and signal authority are preserved.
+    "1fb4b82c39c93811b0e32311c6dab8f16ac5cbbace0738cc9be977c7ae8bb1d5",
     "ca53da66b0949cc65be9e78080a80a2dd3a3cfa027efada6337e5221372aa10e"
   ],
   "runner/process.ts": [

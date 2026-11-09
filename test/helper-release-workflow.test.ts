@@ -208,7 +208,7 @@ test('signed-tag guards accept Linux candidates only in attest-only mode', () =>
     assert.ok(release.test(version), `release rejected numeric version ${version}`);
     assert.ok(attest.test(version), `attest-only rejected numeric version ${version}`);
   }
-  for (const version of ['0.1.6-linux.s5.7.1', '12.34.56-linux.test-1.alpha2']) {
+  for (const version of ['0.1.6-linux.s5.7.2', '12.34.56-linux.test-1.alpha2']) {
     assert.ok(attest.test(version), `attest-only rejected Linux candidate ${version}`);
     assert.equal(release.test(version), false, `release accepted Linux candidate ${version}`);
   }

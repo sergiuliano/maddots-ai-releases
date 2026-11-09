@@ -661,11 +661,13 @@ test('packaged guardian authority shape has only self-group TERM and retained na
   assert.equal((LINUX_INNER_LAUNCHER.match(/os\.execve\(/gu) ?? []).length, 2, 'only the provider and original workload task may exec');
   const provider = LINUX_INNER_LAUNCHER.match(/def provider_exec\([^\n]+\):\n([\s\S]*?)\ndef provider_http/u)?.[1];
   assert.ok(provider, 'review the separate provider exec boundary');
-  assert.match(provider, /final_admission\(status, release, expected\)\n {4}os\.execve\(spec\['executable'\]/u,
+  assert.match(provider, /final_admission\(status, release, expected\)\n {8}os\.execve\(spec\['executable'\]/u,
     'provider expiry and queued cancellation are checked immediately before provider exec');
   assert.ok(provider.indexOf('close_except({status.fileno()})') < provider.indexOf('final_admission(status, release, expected)'));
   assert.ok(provider.indexOf('os.set_inheritable(status.fileno(), False)') < provider.indexOf('os.execve'));
-  assert.ok(provider.indexOf('os.chdir') < provider.indexOf('final_admission(status, release, expected)'));
+  assert.ok(provider.indexOf('os.fchdir(cwd)') < provider.indexOf('verify_provider_cwd(spec, cwd, entered=True)'));
+  assert.ok(provider.indexOf('verify_provider_cwd(spec, cwd, entered=True)') < provider.indexOf('final_admission(status, release, expected)'));
+  assert.match(provider, /os\.O_DIRECTORY \| os\.O_NOFOLLOW \| os\.O_CLOEXEC/u);
   const workload = LINUX_INNER_LAUNCHER.slice(LINUX_INNER_LAUNCHER.lastIndexOf("os.chdir(launch['cwd'])"));
   assert.match(workload, /provider_final_admission\(provider_descriptors\)\n {4}final_admission\(channel, release_line, expected_release\)\n {4}try:\n {8}os\.execve\(launch\['file'\]/u,
     'OpenCode rechecks provider status, expiry and queued cancellation immediately before its own exec');
